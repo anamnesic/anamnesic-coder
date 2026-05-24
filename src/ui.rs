@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use crate::llm::client::LlmClient;
 use crate::agent::state::AgentState;
 
+#[derive(PartialEq)]
 pub enum Focus {
     Sidebar,
     Messages,
@@ -43,6 +44,7 @@ pub struct App {
     pub editor_row: usize,
     pub editor_col: usize,
     pub editor_dirty: bool,
+    pub editor_scroll: usize,
 }
 
 impl App {
@@ -55,6 +57,11 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_selected: 0,
             focus: Focus::Input,
+            editor_file: None,
+            editor_lines: Vec::new(),
+            editor_row: 0,
+            editor_col: 0,
+            editor_dirty: false,
         }
     }
 
@@ -121,18 +128,27 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                             Focus::Sidebar => Focus::Messages,
                             Focus::Messages => Focus::Input,
                             Focus::Input => Focus::Sidebar,
+                            Focus::Editor => Focus::Input,
                         };
                     }
                     KeyCode::Up => {
                         if let Focus::Sidebar = guard.focus {
                             if guard.sidebar_selected > 0 { guard.sidebar_selected -= 1; }
-                        } else if let Focus::Messages = guard.focus {
-                            // no-op for now
+                        } else if guard.focus == Focus::Editor {
+                            if guard.editor_row > 0 { guard.editor_row -= 1; }
+                            let line_len = guard.editor_lines.get(guard.editor_row).map(|l| l.len()).unwrap_or(0);
+                            if guard.editor_col > line_len { guard.editor_col = line_len; }
+                            // adjust scroll
+                            if guard.editor_row < guard.editor_scroll { guard.editor_scroll = guard.editor_row; }
                         }
                     }
                     KeyCode::Down => {
                         if let Focus::Sidebar = guard.focus {
                             if guard.sidebar_selected + 1 < guard.sidebar_items.len() { guard.sidebar_selected += 1; }
+                        } else if guard.focus == Focus::Editor {
+                            if guard.editor_row + 1 < guard.editor_lines.len() { guard.editor_row += 1; }
+                            let line_len = guard.editor_lines.get(guard.editor_row).map(|l| l.len()).unwrap_or(0);
+                            if guard.editor_col > line_len { guard.editor_col = line_len; }
                         }
                     }
                     KeyCode::Enter => {
@@ -175,6 +191,27 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                                     }
                                 }
                             }
+                            Focus::Editor => {
+                                // insert newline at cursor
+                                if guard.editor_row <= guard.editor_lines.len() {
+                                    let line = if guard.editor_row < guard.editor_lines.len() {
+                                        guard.editor_lines[guard.editor_row].clone()
+                                    } else {
+                                        String::new()
+                                    };
+                                    let (left, right) = line.split_at(guard.editor_col.min(line.len()));
+                                    if guard.editor_row < guard.editor_lines.len() {
+                                        guard.editor_lines[guard.editor_row] = left.to_string();
+                                        guard.editor_lines.insert(guard.editor_row + 1, right.to_string());
+                                    } else {
+                                        guard.editor_lines.push(left.to_string());
+                                        guard.editor_lines.push(right.to_string());
+                                    }
+                                    guard.editor_row += 1;
+                                    guard.editor_col = 0;
+                                    guard.editor_dirty = true;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -184,9 +221,11 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_row >= guard.editor_lines.len() {
                                 guard.editor_lines.push(String::new());
                             }
-                            let line = &mut guard.editor_lines[guard.editor_row];
-                            if guard.editor_col <= line.len() {
-                                line.insert(guard.editor_col, c);
+                            let row = guard.editor_row;
+                            let col = guard.editor_col;
+                            let line = &mut guard.editor_lines[row];
+                            if col <= line.len() {
+                                line.insert(col, c);
                             } else {
                                 line.push(c);
                             }
@@ -200,18 +239,19 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Backspace => {
                         if guard.focus == Focus::Editor {
-                            if guard.editor_row < guard.editor_lines.len() {
-                                let line = &mut guard.editor_lines[guard.editor_row];
-                                if guard.editor_col > 0 {
-                                    line.remove(guard.editor_col - 1);
+                            let row = guard.editor_row;
+                            let col = guard.editor_col;
+                            if row < guard.editor_lines.len() {
+                                if col > 0 {
+                                    guard.editor_lines[row].remove(col - 1);
                                     guard.editor_col -= 1;
-                                } else if guard.editor_row > 0 {
+                                } else if row > 0 {
                                     // join with previous line
-                                    let prev_len = guard.editor_lines[guard.editor_row - 1].len();
-                                    let cur = guard.editor_lines.remove(guard.editor_row);
+                                    let prev_len = guard.editor_lines[row - 1].len();
+                                    let cur = guard.editor_lines.remove(row);
                                     guard.editor_row -= 1;
                                     guard.editor_col = prev_len;
-                                    guard.editor_lines[guard.editor_row].push_str(&cur);
+                                    guard.editor_lines[row - 1].push_str(&cur);
                                 }
                             }
                             guard.editor_dirty = true;
@@ -228,7 +268,8 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_col > 0 { guard.editor_col -= 1; }
                             else if guard.editor_row > 0 {
                                 guard.editor_row -= 1;
-                                guard.editor_col = guard.editor_lines[guard.editor_row].len();
+                                let row = guard.editor_row;
+                                guard.editor_col = guard.editor_lines[row].len();
                             }
                         } else if guard.cursor_position > 0 {
                             guard.cursor_position -= 1;
@@ -236,10 +277,11 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Right => {
                         if guard.focus == Focus::Editor {
-                            if guard.editor_row < guard.editor_lines.len() {
-                                let len = guard.editor_lines[guard.editor_row].len();
+                            let row = guard.editor_row;
+                            if row < guard.editor_lines.len() {
+                                let len = guard.editor_lines[row].len();
                                 if guard.editor_col < len { guard.editor_col += 1; }
-                                else if guard.editor_row + 1 < guard.editor_lines.len() {
+                                else if row + 1 < guard.editor_lines.len() {
                                     guard.editor_row += 1;
                                     guard.editor_col = 0;
                                 }
@@ -329,13 +371,20 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
             .split(cols[1]);
 
         // Messages area or editor
-        if app.editor_file.is_some() {
-            let title = format!("Editor - {}", app.editor_file.as_ref().unwrap());
-            let text = app.editor_lines.join("\n");
-            let editor = Paragraph::new(text).block(Block::default().title(title).borders(Borders::ALL));
+            if app.editor_file.is_some() {
+            let title = format!("Editor - {}{}", app.editor_file.as_ref().unwrap(), if app.editor_dirty { " *" } else { "" });
+            // compute visible lines based on scroll and area height
+            let area_height = right_chunks[0].height as usize - 2; // leave room for borders
+            let total_lines = app.editor_lines.len();
+            if app.editor_scroll + area_height > total_lines {
+                if total_lines > area_height { app.editor_scroll = total_lines - area_height; } else { app.editor_scroll = 0; }
+            }
+            let end = std::cmp::min(app.editor_scroll + area_height, total_lines);
+            let visible = app.editor_lines[app.editor_scroll..end].join("\n");
+            let editor = Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(editor, right_chunks[0]);
-            // set cursor in editor area
-            let r = app.editor_row as u16;
+            // set cursor in editor area relative to scroll
+            let r = (app.editor_row.saturating_sub(app.editor_scroll)) as u16;
             let c = app.editor_col as u16;
             f.set_cursor(right_chunks[0].x + c + 1, right_chunks[0].y + r + 1);
         } else {
