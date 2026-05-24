@@ -67,7 +67,7 @@ impl Tokenizer {
         if self.is_bpe && !self.merges.is_empty() {
             self.encode_bpe(text, max_len)
         } else {
-            self.encode_fallback(text, max_len)
+            self.encode_spm(text, max_len)
         }
     }
 
@@ -120,6 +120,42 @@ impl Tokenizer {
         }
         ids.truncate(max_len);
         ids
+    }
+
+    /// SentencePiece-style greedy tokenizer (used by gemma, llama 1/2, mistral, qwen).
+    /// Normalizes whitespace to ▁ (U+2581), then does longest-match forward greedy search.
+    fn encode_spm(&self, text: &str, max_len: usize) -> Vec<u32> {
+        // Normalize: prepend ▁, replace internal spaces with ▁
+        let normalized = "\u{2581}".to_string() + &text.replace(' ', "\u{2581}");
+        let chars: Vec<char> = normalized.chars().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < chars.len() && result.len() < max_len {
+            // Try longest match from position i
+            let max_look = (chars.len() - i).min(48);
+            let mut matched = false;
+            for len in (1..=max_look).rev() {
+                let s: String = chars[i..i+len].iter().collect();
+                if let Some(&id) = self.token_to_id.get(&s) {
+                    result.push(id);
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                // byte-level fallback using <0xNN> tokens
+                let ch: String = chars[i..i+1].iter().collect();
+                for b in ch.as_bytes() {
+                    let key = format!("<0x{:02X}>", b);
+                    if let Some(&id) = self.token_to_id.get(&key) {
+                        result.push(id);
+                    }
+                }
+                i += 1;
+            }
+        }
+        result
     }
 
     fn encode_fallback(&self, text: &str, max_len: usize) -> Vec<u32> {

@@ -1,13 +1,13 @@
 use crate::types::plan::PlanStep;
 use crate::agent::state::AgentState;
-use crate::llm::client::OllamaClient;
+use crate::llm::client::LlmClient;
 use crate::llm::prompt::CoderPrompt;
 use crate::tools::shell;
 use crate::tools::test;
 use crate::compressor::layer1;
 use crate::compressor::caveman::CavemanLevel;
 
-async fn coder_generate(client: &OllamaClient, model: &str, task: &str, context: &str, caveman: &CavemanLevel) -> String {
+async fn coder_generate(client: &LlmClient, model: &str, task: &str, context: &str, caveman: &CavemanLevel) -> String {
     let system = CoderPrompt::with_caveman(caveman);
     let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, task);
     client.generate(model, &prompt).await.unwrap_or_default()
@@ -32,7 +32,7 @@ fn compress_output(output: &str, label: &str) -> String {
     result.output
 }
 
-pub async fn execute_step(client: &OllamaClient, state: &mut AgentState, step: &PlanStep) {
+pub async fn execute_step(client: &LlmClient, state: &mut AgentState, step: &PlanStep) {
     let caveman = state.caveman;
     match step.step_type.as_str() {
         "create_file" => {

@@ -1,5 +1,5 @@
 models/
-
+.env
 # Rust build output
 /target/
 

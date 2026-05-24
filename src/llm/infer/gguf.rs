@@ -37,7 +37,7 @@ pub fn ggml_type_size(t: GgmlType) -> usize {
         GgmlType::Q8_0 => 34, GgmlType::Q8_1 => 36,
         GgmlType::Q2_K => 2 + 64 + 2, GgmlType::Q3_K => 2 + 32 + 2 + 64,
         GgmlType::Q4_K => 2 + 2 + 12 + 128, GgmlType::Q5_K => 2 + 2 + 12 + 32 + 128,
-        GgmlType::Q6_K => 64 + 16 + 32 + 2, GgmlType::Q8_K => 4 + 256 + 4 + 2,
+        GgmlType::Q6_K => 128 + 64 + 16 + 2, GgmlType::Q8_K => 4 + 256 + 32,
         GgmlType::IQ2_XXS | GgmlType::IQ2_XS => 2 + 4 + 32 + 64,
         GgmlType::IQ3_XXS => 2 + 4 + 64 + 32, GgmlType::IQ1_S => 2 + 4 + 32 + 32,
         GgmlType::IQ3_S => 2 + 4 + 64 + 32, GgmlType::IQ2_S => 2 + 4 + 32 + 64,
@@ -97,10 +97,26 @@ impl GgufReader {
                 10 | 11 => { rdr.metadata_int.insert(key.clone(), rdr.read_i64(&mut pos)); },
                 12 => { rdr.metadata_float.insert(key.clone(), rdr.read_f64(&mut pos)); },
                 9 => {
-                    let _arr_type = rdr.read_i32(&mut pos);
+                    let arr_type = rdr.read_i32(&mut pos);
                     let arr_n = rdr.read_u64(&mut pos) as usize;
-                    for _ in 0..arr_n {
-                        rdr.read_string(&mut pos);
+                    for i in 0..arr_n {
+                        match arr_type {
+                            0 | 1 | 7 => { rdr.read_u8(&mut pos); },
+                            2 | 3     => { rdr.read_u16(&mut pos); },
+                            4 | 5 | 6 => {
+                                let v = rdr.read_u32(&mut pos);
+                                rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
+                            },
+                            8 => {
+                                let s = rdr.read_string(&mut pos);
+                                rdr.metadata_str.insert(format!("{}_{}", key, i), s);
+                            },
+                            10 | 11 | 12 => {
+                                let v = rdr.read_u64(&mut pos);
+                                rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
+                            },
+                            _ => {},
+                        }
                     }
                 },
                 _ => {},

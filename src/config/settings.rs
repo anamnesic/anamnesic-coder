@@ -14,7 +14,7 @@ pub struct Config {
     pub allowed_commands: Vec<String>,
     pub blocked_commands: Vec<String>,
     pub use_local: bool,
-    pub local_model_path: Option<PathBuf>,
+    pub models_dir: PathBuf,
     pub max_seq_len: usize,
 }
 
@@ -42,7 +42,9 @@ impl Default for Config {
                 "format".into(), "del /f".into(), "rd /s".into(),
             ],
             use_local: false,
-            local_model_path: None,
+            models_dir: std::env::var("MODELS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("models")),
             max_seq_len: 2048,
         }
     }

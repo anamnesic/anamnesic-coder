@@ -6,12 +6,17 @@ mod types;
 mod config;
 mod hw_recommend;
 mod compressor;
+mod bench;
+mod ui;
+mod models_dev;
+mod providers;
 
 use clap::{Parser, Subcommand};
 use config::settings::Config;
 use agent::state::AgentState;
 use agent::r#loop::run_agent_loop;
-use llm::client::OllamaClient;
+use llm::client::LlmClient;
+use llm::model_resolver;
 use llm::infer::engine::InferenceEngine;
 use llm::infer::gguf::GgufReader;
 use llm::infer::model::Model;
@@ -24,10 +29,15 @@ use anyhow::Result;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Use local GGUF inference instead of Ollama
     #[arg(long)]
     local: bool,
+    /// Offload matrix multiplications to OpenCL GPU (requires --local and --features gpu)
     #[arg(long)]
-    model: Option<PathBuf>,
+    gpu: bool,
+    /// Model name (e.g. gemma3:1b) or path to a .gguf file
+    #[arg(long)]
+    model: Option<String>,
     #[arg(short, long, default_value = "workspace")]
     dir: String,
     #[arg(long, default_value = "off")]
@@ -39,6 +49,63 @@ struct Cli {
 enum Commands {
     Check,
     Repl,
+    /// List locally available models
+    Models,
+    /// List cloud models from models.dev catalog
+    Cloud {
+        /// Filter by name/family/provider (empty = show all)
+        #[arg(default_value = "")]
+        query: String,
+    },
+    /// Configure and manage cloud provider API keys (stored securely at ~/.config/rustcode/providers.toml)
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
+    },
+    /// Benchmark all local models and show ranking vs hw_recommend predictions
+    Bench {
+        /// Category to evaluate against (general, coding, reasoning, chat)
+        #[arg(short, long, default_value = "coding")]
+        category: String,
+        /// Output JSON file for results
+        #[arg(short, long, default_value = "bench_results.json")]
+        output: String,
+    },
+}
+
+/// Sub-actions for `rust-agent providers`
+#[derive(Subcommand)]
+enum ProvidersAction {
+    /// List all providers from the models.dev catalog and their configuration status
+    List,
+    /// Show currently configured providers and their (masked) API keys
+    Show,
+    /// Set an API key for a provider  (e.g. rust-agent providers set openai sk-...)
+    Set {
+        /// Provider ID as in models.dev (e.g. openai, anthropic, groq, mistral)
+        provider: String,
+        /// API key — read from stdin if omitted (safer: avoids shell history)
+        api_key: Option<String>,
+        /// Override the API base URL (optional; uses provider default if not set)
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Remove a provider's API key and config
+    Remove {
+        provider: String,
+    },
+    /// Enable or disable a provider without removing its key
+    Enable {
+        provider: String,
+        #[arg(value_parser = clap::value_parser!(bool))]
+        enabled: bool,
+    },
+    /// Test connectivity and API key validity for a provider
+    Test {
+        provider: String,
+    },
+    /// Import API keys from environment variables (reads models.dev env var names)
+    Import,
 }
 
 #[tokio::main]
@@ -48,17 +115,58 @@ async fn main() -> Result<()> {
     let mut cfg = Config::default();
     cfg.workspace_dir = PathBuf::from(&cli.dir);
     cfg.use_local = cli.local;
-    cfg.local_model_path = cli.model;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
 
     match cli.command {
         Some(Commands::Check) => hw_check().await?,
+        Some(Commands::Cloud { query }) => {
+            let catalog = models_dev::ModelsDevClient::load();
+            catalog.print_list(&query);
+        },
+        Some(Commands::Providers { action }) => {
+            handle_providers(action)?;
+        },
+        Some(Commands::Bench { category, output }) => {
+            let results = bench::model_bench::rank_models(&state.config.models_dir, &category);
+            bench::model_bench::save_ranking(&results, std::path::Path::new(&output))?;
+            bench::display::show_ranking_table(&results)?;
+        },
+        Some(Commands::Models) => {
+            let models = model_resolver::list_models(&state.config.models_dir);
+            if models.is_empty() {
+                println!("No models found in {}", state.config.models_dir.display());
+            } else {
+                println!("Available models:");
+                for m in models { println!("  {}", m); }
+            }
+        },
         Some(Commands::Repl) | None => {
             if state.config.use_local {
-                run_local(&state.config).await?;
+                let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
+                let blob_path = model_resolver::resolve_model(model_name, &state.config.models_dir)?;
+                println!("Loading {} from {}...", model_name, blob_path.display());
+                let model = Model::load(&blob_path.to_string_lossy())?;
+                let reader = GgufReader::load(&blob_path.to_string_lossy())?;
+                let tokenizer = Tokenizer::load_from_gguf(&reader)?;
+                let mut engine = InferenceEngine::new(model, tokenizer, state.config.max_seq_len);
+                if cli.gpu {
+                    engine.init_gpu();
+                    if !engine.gpu_active() {
+                        println!("Warning: GPU not available, falling back to CPU.");
+                    } else {
+                        println!("GPU acceleration active.");
+                    }
+                }
+                let client = LlmClient::local(engine);
+
+                if let Some(task) = cli.task {
+                    run_agent_loop(&client, &mut state, &task).await;
+                } else {
+                    repl(&client, &mut state).await?;
+                }
             } else {
-                let client = OllamaClient::new(&state.config.ollama_host);
+                let client = LlmClient::ollama(&state.config.ollama_host);
                 if let Some(task) = cli.task {
                     run_agent_loop(&client, &mut state, &task).await;
                 } else {
@@ -70,7 +178,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn repl(client: &OllamaClient, state: &mut AgentState) -> Result<()> {
+async fn repl(client: &LlmClient, state: &mut AgentState) -> Result<()> {
     use std::io::Write;
     loop {
         let prompt = match state.caveman {
@@ -141,28 +249,95 @@ async fn hw_check() -> Result<()> {
     Ok(())
 }
 
-async fn run_local(cfg: &Config) -> Result<()> {
-    let model_path = cfg.local_model_path.as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "model.gguf".into());
+fn handle_providers(action: ProvidersAction) -> Result<()> {
+    use providers::{ProviderStore, print_store, test_provider};
+    let catalog_client = models_dev::ModelsDevClient::load();
+    let catalog = &catalog_client.catalog;
 
-    println!("Loading model from {}...", model_path);
-    let model = Model::load(&model_path)?;
-    let reader = GgufReader::load(&model_path)?;
-    let tokenizer = Tokenizer::load_from_gguf(&reader)?;
-    let mut engine = InferenceEngine::new(model, tokenizer, cfg.max_seq_len);
-
-    use std::io::Write;
-    loop {
-        print!("\n[prompt] ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        if input.is_empty() || input == "/exit" || input == "/quit" { break; }
-        println!("Generating...");
-        let result = engine.generate(input, 256, 0.8, 40)?;
-        println!("\n{}", result);
+    match action {
+        ProvidersAction::List => {
+            let mut ids: Vec<&str> = catalog.keys().map(|s| s.as_str()).collect();
+            ids.sort();
+            println!("\n  Available providers from models.dev catalog");
+            println!("{}", "─".repeat(80));
+            println!("  {:<20} {:<40} {:<15}", "Provider ID", "API base", "Env var");
+            println!("{}", "─".repeat(80));
+            for id in ids {
+                let p = &catalog[id];
+                let env = p.env.first().map(|s| s.as_str()).unwrap_or("—");
+                println!("  {:<20} {:<40} {:<15}", id, p.api, env);
+            }
+            println!("\n  Use: rust-agent providers set <id> <api-key>");
+        }
+        ProvidersAction::Show => {
+            let store = ProviderStore::load();
+            print_store(&store, catalog);
+        }
+        ProvidersAction::Set { provider, api_key, base } => {
+            let key = match api_key {
+                Some(k) => k,
+                None => {
+                    // Read from stdin without echoing
+                    eprint!("  API key for '{}' (input hidden): ", provider);
+                    rpassword::read_password().unwrap_or_default()
+                }
+            };
+            if key.is_empty() {
+                anyhow::bail!("API key cannot be empty");
+            }
+            let mut store = ProviderStore::load();
+            store.set_key(&provider, &key);
+            if let Some(b) = base {
+                store.set_base(&provider, &b);
+            }
+            store.save()?;
+            println!("  ✓ API key saved for '{}' ({})", provider, ProviderStore::config_path_display());
+        }
+        ProvidersAction::Remove { provider } => {
+            let mut store = ProviderStore::load();
+            store.remove(&provider);
+            store.save()?;
+            println!("  ✓ Removed config for '{}'", provider);
+        }
+        ProvidersAction::Enable { provider, enabled } => {
+            let mut store = ProviderStore::load();
+            store.set_enabled(&provider, enabled);
+            store.save()?;
+            println!("  ✓ '{}' is now {}", provider, if enabled { "enabled" } else { "disabled" });
+        }
+        ProvidersAction::Test { provider } => {
+            let mut store = ProviderStore::load();
+            let entry = store.providers.entry(provider.clone()).or_default();
+            // fill api_base from catalog if not set
+            if entry.api_base.is_none() {
+                if let Some(prov) = catalog.get(&provider) {
+                    if !prov.api.is_empty() {
+                        entry.api_base = Some(prov.api.clone());
+                    }
+                }
+            }
+            let entry = entry.clone();
+            print!("  Testing '{}' ... ", provider);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            match test_provider(&provider, &entry) {
+                Ok(msg) => println!("✓ {msg}"),
+                Err(e)  => println!("✗ {e}"),
+            }
+        }
+        ProvidersAction::Import => {
+            match ProviderStore::import_from_env(catalog) {
+                Ok(imported) if imported.is_empty() => {
+                    println!("  No new API keys found in environment.");
+                    println!("  Set env vars like OPENAI_API_KEY, GROQ_API_KEY, etc. before running.");
+                }
+                Ok(imported) => {
+                    println!("  ✓ Imported {} provider(s):", imported.len());
+                    for s in &imported { println!("    • {s}"); }
+                    println!("  Saved to: {}", ProviderStore::config_path_display());
+                }
+                Err(e) => eprintln!("  ✗ Import failed: {e}"),
+            }
+        }
     }
     Ok(())
 }

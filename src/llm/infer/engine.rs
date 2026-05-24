@@ -12,6 +12,8 @@ pub struct InferenceEngine {
     max_seq_len: usize,
     act: Vec<f32>,
     weights: Vec<f32>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<super::gpu::GpuContext>,
 }
 
 fn tn(layer: i64, base: &str) -> String {
@@ -21,6 +23,34 @@ fn tn(layer: i64, base: &str) -> String {
 fn dequant_tensor(t: &Tensor, weights: &mut [f32]) {
     t.dequantize_to_f32(weights);
 }
+
+/// GEMV helper: out[0..rows] = W × x[0..cols]
+/// Tries GPU first; falls back to CPU dequant + matmul_nt.
+fn gemv(
+    name: &str,
+    model: &super::model::Model,
+    weights: &mut [f32],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    #[cfg(feature = "gpu")] gpu: &mut Option<super::gpu::GpuContext>,
+) {
+    #[cfg(feature = "gpu")]
+    if let Some(ref mut ctx) = gpu {
+        match ctx.gemv(name, &x[..cols], &mut out[..rows]) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => log::debug!("GPU GEMV failed for {}: {} — using CPU", name, e),
+        }
+    }
+    // CPU path
+    if let Some(t) = model.tensors.get(name) {
+        dequant_tensor(t, weights);
+        ops::matmul_nt(out, x, weights, 1, rows, cols);
+    }
+}
+
 
 fn forward_layer(
     model: &super::model::Model,
@@ -32,6 +62,7 @@ fn forward_layer(
     hidden: &mut [f32], scores: &mut [f32], attn_out: &mut [f32],
     residual: &mut [f32], q_buf: &mut [f32], k_buf: &mut [f32],
     v_buf: &mut [f32], gate_buf: &mut [f32], up_buf: &mut [f32],
+    #[cfg(feature = "gpu")] gpu: &mut Option<super::gpu::GpuContext>,
 ) {
     let n_embd = model.n_embd as usize;
     let n_head = model.n_head as usize;
@@ -49,21 +80,12 @@ fn forward_layer(
         ops::rms_norm_inplace(hidden, &weights[..n_embd], n_embd, 1, model.norm_eps);
     }
 
-    let name = tn(layer, "attn_q");
-    if let Some(t) = model.tensors.get(&name) {
-        dequant_tensor(t, weights);
-        ops::matmul_nt(q_buf, hidden, weights, 1, q_size, n_embd);
-    }
-    let name = tn(layer, "attn_k");
-    if let Some(t) = model.tensors.get(&name) {
-        dequant_tensor(t, weights);
-        ops::matmul_nt(k_buf, hidden, weights, 1, kv_size, n_embd);
-    }
-    let name = tn(layer, "attn_v");
-    if let Some(t) = model.tensors.get(&name) {
-        dequant_tensor(t, weights);
-        ops::matmul_nt(v_buf, hidden, weights, 1, kv_size, n_embd);
-    }
+    gemv(&tn(layer, "attn_q"), model, weights, hidden, q_buf, q_size, n_embd,
+        #[cfg(feature = "gpu")] gpu);
+    gemv(&tn(layer, "attn_k"), model, weights, hidden, k_buf, kv_size, n_embd,
+        #[cfg(feature = "gpu")] gpu);
+    gemv(&tn(layer, "attn_v"), model, weights, hidden, v_buf, kv_size, n_embd,
+        #[cfg(feature = "gpu")] gpu);
 
     ops::rope(q_buf, q_size, n_head, n_past, 1, model.rope_freq_base);
     ops::rope(k_buf, kv_size, n_kv_head, n_past, 1, model.rope_freq_base);
@@ -116,16 +138,12 @@ fn forward_layer(
         }
     }
 
-    let name = tn(layer, "attn_output");
-    if let Some(t) = model.tensors.get(&name) {
-        dequant_tensor(t, weights);
-        ops::matmul_nt(gate_buf, attn_out, weights, 1, n_embd, n_embd);
-        attn_out.copy_from_slice(&gate_buf[..n_embd]);
-    }
+    // attn_output: [n_embd × n_embd]
+    gemv(&tn(layer, "attn_output"), model, weights, attn_out, gate_buf, n_embd, n_embd,
+        #[cfg(feature = "gpu")] gpu);
+    attn_out[..n_embd].copy_from_slice(&gate_buf[..n_embd]);
 
-    for i in 0..n_embd {
-        hidden[i] += attn_out[i];
-    }
+    for i in 0..n_embd { hidden[i] += attn_out[i]; }
     residual.copy_from_slice(&hidden[..n_embd]);
 
     let name = tn(layer, "ffn_norm");
@@ -137,27 +155,16 @@ fn forward_layer(
     let gw_exists = model.tensors.contains_key(&tn(layer, "ffn_gate"));
     let uw_exists = model.tensors.contains_key(&tn(layer, "ffn_up"));
     if gw_exists && uw_exists {
-        let name = tn(layer, "ffn_gate");
-        if let Some(t) = model.tensors.get(&name) {
-            dequant_tensor(t, weights);
-        }
-        ops::matmul_nt(gate_buf, hidden, weights, 1, n_ff, n_embd);
-        let name = tn(layer, "ffn_up");
-        if let Some(t) = model.tensors.get(&name) {
-            dequant_tensor(t, weights);
-        }
-        ops::matmul_nt(up_buf, hidden, weights, 1, n_ff, n_embd);
+        gemv(&tn(layer, "ffn_gate"), model, weights, hidden, gate_buf, n_ff, n_embd,
+            #[cfg(feature = "gpu")] gpu);
+        gemv(&tn(layer, "ffn_up"),   model, weights, hidden, up_buf,   n_ff, n_embd,
+            #[cfg(feature = "gpu")] gpu);
         ops::silu_inplace(gate_buf, n_ff);
         for i in 0..n_ff { gate_buf[i] *= up_buf[i]; }
 
-        let name = tn(layer, "ffn_down");
-        if let Some(t) = model.tensors.get(&name) {
-            dequant_tensor(t, weights);
-            ops::matmul_nt(hidden, gate_buf, weights, 1, n_embd, n_ff);
-        }
-        for i in 0..n_embd {
-            hidden[i] += residual[i];
-        }
+        gemv(&tn(layer, "ffn_down"), model, weights, gate_buf, hidden, n_embd, n_ff,
+            #[cfg(feature = "gpu")] gpu);
+        for i in 0..n_embd { hidden[i] += residual[i]; }
     }
 }
 
@@ -173,8 +180,36 @@ impl InferenceEngine {
         let kv_cache_size = (model.n_layer * 2 * max_seq_len as i64 * model.n_embd) as usize;
         let kv_cache = vec![0.0f32; kv_cache_size];
 
-        InferenceEngine { model, tokenizer, kv_cache, n_past: 0, max_seq_len, act, weights }
+        InferenceEngine {
+            model, tokenizer, kv_cache, n_past: 0, max_seq_len, act, weights,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        }
     }
+
+    /// Try to initialise GPU acceleration. Logs a warning if unavailable.
+    pub fn init_gpu(&mut self) {
+        #[cfg(feature = "gpu")]
+        {
+            match super::gpu::GpuContext::new(&self.model) {
+                Ok(ctx) => {
+                    log::info!("GPU acceleration enabled");
+                    self.gpu = Some(ctx);
+                }
+                Err(e) => log::warn!("GPU init failed (CPU fallback): {}", e),
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        log::warn!("Built without --features gpu; using CPU only");
+    }
+
+    pub fn gpu_active(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        { self.gpu.is_some() }
+        #[cfg(not(feature = "gpu"))]
+        { false }
+    }
+
 
     fn forward(&mut self, token_id: u32, logits: &mut [f32]) -> Result<()> {
         let n_embd = self.model.n_embd as usize;
@@ -227,6 +262,7 @@ impl InferenceEngine {
                 layer as i64,
                 act_head, scores_h, attn_out_h, residual,
                 q_buf, k_buf, v_buf, gate_buf, up_buf,
+                #[cfg(feature = "gpu")] &mut self.gpu,
             );
         }
 
@@ -255,6 +291,16 @@ impl InferenceEngine {
     }
 
     pub fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_k: usize) -> Result<String> {
+        let (text, _) = self.generate_inner(prompt, max_tokens, temperature, top_k, true)?;
+        Ok(text)
+    }
+
+    /// Silent generation for benchmarking. Returns (output_text, tokens_generated).
+    pub fn generate_bench(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_k: usize) -> Result<(String, usize)> {
+        self.generate_inner(prompt, max_tokens, temperature, top_k, false)
+    }
+
+    fn generate_inner(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_k: usize, verbose: bool) -> Result<(String, usize)> {
         let input_tokens = self.tokenizer.encode(prompt, 512);
         if input_tokens.is_empty() {
             anyhow::bail!("Failed to tokenize prompt");
@@ -263,6 +309,7 @@ impl InferenceEngine {
         let n_vocab = self.model.n_vocab as usize;
         let mut logits = vec![0.0f32; n_vocab];
         let mut output = String::new();
+        let mut tokens_generated = 0usize;
 
         for &tok in &input_tokens {
             self.forward(tok, &mut logits)?;
@@ -275,7 +322,7 @@ impl InferenceEngine {
             if temperature < 0.01 {
                 let idx = logits.iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 last_token = idx as u32;
@@ -307,13 +354,15 @@ impl InferenceEngine {
             if last_token == self.tokenizer.eos_id { break; }
             let piece = self.tokenizer.decode(&[last_token]);
             output.push_str(&piece);
-            print!("{}", piece);
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-
+            tokens_generated += 1;
+            if verbose {
+                print!("{}", piece);
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+            }
             self.forward(last_token, &mut logits)?;
         }
-        println!();
-        Ok(output)
+        if verbose { println!(); }
+        Ok((output, tokens_generated))
     }
 }

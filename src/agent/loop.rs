@@ -1,9 +1,9 @@
 use crate::agent::state::AgentState;
 use crate::agent::planner;
 use crate::agent::executor;
-use crate::llm::client::OllamaClient;
+use crate::llm::client::LlmClient;
 
-pub async fn run_agent_loop(client: &OllamaClient, state: &mut AgentState, task: &str) {
+pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &str) {
     let caveman_tag = state.caveman.tag();
     if !caveman_tag.is_empty() {
         println!("[{}]", caveman_tag);
