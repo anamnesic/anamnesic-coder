@@ -12,6 +12,7 @@ pub enum GgmlType {
     IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20,
     IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26, I64 = 27,
     F64 = 28, IQ1_M = 29, BF16 = 30,
+    TQ1_0 = 31, TQ2_0 = 32, NVFP4 = 33,
 }
 
 pub fn ggml_blck_size(t: GgmlType) -> usize {
@@ -85,16 +86,16 @@ impl GgufReader {
             let val_type_i = rdr.read_i32(&mut pos);
             match val_type_i {
                 0 => { rdr.metadata_uint32_insert(&key, rdr.read_u8(&mut pos) as u32); },
-                1 => { rdr.metadata_int.insert(key, rdr.read_i8(&mut pos) as i64); },
+                1 => { rdr.metadata_int.insert(key.clone(), rdr.read_i8(&mut pos) as i64); },
                 2 => { rdr.metadata_uint32_insert(&key, rdr.read_u16(&mut pos) as u32); },
-                3 => { rdr.metadata_int.insert(key, rdr.read_i16(&mut pos) as i64); },
+                3 => { rdr.metadata_int.insert(key.clone(), rdr.read_i16(&mut pos) as i64); },
                 4 => { rdr.metadata_uint32_insert(&key, rdr.read_u32(&mut pos)); },
-                5 => { rdr.metadata_int.insert(key, rdr.read_i32(&mut pos) as i64); },
-                6 => { rdr.metadata_float.insert(key, rdr.read_f32(&mut pos) as f64); },
-                7 => { rdr.metadata_int.insert(key, rdr.read_u8(&mut pos) as i64); },
-                8 => { rdr.metadata_str.insert(key, rdr.read_string(&mut pos)); },
-                10 | 11 => { rdr.metadata_int.insert(key, rdr.read_i64(&mut pos)); },
-                12 => { rdr.metadata_float.insert(key, rdr.read_f64(&mut pos)); },
+                5 => { rdr.metadata_int.insert(key.clone(), rdr.read_i32(&mut pos) as i64); },
+                6 => { rdr.metadata_float.insert(key.clone(), rdr.read_f32(&mut pos) as f64); },
+                7 => { rdr.metadata_int.insert(key.clone(), rdr.read_u8(&mut pos) as i64); },
+                8 => { rdr.metadata_str.insert(key.clone(), rdr.read_string(&mut pos)); },
+                10 | 11 => { rdr.metadata_int.insert(key.clone(), rdr.read_i64(&mut pos)); },
+                12 => { rdr.metadata_float.insert(key.clone(), rdr.read_f64(&mut pos)); },
                 9 => {
                     let _arr_type = rdr.read_i32(&mut pos);
                     let arr_n = rdr.read_u64(&mut pos) as usize;
@@ -119,7 +120,7 @@ impl GgufReader {
             let ty_i = rdr.read_i32(&mut pos);
             let ty = unsafe { std::mem::transmute::<i32, GgmlType>(ty_i) };
             let offset = rdr.read_u64(&mut pos);
-            rdr.tensors.insert(name, GgufTensorInfo { name, dims, ty, offset });
+            rdr.tensors.insert(name.clone(), GgufTensorInfo { name, dims, ty, offset });
         }
 
         let align = rdr.alignment as usize;

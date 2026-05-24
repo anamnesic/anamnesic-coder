@@ -1,3 +1,5 @@
+use crate::compressor::caveman::CavemanLevel;
+
 pub struct PlannerPrompt;
 
 impl PlannerPrompt {
@@ -19,6 +21,16 @@ Output JSON format:
 
 Keep plans minimal: 1-5 steps. Only include necessary steps."#
     }
+
+    pub fn with_caveman(level: &CavemanLevel) -> String {
+        let base = Self::system();
+        let suffix = level.system_prompt_suffix();
+        if suffix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}{}", base, suffix)
+        }
+    }
 }
 
 pub struct CoderPrompt;
@@ -35,7 +47,13 @@ Rules:
 - Follow existing code style"#
     }
 
-    pub fn generate_file_system() -> &'static str {
-        "Return ONLY the file content inside a code block. Do NOT include the filename or extra explanation."
+    pub fn with_caveman(level: &CavemanLevel) -> String {
+        let base = Self::system();
+        let suffix = level.system_prompt_suffix();
+        if suffix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}{}", base, suffix)
+        }
     }
 }

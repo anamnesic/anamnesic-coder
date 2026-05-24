@@ -4,20 +4,43 @@ use crate::llm::client::OllamaClient;
 use crate::llm::prompt::CoderPrompt;
 use crate::tools::shell;
 use crate::tools::test;
+use crate::compressor::layer1;
+use crate::compressor::caveman::CavemanLevel;
 
-async fn coder_generate(client: &OllamaClient, model: &str, task: &str, context: &str) -> String {
-    let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", CoderPrompt::system(), context, task);
+async fn coder_generate(client: &OllamaClient, model: &str, task: &str, context: &str, caveman: &CavemanLevel) -> String {
+    let system = CoderPrompt::with_caveman(caveman);
+    let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, task);
     client.generate(model, &prompt).await.unwrap_or_default()
 }
 
+fn compress_output(output: &str, label: &str) -> String {
+    if output.len() < 200 {
+        return output.to_string();
+    }
+    let result = layer1::compress(output);
+    if result.compressed_lines < result.original_lines {
+        let saved = result.original_lines.saturating_sub(result.compressed_lines);
+        let pct = if result.original_lines > 0 {
+            (saved as f64 / result.original_lines as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        if label == "command" {
+            eprintln!("  [NTK-L1: {} lines ({}% saved)]", result.output.lines().count(), pct);
+        }
+    }
+    result.output
+}
+
 pub async fn execute_step(client: &OllamaClient, state: &mut AgentState, step: &PlanStep) {
+    let caveman = state.caveman;
     match step.step_type.as_str() {
         "create_file" => {
             if let Some(filename) = &step.filename {
                 println!("  Generating [{}]...", filename);
                 let context = grep_context(state);
                 let content = coder_generate(client, &state.config.coder_model,
-                    &format!("Create file '{}': {}", filename, step.description), &context).await;
+                    &format!("Create file '{}': {}", filename, step.description), &context, &caveman).await;
                 if !content.is_empty() {
                     if let Some(code_start) = content.find("```") {
                         let after = &content[code_start + 3..];
@@ -41,8 +64,9 @@ pub async fn execute_step(client: &OllamaClient, state: &mut AgentState, step: &
                     println!("  File {} not found", filename);
                     return;
                 }
+                let system = CoderPrompt::with_caveman(&caveman);
                 let prompt = format!("{}\n\nFile: {}\n\nContent:\n```\n{}\n```\n\nInstruction: {}\nReturn only the modified file content.",
-                    CoderPrompt::system(), filename, content, step.description);
+                    system, filename, content, step.description);
                 let edited = client.generate(&state.config.coder_model, &prompt).await.unwrap_or_default();
                 if !edited.is_empty() && edited != content {
                     state.files.write_file(filename, &edited).ok();
@@ -56,7 +80,8 @@ pub async fn execute_step(client: &OllamaClient, state: &mut AgentState, step: &
             if let Some(filename) = &step.filename {
                 match state.files.read_file(filename) {
                     Some(content) => {
-                        let truncated: String = content.chars().take(3000).collect();
+                        let compressed = compress_output(&content, "file");
+                        let truncated: String = compressed.chars().take(3000).collect();
                         println!("{}", truncated);
                         if content.len() > 3000 {
                             println!("  ...({} more chars)", content.len() - 3000);
@@ -66,32 +91,35 @@ pub async fn execute_step(client: &OllamaClient, state: &mut AgentState, step: &
                 }
             } else {
                 let results = search_code(state, &step.description);
-                println!("{}", results);
+                println!("{}", compress_output(&results, "search"));
             }
         },
         "search_code" => {
             let pattern = step.pattern.as_deref().unwrap_or(&step.description);
             let results = search_code(state, pattern);
-            println!("{}", if results.is_empty() { "  No results".into() } else { results });
+            let compressed = compress_output(&results, "search");
+            println!("{}", if compressed.is_empty() { "  No results".into() } else { compressed });
         },
         "run_command" => {
             let cmd = step.command.as_deref().unwrap_or("");
             if !cmd.is_empty() {
                 println!("  Running: {}", cmd);
                 let result = shell::run_command(cmd, &state.config);
-                let truncated: String = result.chars().take(2000).collect();
+                let compressed = compress_output(&result, "command");
+                let truncated: String = compressed.chars().take(2000).collect();
                 println!("{}", truncated);
             }
         },
         "run_tests" => {
             let output = test::run_tests(&step.description, &state.config);
             state.last_test_output = output.clone();
-            let truncated: String = output.chars().take(2000).collect();
+            let compressed = compress_output(&output, "test");
+            let truncated: String = compressed.chars().take(2000).collect();
             println!("{}", truncated);
         },
         "answer" => {
             let context = grep_context(state);
-            let answer = coder_generate(client, &state.config.coder_model, &step.description, &context).await;
+            let answer = coder_generate(client, &state.config.coder_model, &step.description, &context, &caveman).await;
             println!("{}", answer);
         },
         "git_init" => {

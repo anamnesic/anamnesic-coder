@@ -41,7 +41,7 @@ fn dequantize_q8_0_row(block: &[u8], out: &mut [f32], n: i64) {
         let d = half_to_f32(d_bits);
         for i in 0..32 {
             let q = block[b as usize * 34 + 2 + i as usize] as i8;
-            if b * 32 + i as i64 < n {
+            if b * 32 + (i as i64) < n {
                 out[(b * 32 + i as i64) as usize] = (q as f32) * d;
             }
         }

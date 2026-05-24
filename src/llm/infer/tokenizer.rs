@@ -135,7 +135,7 @@ impl Tokenizer {
                         result.push(id);
                     }
                 }
-                if let Some(&id) = self.token_to_id.get(&ch.to_string()) {
+                if let Some(&_id) = self.token_to_id.get(&ch.to_string()) {
                     current = ch.to_string();
                 } else {
                     for b in ch.to_string().bytes() {

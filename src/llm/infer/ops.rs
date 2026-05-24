@@ -1,5 +1,3 @@
-use std::f32::consts::E;
-
 pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], n: usize, rows: usize, eps: f32) {
     for r in 0..rows {
         let offset = r * n;
@@ -10,8 +8,22 @@ pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], n: usize, rows: usiz
     }
 }
 
+pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], n: usize, rows: usize, eps: f32) {
+    for r in 0..rows {
+        let offset = r * n;
+        let mut ss = 0.0f32;
+        for i in 0..n { ss += x[offset + i] * x[offset + i]; }
+        let s = 1.0 / (ss / n as f32 + eps).sqrt();
+        for i in 0..n { x[offset + i] = x[offset + i] * s * weight[i]; }
+    }
+}
+
 pub fn silu(out: &mut [f32], x: &[f32], n: usize) {
     for i in 0..n { out[i] = x[i] / (1.0 + (-x[i]).exp()); }
+}
+
+pub fn silu_inplace(x: &mut [f32], n: usize) {
+    for i in 0..n { x[i] = x[i] / (1.0 + (-x[i]).exp()); }
 }
 
 pub fn matmul(dst: &mut [f32], a: &[f32], b: &[f32], m: usize, n: usize, k: usize) {

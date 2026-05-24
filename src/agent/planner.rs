@@ -1,10 +1,12 @@
 use crate::llm::client::OllamaClient;
 use crate::llm::prompt::PlannerPrompt;
-use crate::types::plan::Plan;
+use crate::types::plan::{Plan, PlanStep};
+use crate::compressor::caveman::CavemanLevel;
 use anyhow::Result;
 
-pub async fn plan_task(client: &OllamaClient, model: &str, task: &str, context: &str) -> Result<Plan> {
-    let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", PlannerPrompt::system(), context, task);
+pub async fn plan_task(client: &OllamaClient, model: &str, task: &str, context: &str, caveman: &CavemanLevel) -> Result<Plan> {
+    let system = PlannerPrompt::with_caveman(caveman);
+    let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, task);
     let response = client.generate(model, &prompt).await?;
 
     if let Some(json_start) = response.find('{') {

@@ -4,11 +4,15 @@ use crate::agent::executor;
 use crate::llm::client::OllamaClient;
 
 pub async fn run_agent_loop(client: &OllamaClient, state: &mut AgentState, task: &str) {
+    let caveman_tag = state.caveman.tag();
+    if !caveman_tag.is_empty() {
+        println!("[{}]", caveman_tag);
+    }
     println!("[Planning] {}", task);
     state.session.add_message("user", task);
 
     let context = state.session.get_context();
-    let plan = planner::plan_task(client, &state.config.planner_model, task, &context).await
+    let plan = planner::plan_task(client, &state.config.planner_model, task, &context, &state.caveman).await
         .unwrap_or_else(|e| {
             eprintln!("Planner error: {}. Falling back to direct execution.", e);
             crate::types::plan::Plan {
