@@ -48,6 +48,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Check,
+    /// Launch the terminal UI
+    Tui,
     Repl,
     /// List locally available models
     Models,
@@ -111,6 +113,7 @@ enum ProvidersAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).ok();
+    llm::infer::ops::init_thread_pool();
     let cli = Cli::parse();
     let mut cfg = Config::default();
     cfg.workspace_dir = PathBuf::from(&cli.dir);
@@ -139,6 +142,22 @@ async fn main() -> Result<()> {
             } else {
                 println!("Available models:");
                 for m in models { println!("  {}", m); }
+            }
+        },
+        Some(Commands::Tui) => {
+            if state.config.use_local {
+                let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
+                let blob_path = model_resolver::resolve_model(model_name, &state.config.models_dir)?;
+                println!("Loading {} from {}...", model_name, blob_path.display());
+                let model = Model::load(&blob_path.to_string_lossy())?;
+                let reader = GgufReader::load(&blob_path.to_string_lossy())?;
+                let tokenizer = Tokenizer::load_from_gguf(&reader)?;
+                let engine = InferenceEngine::new(model, tokenizer, state.config.max_seq_len);
+                let client = LlmClient::local(engine);
+                ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            } else {
+                let client = LlmClient::ollama(&state.config.ollama_host);
+                ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
         },
         Some(Commands::Repl) | None => {

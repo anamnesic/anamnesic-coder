@@ -9,8 +9,9 @@ use crate::hw_recommend::{detector, recommender, catalog, scoring};
 use crate::models_dev::{ModelsDevClient, CloudMatch};
 
 const BENCH_PROMPT: &str = "Write a Python function that computes fibonacci numbers.";
-const BENCH_TOKENS: usize = 60;
-const BENCH_TEMP: f32 = 0.0; // greedy for reproducibility
+const BENCH_TOKENS: usize = 20;   // enough to measure TPS without hanging for minutes
+const BENCH_TEMP: f32 = 0.0;      // greedy for reproducibility
+const BENCH_TIMEOUT_SECS: u64 = 120; // skip models that take longer than 2 min
 
 /// Models to skip — not inference models.
 const SKIP_MODELS: &[&str] = &["nomic-embed-text:latest", "qwen3-coder:480b-cloud"];
@@ -64,9 +65,21 @@ pub fn benchmark_model(name: &str, models_dir: &Path) -> BenchResult {
 
     let mut engine = InferenceEngine::new(model, tokenizer, 512);
     let t1 = Instant::now();
-    let (output, tokens_out) = match engine.generate_bench(BENCH_PROMPT, BENCH_TOKENS, BENCH_TEMP, 40) {
-        Ok(r) => r,
-        Err(e) => return BenchResult::error(name, format!("generate: {e}")),
+
+    // Run generation in a thread with a timeout so slow models don't block forever
+    let (output, tokens_out) = {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let prompt = BENCH_PROMPT.to_string();
+        std::thread::spawn(move || {
+            let res = engine.generate_bench(&prompt, BENCH_TOKENS, BENCH_TEMP, 40);
+            let _ = tx.send(res);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(BENCH_TIMEOUT_SECS)) {
+            Ok(Ok(r))  => r,
+            Ok(Err(e)) => return BenchResult::error(name, format!("generate: {e}")),
+            Err(_)     => return BenchResult::error(name, format!("timeout after {BENCH_TIMEOUT_SECS}s")),
+        }
     };
     let gen_ms = t1.elapsed().as_millis() as u64;
 

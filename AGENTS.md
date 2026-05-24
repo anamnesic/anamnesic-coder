@@ -11,5 +11,10 @@ This file lists all the index.md files created in the src directory and its subd
 - [`src/hw_recommend/index.md`](src/hw_recommend/index.md) - Documentation for the hardware recommendation module
 - [`src/llm/index.md`](src/llm/index.md) - Documentation for the LLM module
 - [`src/llm/infer/index.md`](src/llm/infer/index.md) - Documentation for the LLM inference submodule
+ - [`src/bench/index.md`](src/bench/index.md) - Documentation for benchmarking utilities
+ - [`src/memory/index.md`](src/memory/index.md) - Documentation for memory subsystems
+ - [`src/repo/index.md`](src/repo/index.md) - Documentation for repository helpers
+ - [`src/tools/index.md`](src/tools/index.md) - Documentation for tooling helpers
+ - [`src/types/index.md`](src/types/index.md) - Documentation for shared types
 
 Each index.md file contains a list of files in that directory with brief descriptions of their purpose.

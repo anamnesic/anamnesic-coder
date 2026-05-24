@@ -25,4 +25,5 @@ ratatui = "0.29"
 crossterm = "0.28"
 toml = "0.8"
 rpassword = "7"
+rayon = "1"
 ocl = { version = "0.19", optional = true }
