@@ -62,6 +62,7 @@ impl App {
             editor_row: 0,
             editor_col: 0,
             editor_dirty: false,
+            editor_scroll: 0,
         }
     }
 
@@ -200,9 +201,10 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                                         String::new()
                                     };
                                     let (left, right) = line.split_at(guard.editor_col.min(line.len()));
-                                    if guard.editor_row < guard.editor_lines.len() {
-                                        guard.editor_lines[guard.editor_row] = left.to_string();
-                                        guard.editor_lines.insert(guard.editor_row + 1, right.to_string());
+                                    let row = guard.editor_row;
+                                    if row < guard.editor_lines.len() {
+                                        guard.editor_lines[row] = left.to_string();
+                                        guard.editor_lines.insert(row + 1, right.to_string());
                                     } else {
                                         guard.editor_lines.push(left.to_string());
                                         guard.editor_lines.push(right.to_string());
@@ -376,15 +378,17 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
             // compute visible lines based on scroll and area height
             let area_height = right_chunks[0].height as usize - 2; // leave room for borders
             let total_lines = app.editor_lines.len();
-            if app.editor_scroll + area_height > total_lines {
-                if total_lines > area_height { app.editor_scroll = total_lines - area_height; } else { app.editor_scroll = 0; }
-            }
-            let end = std::cmp::min(app.editor_scroll + area_height, total_lines);
-            let visible = app.editor_lines[app.editor_scroll..end].join("\n");
+            let scroll = if app.editor_scroll + area_height > total_lines {
+                if total_lines > area_height { total_lines - area_height } else { 0 }
+            } else {
+                app.editor_scroll
+            };
+            let end = std::cmp::min(scroll + area_height, total_lines);
+            let visible = app.editor_lines[scroll..end].join("\n");
             let editor = Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(editor, right_chunks[0]);
             // set cursor in editor area relative to scroll
-            let r = (app.editor_row.saturating_sub(app.editor_scroll)) as u16;
+            let r = (app.editor_row.saturating_sub(scroll)) as u16;
             let c = app.editor_col as u16;
             f.set_cursor(right_chunks[0].x + c + 1, right_chunks[0].y + r + 1);
         } else {
