@@ -1,4 +1,4 @@
-# Rust Agent
+# anamnesic-coder
 
 Local coding agent — plan → act → verify. Fusion of TinyCoder + llm-on-legacy-gpus.
 

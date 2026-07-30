@@ -1,5 +1,5 @@
 [package]
-name = "rust-agent"
+name = "anamnesic-coder"
 version = "0.1.0"
 edition = "2021"
 description = "Local coding agent — fusion of TinyCoder + llm-on-legacy-gpus"
