@@ -247,7 +247,7 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32], n: i64) {
         let bs = b * BLOCK;
         let ql = &data[bs..bs+128];
         let qh = &data[bs+128..bs+192];
-        let sc = &data[bs+192..bs+208];
+        let _sc = &data[bs+192..bs+208];
         let d_all = half_to_f32(u16::from_le_bytes([data[bs+208], data[bs+209]]));
 
         let y_base = b * QK_K;

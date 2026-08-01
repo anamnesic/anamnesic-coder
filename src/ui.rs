@@ -4,12 +4,12 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
+    Terminal,
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, DisableLineWrap, EnableLineWrap},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
     error::Error,
@@ -86,7 +86,6 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
 
     // Create app and event channels
     let app = Arc::new(Mutex::new(App::new()));
-    let app_clone = app.clone();
     let state = Arc::new(Mutex::new(state));
     // populate sidebar with workspace files
     {
@@ -310,7 +309,7 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                         if guard.focus == Focus::Editor {
                             if let Some(fname) = &guard.editor_file {
                                 let content = guard.editor_lines.join("\n");
-                                let mut st = state.lock().unwrap();
+                                let st = state.lock().unwrap();
                                 match st.files.write_file(fname, &content) {
                                     Ok(_) => {
                                         guard.add_message("Info", "File saved");
@@ -342,8 +341,8 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
 }
 
 fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<(), Box<dyn Error>> {
-    f.draw(|mut f| {
-        let size = f.size();
+    f.draw(|f| {
+        let size = f.area();
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .margin(1)
@@ -390,7 +389,7 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
             // set cursor in editor area relative to scroll
             let r = (app.editor_row.saturating_sub(scroll)) as u16;
             let c = app.editor_col as u16;
-            f.set_cursor(right_chunks[0].x + c + 1, right_chunks[0].y + r + 1);
+            f.set_cursor_position((right_chunks[0].x + c + 1, right_chunks[0].y + r + 1));
         } else {
             let messages: Vec<ListItem> = app
                 .messages
@@ -428,7 +427,7 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
         f.render_widget(input, right_chunks[1]);
         // Set cursor position
         if !app.loading {
-            f.set_cursor(right_chunks[1].x + app.cursor_position as u16 + 1, right_chunks[1].y + 1);
+            f.set_cursor_position((right_chunks[1].x + app.cursor_position as u16 + 1, right_chunks[1].y + 1));
         }
     })?;
     Ok(())

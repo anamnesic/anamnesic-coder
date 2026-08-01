@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
@@ -69,7 +69,6 @@ fn render(f: &mut ratatui::Frame, results: &[BenchResult]) {
         .add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let ok_style    = Style::default().fg(Color::Green);
     let err_style   = Style::default().fg(Color::Red);
     let dim_style   = Style::default().fg(Color::DarkGray);
     let best_style  = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);

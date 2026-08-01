@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::SystemTime;
 use anyhow::{Result, Context};
 
 use super::types::{Catalog, ModelInfo, CloudMatch};
@@ -171,10 +170,18 @@ fn try_load_cache(path: &PathBuf) -> Option<Catalog> {
 
 fn fetch_and_cache(cache: &PathBuf) -> Result<Catalog> {
     log::info!("models.dev: fetching catalog from {API_URL}");
-    let body = reqwest::blocking::get(API_URL)
-        .context("HTTP GET models.dev/api.json")?
-        .text()
-        .context("reading response body")?;
+    // models.dev rejects requests without a browser-like User-Agent (HTTP 403).
+    let resp = reqwest::blocking::Client::builder()
+        .user_agent(format!("anamnesic-coder/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?
+        .get(API_URL)
+        .send()
+        .context("HTTP GET models.dev/api.json")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("models.dev: HTTP {} fetching {API_URL}", resp.status());
+    }
+    let body = resp.text().context("reading response body")?;
     let catalog: Catalog = serde_json::from_str(&body)
         .context("parsing models.dev JSON")?;
     if let Ok(j) = serde_json::to_vec(&catalog) {

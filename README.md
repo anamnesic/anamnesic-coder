@@ -58,6 +58,22 @@ Semantic compression for tool outputs (inspired by [VALRAW-ALL/ntk](https://gith
 
 Applied automatically to `run_command`, `run_tests`, `read_file`, `search_code` outputs.
 
+### ☁️ Cloud (NVIDIA NIM)
+
+Run the agent against NVIDIA NIM (OpenAI-compatible) instead of Ollama:
+
+```bash
+# Key from https://build.nvidia.com/ — put it in .env or export it
+echo "NVIDIA_API_KEY=nvapi-..." > .env
+
+cargo run -- --cloud "add user authentication"
+cargo run -- --cloud --cloud-model nvidia/llama-3.3-nemotron-super-49b-v1.5 "explain this code"
+```
+
+- `--provider <id>`: any OpenAI-compatible provider from the models.dev catalog (default `nvidia`).
+- `--cloud-model <id>`: override model (default `nvidia/llama-3.3-nemotron-super-49b-v1.5`).
+- Key priority: `providers set nvidia <key>` → `NVIDIA_API_KEY` from env or `.env`.
+
 ### 💻 Hardware Recommendation
 
 Auto-detect CPU/RAM/GPU and recommend optimal models. Based on [llm-checker](https://github.com/Pavelevich/llm-checker).

@@ -144,6 +144,31 @@ impl ProviderStore {
         store.save()?;
         Ok(imported)
     }
+
+    /// Resolve cloud endpoint + API key for a provider.
+    ///
+    /// Base URL priority: store override → models.dev catalog default → built-in default.
+    /// Key priority: store key → environment / `.env` file (e.g. `NVIDIA_API_KEY`).
+    pub fn resolve_cloud_credentials(provider_id: &str, catalog: &Catalog) -> Result<(String, String)> {
+        let env_name = catalog.get(provider_id)
+            .and_then(|p| p.env.first().map(|s| s.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}_API_KEY", provider_id.to_uppercase().replace('-', "_")));
+
+        let store = Self::load();
+        let key = store.api_key(provider_id).map(|s| s.to_string())
+            .or_else(|| load_env_with_dotenv().get(&env_name).filter(|v| !v.is_empty()).cloned())
+            .with_context(|| format!(
+                "no API key for provider '{provider_id}' (set via 'rust-agent providers set {provider_id} <key>' or ${env_name})"
+            ))?;
+
+        let base = store.providers.get(provider_id)
+            .and_then(|e| e.api_base.clone())
+            .or_else(|| catalog.get(provider_id).filter(|p| !p.api.is_empty()).map(|p| p.api.clone()))
+            .unwrap_or_else(|| crate::providers::verify::default_base(provider_id));
+
+        Ok((base, key))
+    }
 }
 
 fn config_path() -> Result<PathBuf> {

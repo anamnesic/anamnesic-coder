@@ -43,7 +43,8 @@ pub fn test_provider(provider_id: &str, entry: &ProviderEntry) -> Result<String>
     }
 }
 
-fn default_base(provider_id: &str) -> String {
+/// Default API base URL per provider (used when store/catalog have none).
+pub(crate) fn default_base(provider_id: &str) -> String {
     match provider_id {
         "openai"        => "https://api.openai.com/v1".into(),
         "anthropic"     => "https://api.anthropic.com/v1".into(),

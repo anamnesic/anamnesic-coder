@@ -1,4 +1,8 @@
-﻿mod agent;
+﻿// Experimental subsystems (GPU inference kernels, bench, hardware detection) expose
+// API that is not yet wired into the CLI — keep them compiling without dead-code noise.
+#![allow(dead_code)]
+
+mod agent;
 mod llm;
 mod tools;
 mod memory;
@@ -42,6 +46,18 @@ struct Cli {
     dir: String,
     #[arg(long, default_value = "off")]
     caveman: String,
+    /// Use a cloud provider (OpenAI-compatible, e.g. NVIDIA NIM) for inference
+    #[arg(long)]
+    cloud: bool,
+    /// Cloud provider id (default: nvidia — NVIDIA NIM)
+    #[arg(long, default_value = "nvidia")]
+    provider: String,
+    /// Cloud model id for inference (overrides planner/coder/summarizer defaults)
+    #[arg(long)]
+    cloud_model: Option<String>,
+    /// Resume a previous session (lists saved sessions to pick from)
+    #[arg(long)]
+    resume: bool,
     task: Option<String>,
 }
 
@@ -110,6 +126,44 @@ enum ProvidersAction {
     Import,
 }
 
+/// Default model for cloud (NVIDIA NIM) inference.
+const DEFAULT_CLOUD_MODEL: &str = "nvidia/llama-3.3-nemotron-super-49b-v1.5";
+
+/// Build the LLM client: cloud provider (`--cloud`), local GGUF (`--local`) or Ollama.
+async fn build_client(cli: &Cli, cfg: &mut Config) -> Result<LlmClient> {
+    if cli.cloud {
+        let catalog_client = tokio::task::spawn_blocking(models_dev::ModelsDevClient::load).await?;
+        let (base, key) = providers::ProviderStore::resolve_cloud_credentials(&cli.provider, &catalog_client.catalog)?;
+        let model = cli.cloud_model.clone()
+            .or_else(|| std::env::var("CLOUD_MODEL").ok())
+            .unwrap_or_else(|| DEFAULT_CLOUD_MODEL.to_string());
+        cfg.planner_model = std::env::var("PLANNER_MODEL").ok().unwrap_or_else(|| model.clone());
+        cfg.coder_model = std::env::var("CODER_MODEL").ok().unwrap_or_else(|| model.clone());
+        cfg.summarizer_model = std::env::var("SUMMARIZER_MODEL").ok().unwrap_or_else(|| model.clone());
+        println!("Cloud inference: provider='{}' base={} model={}", cli.provider, base, model);
+        Ok(LlmClient::cloud(&base, &key))
+    } else if cfg.use_local {
+        let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
+        let blob_path = model_resolver::resolve_model(model_name, &cfg.models_dir)?;
+        println!("Loading {} from {}...", model_name, blob_path.display());
+        let model = Model::load(&blob_path.to_string_lossy())?;
+        let reader = GgufReader::load(&blob_path.to_string_lossy())?;
+        let tokenizer = Tokenizer::load_from_gguf(&reader)?;
+        let mut engine = InferenceEngine::new(model, tokenizer, cfg.max_seq_len);
+        if cli.gpu {
+            engine.init_gpu();
+            if !engine.gpu_active() {
+                println!("Warning: GPU not available, falling back to CPU.");
+            } else {
+                println!("GPU acceleration active.");
+            }
+        }
+        Ok(LlmClient::local(engine))
+    } else {
+        Ok(LlmClient::ollama(&cfg.ollama_host))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).ok();
@@ -118,6 +172,7 @@ async fn main() -> Result<()> {
     let mut cfg = Config::default();
     cfg.workspace_dir = PathBuf::from(&cli.dir);
     cfg.use_local = cli.local;
+    let client = build_client(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
 
@@ -128,7 +183,7 @@ async fn main() -> Result<()> {
             catalog.print_list(&query);
         },
         Some(Commands::Providers { action }) => {
-            handle_providers(action)?;
+            handle_providers(action).await?;
         },
         Some(Commands::Bench { category, output }) => {
             let results = bench::model_bench::rank_models(&state.config.models_dir, &category);
@@ -145,52 +200,16 @@ async fn main() -> Result<()> {
             }
         },
         Some(Commands::Tui) => {
-            if state.config.use_local {
-                let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
-                let blob_path = model_resolver::resolve_model(model_name, &state.config.models_dir)?;
-                println!("Loading {} from {}...", model_name, blob_path.display());
-                let model = Model::load(&blob_path.to_string_lossy())?;
-                let reader = GgufReader::load(&blob_path.to_string_lossy())?;
-                let tokenizer = Tokenizer::load_from_gguf(&reader)?;
-                let engine = InferenceEngine::new(model, tokenizer, state.config.max_seq_len);
-                let client = LlmClient::local(engine);
-                ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            } else {
-                let client = LlmClient::ollama(&state.config.ollama_host);
-                ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            }
+            ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         },
         Some(Commands::Repl) | None => {
-            if state.config.use_local {
-                let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
-                let blob_path = model_resolver::resolve_model(model_name, &state.config.models_dir)?;
-                println!("Loading {} from {}...", model_name, blob_path.display());
-                let model = Model::load(&blob_path.to_string_lossy())?;
-                let reader = GgufReader::load(&blob_path.to_string_lossy())?;
-                let tokenizer = Tokenizer::load_from_gguf(&reader)?;
-                let mut engine = InferenceEngine::new(model, tokenizer, state.config.max_seq_len);
-                if cli.gpu {
-                    engine.init_gpu();
-                    if !engine.gpu_active() {
-                        println!("Warning: GPU not available, falling back to CPU.");
-                    } else {
-                        println!("GPU acceleration active.");
-                    }
-                }
-                let client = LlmClient::local(engine);
-
-                if let Some(task) = cli.task {
-                    run_agent_loop(&client, &mut state, &task).await;
-                } else {
-                    repl(&client, &mut state).await?;
-                }
+            if cli.resume {
+                resume_session(&mut state)?;
+            }
+            if let Some(task) = cli.task {
+                run_agent_loop(&client, &mut state, &task).await;
             } else {
-                let client = LlmClient::ollama(&state.config.ollama_host);
-                if let Some(task) = cli.task {
-                    run_agent_loop(&client, &mut state, &task).await;
-                } else {
-                    repl(&client, &mut state).await?;
-                }
+                repl(&client, &mut state).await?;
             }
         }
     }
@@ -255,6 +274,37 @@ async fn repl(client: &LlmClient, state: &mut AgentState) -> Result<()> {
     Ok(())
 }
 
+/// List saved sessions and (optionally) restore one into the session context.
+fn resume_session(state: &mut AgentState) -> Result<()> {
+    use std::io::Write;
+
+    let sessions = state.long_memory.get_recent_sessions(10)?;
+    if sessions.is_empty() {
+        println!("  No saved sessions found.");
+        return Ok(());
+    }
+    println!("\n  Recent sessions (memory.db):");
+    println!("{}", "─".repeat(70));
+    for (i, (ts, summary)) in sessions.iter().enumerate() {
+        let s: String = summary.chars().take(80).collect();
+        println!("  [{}] {}  {}", i + 1, ts, s);
+    }
+    print!("  Resume session # (0 = skip): ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let n: usize = input.trim().parse().unwrap_or(0);
+    if n == 0 {
+        return Ok(());
+    }
+    if let Some((ts, summary)) = sessions.get(n.saturating_sub(1)) {
+        let task = format!("Continue previous session ({ts}): {summary}");
+        state.session.add_message("user", &task);
+        println!("  ✓ Resumed session from {ts}");
+    }
+    Ok(())
+}
+
 async fn hw_check() -> Result<()> {
     let hw = hw_recommend::detector::detect_hardware();
     hw_recommend::recommender::print_recommendations(&hw, "general");
@@ -268,9 +318,9 @@ async fn hw_check() -> Result<()> {
     Ok(())
 }
 
-fn handle_providers(action: ProvidersAction) -> Result<()> {
+async fn handle_providers(action: ProvidersAction) -> Result<()> {
     use providers::{ProviderStore, print_store, test_provider};
-    let catalog_client = models_dev::ModelsDevClient::load();
+    let catalog_client = tokio::task::spawn_blocking(models_dev::ModelsDevClient::load).await?;
     let catalog = &catalog_client.catalog;
 
     match action {
