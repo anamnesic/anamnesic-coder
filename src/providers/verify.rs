@@ -53,6 +53,8 @@ pub(crate) fn default_base(provider_id: &str) -> String {
         "groq"          => "https://api.groq.com/openai/v1".into(),
         "togetherai"    => "https://api.together.xyz/v1".into(),
         "deepseek"      => "https://api.deepseek.com".into(),
+        "minimax"       => "https://api.minimax.chat/v1".into(),
+        "z-ai"          => "https://api.z.ai/v1".into(),
         "cohere"        => "https://api.cohere.ai/v1".into(),
         "openrouter"    => "https://openrouter.ai/api/v1".into(),
         "nvidia"        => "https://integrate.api.nvidia.com/v1".into(),

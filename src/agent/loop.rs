@@ -3,12 +3,16 @@ use crate::agent::planner;
 use crate::agent::executor;
 use crate::llm::client::LlmClient;
 use crate::tools::test;
+use anyhow::Result;
 
 /// Compact the session history when it exceeds a rough token budget.
 const CONTEXT_COMPACT_THRESHOLD: usize = 2500;
 
 /// Cap on verification output fed back into the fix loop (protects context).
 const FIX_FEEDBACK_CAP: usize = 2000;
+
+/// Maximum tool-use iterations per agent loop turn.
+const MAX_TOOL_ITERATIONS: usize = 5;
 
 async fn maybe_compact(client: &LlmClient, state: &mut AgentState) {
     if state.session.estimated_tokens() < CONTEXT_COMPACT_THRESHOLD {
@@ -19,12 +23,77 @@ async fn maybe_compact(client: &LlmClient, state: &mut AgentState) {
         "Summarize this coding-session conversation into a concise summary (max ~150 tokens). Keep key decisions, files touched, and open issues.\n\n{}",
         transcript
     );
-    if let Ok(summary) = client.generate_with_retry(&state.config.summarizer_model, &prompt).await {
+    if let Ok(summary) = client.generate_with_retry(&state.config.summarizer_model, &prompt, None).await {
         let summary = summary.trim();
         if !summary.is_empty() {
             state.session.compact(summary.to_string());
             eprintln!("  [context compacted — history summarized]");
         }
+    }
+}
+
+/// Run a tool-use iteration: send prompt with tools, execute any tool calls,
+/// feed results back, and repeat until the model produces final text.
+/// Returns the final text response.
+async fn run_tool_use_iteration(
+    client: &LlmClient,
+    model: &str,
+    prompt: &str,
+    tools: &Vec<crate::llm::client::ToolDef>,
+) -> Result<String> {
+    let mut conversation: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "user", "content": prompt}),
+    ];
+
+    for _iteration in 0..MAX_TOOL_ITERATIONS {
+        let response = client.chat(model, conversation.clone(), Some(tools)).await?;
+
+        // Try to parse the response as tool calls
+        if let Ok(tool_calls) = serde_json::from_str::<Vec<crate::llm::client::ToolCall>>(&response) {
+            if !tool_calls.is_empty() {
+                let mut tool_results = Vec::new();
+                for tc in &tool_calls {
+                    let result = execute_tool(&tc);
+                    tool_results.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    }));
+                }
+                // Add assistant message with tool calls and tool results
+                conversation.push(serde_json::json!({
+                    "role": "assistant",
+                    "tool_calls": tool_calls,
+                }));
+                for tr in tool_results {
+                    conversation.push(tr);
+                }
+                continue;
+            }
+        }
+
+        // No tool calls — this is the final response
+        return Ok(response);
+    }
+
+    Ok("Max tool iterations reached.".to_string())
+}
+
+/// Execute a single tool call and return the result as a string.
+fn execute_tool(tc: &crate::llm::client::ToolCall) -> String {
+    match tc.function.name.as_str() {
+        "read_file" => {
+            // The arguments contain the filename; we return a placeholder
+            // since the actual file tools are handled by the executor
+            format!("Tool read_file called with: {}", tc.function.arguments)
+        }
+        "run_command" => {
+            format!("Tool run_command called with: {}", tc.function.arguments)
+        }
+        "search_code" => {
+            format!("Tool search_code called with: {}", tc.function.arguments)
+        }
+        _ => format!("Unknown tool: {}", tc.function.name),
     }
 }
 
