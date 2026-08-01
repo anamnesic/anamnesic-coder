@@ -2,6 +2,7 @@ use crate::agent::state::AgentState;
 use crate::agent::planner;
 use crate::agent::executor;
 use crate::llm::client::LlmClient;
+use crate::llm::provider_chain::FallbackChain;
 use crate::tools::test;
 use anyhow::Result;
 
@@ -32,9 +33,26 @@ async fn maybe_compact(client: &LlmClient, state: &mut AgentState) {
     }
 }
 
+async fn maybe_compact_chain(chain: &FallbackChain, state: &mut AgentState) {
+    if state.session.estimated_tokens() < CONTEXT_COMPACT_THRESHOLD {
+        return;
+    }
+    let transcript = state.session.transcript();
+    let prompt = format!(
+        "Summarize this coding-session conversation into a concise summary (max ~150 tokens). Keep key decisions, files touched, and open issues.\n\n{}",
+        transcript
+    );
+    if let Ok(summary) = chain.complete(&prompt).await {
+        let summary = summary.trim();
+        if !summary.is_empty() {
+            state.session.compact(summary.to_string());
+            eprintln!("  [context compacted — history summarized]");
+        }
+    }
+}
+
 /// Run a tool-use iteration: send prompt with tools, execute any tool calls,
 /// feed results back, and repeat until the model produces final text.
-/// Returns the final text response.
 async fn run_tool_use_iteration(
     client: &LlmClient,
     model: &str,
@@ -48,7 +66,6 @@ async fn run_tool_use_iteration(
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         let response = client.chat(model, conversation.clone(), Some(tools)).await?;
 
-        // Try to parse the response as tool calls
         if let Ok(tool_calls) = serde_json::from_str::<Vec<crate::llm::client::ToolCall>>(&response) {
             if !tool_calls.is_empty() {
                 let mut tool_results = Vec::new();
@@ -60,7 +77,6 @@ async fn run_tool_use_iteration(
                         "content": result,
                     }));
                 }
-                // Add assistant message with tool calls and tool results
                 conversation.push(serde_json::json!({
                     "role": "assistant",
                     "tool_calls": tool_calls,
@@ -72,27 +88,17 @@ async fn run_tool_use_iteration(
             }
         }
 
-        // No tool calls — this is the final response
         return Ok(response);
     }
 
     Ok("Max tool iterations reached.".to_string())
 }
 
-/// Execute a single tool call and return the result as a string.
 fn execute_tool(tc: &crate::llm::client::ToolCall) -> String {
     match tc.function.name.as_str() {
-        "read_file" => {
-            // The arguments contain the filename; we return a placeholder
-            // since the actual file tools are handled by the executor
-            format!("Tool read_file called with: {}", tc.function.arguments)
-        }
-        "run_command" => {
-            format!("Tool run_command called with: {}", tc.function.arguments)
-        }
-        "search_code" => {
-            format!("Tool search_code called with: {}", tc.function.arguments)
-        }
+        "read_file" => format!("Tool read_file called with: {}", tc.function.arguments),
+        "run_command" => format!("Tool run_command called with: {}", tc.function.arguments),
+        "search_code" => format!("Tool search_code called with: {}", tc.function.arguments),
         _ => format!("Unknown tool: {}", tc.function.name),
     }
 }
@@ -137,8 +143,6 @@ pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &s
     state.session.add_action(&summary_str);
     state.long_memory.save_session(task, &summary_str).ok();
 
-    // Stop-hook gate: if the plan never ran a test suite but the workspace is a
-    // Cargo project, verify with `cargo test` before declaring the work done.
     if state.last_test_output.is_empty() && state.config.workspace_dir.join("Cargo.toml").exists() {
         eprintln!("  [verify] running cargo test...");
         state.last_test_output = test::run_tests("cargo test", &state.config);
@@ -155,6 +159,71 @@ pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &s
         let fix_task = format!("Fix issues in: {}{}", task, feedback);
         Box::pin(run_agent_loop(client, state, &fix_task)).await;
     }
+}
+
+/// Run the agent loop with a FallbackChain for cloud provider fallback.
+pub async fn run_agent_loop_with_fallback(
+    chain: &FallbackChain,
+    state: &mut AgentState,
+    task: &str,
+) -> Result<()> {
+    let caveman_tag = state.caveman.tag();
+    if !caveman_tag.is_empty() {
+        println!("[{}]", caveman_tag);
+    }
+    println!("[Planning] {}", task);
+    state.session.add_message("user", task);
+
+    maybe_compact_chain(chain, state).await;
+
+    let context = state.session.get_context();
+    let plan = planner::plan_task_with_chain(chain, &state.config.planner_model, task, &context, &state.caveman).await
+        .unwrap_or_else(|e| {
+            eprintln!("Planner error: {}. Falling back to direct execution.", e);
+            crate::types::plan::Plan {
+                steps: vec![crate::types::plan::PlanStep {
+                    step_type: "answer".into(),
+                    description: task.into(),
+                    filename: None, pattern: None, command: None,
+                }],
+            }
+        });
+
+    let steps = plan.steps;
+    if steps.is_empty() {
+        eprintln!("Planner returned no steps.");
+        return Ok(());
+    }
+
+    let total = steps.len();
+    for (i, step) in steps.iter().enumerate() {
+        println!("\n[{}/{}] [{}]: {}", i + 1, total, step.step_type, step.description);
+        executor::execute_step_with_chain(chain, state, step).await;
+    }
+
+    let summary: Vec<&str> = steps.iter().map(|s| s.description.as_str()).collect();
+    let summary_str = summary.join("; ");
+    state.session.add_action(&summary_str);
+    state.long_memory.save_session(task, &summary_str).ok();
+
+    if state.last_test_output.is_empty() && state.config.workspace_dir.join("Cargo.toml").exists() {
+        eprintln!("  [verify] running cargo test...");
+        state.last_test_output = test::run_tests("cargo test", &state.config);
+    }
+
+    if state.retries < state.config.max_retries && needs_fix(state) {
+        state.retries += 1;
+        let feedback = if state.last_test_output.is_empty() {
+            String::new()
+        } else {
+            let cap: String = state.last_test_output.chars().take(FIX_FEEDBACK_CAP).collect();
+            format!("\n\nVerification output from your last attempt (fix failures; do NOT weaken existing tests to make them pass):\n```\n{}\n```", cap)
+        };
+        let fix_task = format!("Fix issues in: {}{}", task, feedback);
+        Box::pin(run_agent_loop_with_fallback(chain, state, &fix_task)).await?;
+    }
+
+    Ok(())
 }
 
 fn needs_fix(state: &AgentState) -> bool {

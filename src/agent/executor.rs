@@ -1,6 +1,7 @@
 use crate::types::plan::PlanStep;
 use crate::agent::state::AgentState;
 use crate::llm::client::LlmClient;
+use crate::llm::provider_chain::FallbackChain;
 use crate::llm::prompt::CoderPrompt;
 use crate::tools::shell;
 use crate::tools::test;
@@ -164,6 +165,16 @@ fn extract_path(description: &str) -> Option<String> {
 
 pub async fn execute_step(client: &LlmClient, state: &mut AgentState, step: &PlanStep) {
     let caveman = state.caveman;
+    execute_step_inner(client, state, step, caveman).await
+}
+
+/// Execute a step using a FallbackChain for cloud provider fallback.
+pub async fn execute_step_with_chain(chain: &FallbackChain, state: &mut AgentState, step: &PlanStep) {
+    let caveman = state.caveman;
+    execute_step_inner_chain(chain, state, step, caveman).await
+}
+
+async fn execute_step_inner(client: &LlmClient, state: &mut AgentState, step: &PlanStep, caveman: crate::compressor::caveman::CavemanLevel) {
     match step.step_type.as_str() {
         "create_file" => {
             if let Some(filename) = step.filename.clone().or_else(|| extract_path(&step.description)) {
@@ -285,6 +296,31 @@ pub async fn execute_step(client: &LlmClient, state: &mut AgentState, step: &Pla
             println!("  Done: {}", step.description);
         },
         _ => println!("  Unknown step type: {}", step.step_type),
+    }
+}
+
+async fn execute_step_inner_chain(chain: &FallbackChain, state: &mut AgentState, step: &PlanStep, caveman: crate::compressor::caveman::CavemanLevel) {
+    match step.step_type.as_str() {
+        "answer" => {
+            let context = grep_context(state);
+            let system = CoderPrompt::with_caveman(&caveman);
+            let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, step.description);
+            match chain.complete(&prompt).await {
+                Ok(text) => {
+                    let mut out = std::io::stdout();
+                    for tok in text.chars() {
+                        let _ = write!(out, "{}", tok);
+                        let _ = out.flush();
+                    }
+                    println!();
+                }
+                Err(e) => eprintln!("  ✗ answer failed: {e}"),
+            }
+        },
+        _ => {
+            // For non-answer steps, fall back to direct execution without a client
+            println!("  [fallback] step type '{}' requires a client, skipping", step.step_type);
+        }
     }
 }
 
