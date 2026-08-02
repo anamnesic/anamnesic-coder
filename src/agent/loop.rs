@@ -1,11 +1,65 @@
 use crate::agent::state::AgentState;
 use crate::agent::planner;
 use crate::agent::executor;
-use crate::llm::client::LlmClient;
+use crate::llm::router::LlmRouter;
 use crate::llm::provider_chain::FallbackChain;
 use crate::tools::test;
 use crate::tools::shell;
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Progress events emitted by the agent loop, consumed by the TUI to show
+/// live tool calls, plan steps and final results (mirrors exec-cell streaming
+/// in 2026-era coding-agent TUIs).
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Status(String),
+    ToolCall { name: String, summary: String },
+    PlanStep { index: usize, total: usize, description: String },
+    Done { message: String },
+    Interrupted,
+}
+
+/// Optional UI hooks for the agent loop: a progress sink and a cancellation
+/// flag. When `on_event` is set, the loop reports through it instead of
+/// printing to stdout (the TUI owns the screen); otherwise it prints as before.
+#[derive(Default, Clone)]
+pub struct AgentHooks {
+    pub on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
+    pub interrupt: Option<Arc<AtomicBool>>,
+}
+
+impl AgentHooks {
+    pub fn emit(&self, event: AgentEvent) {
+        if let Some(f) = &self.on_event {
+            f(event);
+        }
+    }
+
+    pub fn note(&self, text: &str) {
+        if self.on_event.is_some() {
+            self.emit(AgentEvent::Status(text.to_string()));
+        } else {
+            println!("{text}");
+        }
+    }
+
+    pub fn warn(&self, text: &str) {
+        if self.on_event.is_some() {
+            self.emit(AgentEvent::Status(text.to_string()));
+        } else {
+            eprintln!("{text}");
+        }
+    }
+
+    pub fn interrupted(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+}
 
 /// Compact the session history when it exceeds a rough token budget.
 const CONTEXT_COMPACT_THRESHOLD: usize = 2500;
@@ -16,7 +70,7 @@ const FIX_FEEDBACK_CAP: usize = 2000;
 /// Maximum tool-use iterations per agent loop turn.
 const MAX_TOOL_ITERATIONS: usize = 5;
 
-async fn maybe_compact(client: &LlmClient, state: &mut AgentState) {
+async fn maybe_compact(client: &LlmRouter, state: &mut AgentState) {
     if state.session.estimated_tokens() < CONTEXT_COMPACT_THRESHOLD {
         return;
     }
@@ -55,11 +109,12 @@ async fn maybe_compact_chain(chain: &FallbackChain, state: &mut AgentState) {
 /// Run a tool-use iteration: send prompt with tools, execute any tool calls,
 /// feed results back, and repeat until the model produces final text.
 async fn run_tool_use_iteration(
-    client: &LlmClient,
+    client: &LlmRouter,
     state: &mut AgentState,
     model: &str,
     prompt: &str,
     tools: &[crate::llm::client::ToolDef],
+    hooks: &AgentHooks,
 ) -> Result<(bool, String)> {
     let mut conversation: Vec<serde_json::Value> = vec![
         serde_json::json!({"role": "system", "content": "You are a coding agent. Use tools to inspect, edit, and verify the workspace. Call tools whenever an action is needed. Never claim a command ran unless you received its tool result. When finished, respond briefly with what changed and verification status."}),
@@ -68,16 +123,23 @@ async fn run_tool_use_iteration(
     let mut used_tools = false;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
+        if hooks.interrupted() {
+            return Ok((used_tools, "[interrupted by user]".to_string()));
+        }
         let response = client.chat(model, conversation.clone(), Some(&tools.to_vec()), None).await?;
 
         if let Ok(tool_calls) = serde_json::from_str::<Vec<crate::llm::client::ToolCall>>(&response) {
             if !tool_calls.is_empty() {
                 used_tools = true;
-                println!("  [tools] iteration {}: {} call(s)", iteration + 1, tool_calls.len());
+                hooks.note(&format!("  [tools] iteration {}: {} call(s)", iteration + 1, tool_calls.len()));
                 let mut tool_results = Vec::new();
                 for tc in &tool_calls {
                     let result = execute_tool(state, tc);
-                    println!("    → {}: {}", tc.function.name, truncate_tool_output(&result));
+                    hooks.note(&format!("    → {}: {}", tc.function.name, truncate_tool_output(&result)));
+                    hooks.emit(AgentEvent::ToolCall {
+                        name: tc.function.name.clone(),
+                        summary: truncate_tool_output(&result),
+                    });
                     tool_results.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -173,57 +235,108 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
     ]
 }
 
-pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &str) {
+pub async fn run_agent_loop(client: &LlmRouter, state: &mut AgentState, task: &str) {
+    run_agent_loop_with_hooks(client, state, task, &AgentHooks::default()).await;
+}
+
+/// Agent loop with optional progress stream and interrupt support for the TUI.
+pub async fn run_agent_loop_with_hooks(
+    client: &LlmRouter,
+    state: &mut AgentState,
+    task: &str,
+    hooks: &AgentHooks,
+) {
     let caveman_tag = state.caveman.tag();
     if !caveman_tag.is_empty() {
-        println!("[{}]", caveman_tag);
+        hooks.note(&format!("[{}]", caveman_tag));
     }
-    println!("[Planning] {}", task);
+    hooks.note(&format!("[Planning] {task}"));
     state.session.add_message("user", task);
 
     maybe_compact(client, state).await;
 
+    if hooks.interrupted() {
+        hooks.emit(AgentEvent::Interrupted);
+        return;
+    }
+
     // Tool calling is the primary coding-agent loop. The legacy planner is
     // retained below for models that choose not to emit tool calls.
     let tools = coding_tools();
-    match run_tool_use_iteration(client, state, &state.config.coder_model.clone(), task, &tools).await {
+    match run_tool_use_iteration(client, state, &state.config.coder_model.clone(), task, &tools, hooks).await {
         Ok((true, final_text)) => {
             if !final_text.trim().is_empty() {
-                println!("\n[agent] {}", final_text.trim());
+                hooks.note(&format!("\n[agent] {}", final_text.trim()));
             }
             state.session.add_message("assistant", &final_text);
             state.session.add_action("tool-use turn completed");
             state.long_memory.save_session(task, &final_text).ok();
+            if hooks.interrupted() {
+                hooks.emit(AgentEvent::Interrupted);
+            } else {
+                hooks.emit(AgentEvent::Done { message: final_text.trim().to_string() });
+            }
             return;
         }
-        Ok((false, _)) => eprintln!("  [tools] model did not request tools; using planner fallback"),
-        Err(e) => eprintln!("  [tools] unavailable ({e}); using planner fallback"),
+        Ok((false, _)) => hooks.warn("  [tools] model did not request tools; using planner fallback"),
+        Err(e) => hooks.warn(&format!("  [tools] unavailable ({e}); using planner fallback")),
     }
 
-    let context = state.session.get_context();
-    let plan = planner::plan_task(client, &state.config.planner_model, task, &context, &state.caveman).await
-        .unwrap_or_else(|e| {
-            eprintln!("Planner error: {}. Falling back to direct execution.", e);
-            crate::types::plan::Plan {
-                steps: vec![crate::types::plan::PlanStep {
-                    step_type: "answer".into(),
-                    description: task.into(),
-                    filename: None, pattern: None, command: None,
-                }],
-            }
-        });
-
-    let steps = plan.steps;
-    eprintln!("  [plan] {} step(s)", steps.len());
-    if steps.is_empty() {
-        eprintln!("Planner returned no steps.");
+    if hooks.interrupted() {
+        hooks.emit(AgentEvent::Interrupted);
         return;
     }
 
+    let context = state.session.get_context();
+    let fallback_plan = || crate::types::plan::Plan {
+        steps: vec![crate::types::plan::PlanStep {
+            step_type: "answer".into(),
+            description: task.into(),
+            filename: None, pattern: None, command: None,
+        }],
+    };
+    let plan = match client.client_for(&state.config.planner_model) {
+        Ok(planner_client) => {
+            planner::plan_task(&planner_client, &state.config.planner_model, task, &context, &state.caveman).await
+                .unwrap_or_else(|e| {
+                    hooks.warn(&format!("Planner error: {}. Falling back to direct execution.", e));
+                    fallback_plan()
+                })
+        }
+        Err(e) => {
+            hooks.warn(&format!("Planner backend unavailable: {e}"));
+            fallback_plan()
+        }
+    };
+
+    let steps = plan.steps;
+    hooks.warn(&format!("  [plan] {} step(s)", steps.len()));
+    if steps.is_empty() {
+        hooks.warn("Planner returned no steps.");
+        return;
+    }
+
+    let coder_client = match client.client_for(&state.config.coder_model) {
+        Ok(c) => c,
+        Err(e) => {
+            hooks.warn(&format!("Coder backend unavailable: {e}"));
+            return;
+        }
+    };
+
     let total = steps.len();
     for (i, step) in steps.iter().enumerate() {
-        println!("\n[{}/{}] [{}]: {}", i + 1, total, step.step_type, step.description);
-        executor::execute_step(client, state, step).await;
+        if hooks.interrupted() {
+            hooks.emit(AgentEvent::Interrupted);
+            return;
+        }
+        hooks.note(&format!("\n[{}/{}] [{}]: {}", i + 1, total, step.step_type, step.description));
+        hooks.emit(AgentEvent::PlanStep {
+            index: i + 1,
+            total,
+            description: step.description.clone(),
+        });
+        executor::execute_step(&coder_client, state, step).await;
     }
 
     let summary: Vec<&str> = steps.iter().map(|s| s.description.as_str()).collect();
@@ -233,7 +346,7 @@ pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &s
     state.long_memory.save_session(task, &summary_str).ok();
 
     if state.last_test_output.is_empty() && state.config.workspace_dir.join("Cargo.toml").exists() {
-        eprintln!("  [verify] running cargo test...");
+        hooks.warn("  [verify] running cargo test...");
         state.last_test_output = test::run_tests("cargo test", &state.config);
     }
 
@@ -246,8 +359,12 @@ pub async fn run_agent_loop(client: &LlmClient, state: &mut AgentState, task: &s
             format!("\n\nVerification output from your last attempt (fix failures; do NOT weaken existing tests to make them pass):\n```\n{}\n```", cap)
         };
         let fix_task = format!("Fix issues in: {}{}", task, feedback);
-        Box::pin(run_agent_loop(client, state, &fix_task)).await;
+        Box::pin(run_agent_loop_with_hooks(client, state, &fix_task, hooks)).await;
     }
+
+    hooks.emit(AgentEvent::Done {
+        message: format!("Completed: {summary_str}"),
+    });
 }
 
 /// Run the agent loop with a FallbackChain for cloud provider fallback.

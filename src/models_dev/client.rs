@@ -204,3 +204,103 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() }
     else { format!("{}…", &s[..max.saturating_sub(1)]) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models_dev::types::{Catalog, Cost, Limits, ModelInfo, Modalities, Provider};
+
+    fn model(id: &str, family: &str, tool: bool, cost_in: f64) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            family: family.into(),
+            reasoning: false,
+            tool_call: tool,
+            temperature: false,
+            open_weights: true,
+            attachment: false,
+            limit: Limits { context: 131_072, output: 4096 },
+            cost: Cost { input: cost_in, output: cost_in, cache_read: None, cache_write: None },
+            modalities: Modalities { input: vec!["text".into()], output: vec!["text".into()] },
+            knowledge: None,
+            release_date: None,
+        }
+    }
+
+    fn provider(id: &str, models: Vec<ModelInfo>) -> Provider {
+        let map = models.into_iter().map(|m| (m.id.clone(), m)).collect();
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            api: format!("https://{id}.example.com/v1"),
+            env: vec![],
+            doc: String::new(),
+            models: map,
+        }
+    }
+
+    fn sample_client() -> ModelsDevClient {
+        let mut catalog = Catalog::new();
+        catalog.insert("fakea".into(), provider("fakea", vec![
+            model("fakea/cheap:1b", "cheap", true, 0.05),
+            model("fakea/pricey:4b", "pricey", false, 0.50),
+        ]));
+        catalog.insert("fakeb".into(), provider("fakeb", vec![
+            model("fakeb/gemma:4b", "gemma", true, 0.20),
+        ]));
+        ModelsDevClient { catalog }
+    }
+
+    #[test]
+    fn find_by_id_locates_model_across_providers() {
+        let c = sample_client();
+        let (pid, m) = c.find_by_id("fakeb/gemma:4b").unwrap();
+        assert_eq!(pid, "fakeb");
+        assert_eq!(m.id, "fakeb/gemma:4b");
+        assert!(c.find_by_id("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn provider_models_returns_only_that_provider() {
+        let c = sample_client();
+        let models = c.provider_models("fakea");
+        assert_eq!(models.len(), 2);
+        assert!(c.provider_models("nope").is_empty());
+    }
+
+    #[test]
+    fn suggest_for_task_prefers_cheapest_tool_callable() {
+        let c = sample_client();
+        let best = c.suggest_for_task("coding", 3);
+        let (pid, m) = best[0];
+        assert_eq!((pid, m.id.as_str()), ("fakea", "fakea/cheap:1b"));
+    }
+
+    #[test]
+    fn match_local_maps_ollama_family_to_cloud() {
+        let c = sample_client();
+        let matched = c.match_local("gemma3:4b").unwrap();
+        assert_eq!(matched.model_id, "fakeb/gemma:4b");
+        assert_eq!(matched.provider, "fakeb");
+    }
+
+    #[test]
+    fn match_local_returns_none_when_no_family_matches() {
+        let c = sample_client();
+        assert!(c.match_local("zenith9000:7b").is_none());
+    }
+
+    #[test]
+    fn filter_selects_only_matching_models() {
+        let c = sample_client();
+        let tool_capable: Vec<_> = c.filter(|m| m.tool_call).into_iter().collect();
+        assert_eq!(tool_capable.len(), 2);
+    }
+
+    #[test]
+    fn all_models_spans_providers() {
+        let c = sample_client();
+        assert_eq!(c.all_models().len(), 3);
+    }
+}

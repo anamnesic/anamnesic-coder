@@ -619,3 +619,84 @@ impl CloudClient {
         Ok(full)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_def(name: &str) -> ToolDef {
+        ToolDef {
+            r#type: "function".into(),
+            function: ToolFunction {
+                name: name.into(),
+                description: "desc".into(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+        }
+    }
+
+    #[test]
+    fn tool_def_serializes_to_openai_shape() {
+        let v = serde_json::to_value(tool_def("read_file")).unwrap();
+        assert_eq!(v["type"], "function");
+        assert_eq!(v["function"]["name"], "read_file");
+        assert_eq!(v["function"]["description"], "desc");
+        assert_eq!(v["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_call_parses_string_arguments() {
+        let json = r#"[{"id":"call_1","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"cargo test\"}"}}]"#;
+        let calls: Vec<ToolCall> = serde_json::from_str(json).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "run_command");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"cargo test"}"#);
+    }
+
+    #[test]
+    fn empty_tool_calls_array_parses_to_empty() {
+        let calls: Vec<ToolCall> = serde_json::from_str("[]").unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn response_format_json_schema_serializes_variant() {
+        let rf = ResponseFormat::JsonSchema {
+            name: "plan".into(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        };
+        let v = serde_json::to_value(&rf).unwrap();
+        assert_eq!(v["JsonSchema"]["name"], "plan");
+        assert_eq!(v["JsonSchema"]["strict"], true);
+    }
+
+    #[test]
+    fn cloud_client_trims_trailing_slash() {
+        let c = CloudClient::new("https://integrate.api.nvidia.com/", "k");
+        assert_eq!(c.base_url, "https://integrate.api.nvidia.com");
+        assert_eq!(c.api_key, "k");
+    }
+
+    #[test]
+    fn ollama_client_trims_trailing_slash() {
+        let c = OllamaClient::new("http://localhost:11434/");
+        assert_eq!(c.host, "http://localhost:11434");
+    }
+
+    #[test]
+    fn chat_request_includes_model_messages_and_tools() {
+        let req = ChatRequest {
+            model: "qwen3:1.7b".into(),
+            messages: vec![serde_json::json!({ "role": "user", "content": "hi" })],
+            stream: false,
+            max_tokens: 2048,
+            tools: Some(vec![tool_def("run_command")]),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["model"], "qwen3:1.7b");
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["tools"][0]["function"]["name"], "run_command");
+    }
+}

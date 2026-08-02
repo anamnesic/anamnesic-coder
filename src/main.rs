@@ -20,6 +20,7 @@ use config::settings::Config;
 use agent::state::AgentState;
 use agent::r#loop::run_agent_loop;
 use llm::client::LlmClient;
+use llm::router::{LlmRouter, DEFAULT_PROVIDER};
 use llm::model_resolver;
 use llm::infer::engine::InferenceEngine;
 use llm::infer::gguf::GgufReader;
@@ -49,8 +50,8 @@ struct Cli {
     /// Use a cloud provider (OpenAI-compatible, e.g. NVIDIA NIM) for inference
     #[arg(long)]
     cloud: bool,
-    /// Cloud provider id (default: nvidia — NVIDIA NIM)
-    #[arg(long, default_value = "nvidia")]
+    /// Cloud provider id (default: ollama-cloud — Ollama Cloud)
+    #[arg(long, default_value = DEFAULT_PROVIDER)]
     provider: String,
     /// Cloud model id for inference (overrides planner/coder/summarizer defaults)
     #[arg(long)]
@@ -129,23 +130,15 @@ enum ProvidersAction {
     Import,
 }
 
-/// Default model for cloud (NVIDIA NIM) inference.
+/// Default model for cloud inference.  Plain-name providers (Ollama Cloud)
+/// use their own default; provider-qualified ids like NVIDIA's use `nvidia/…`.
 const DEFAULT_CLOUD_MODEL: &str = "nvidia/llama-3.3-nemotron-super-49b-v1.5";
+const OLLAMA_CLOUD_DEFAULT_MODEL: &str = "nemotron-3-nano:30b";
 
-/// Build the LLM client: cloud provider (`--cloud`), local GGUF (`--local`) or Ollama.
-async fn build_client(cli: &Cli, cfg: &mut Config) -> Result<LlmClient> {
-    if cli.cloud {
-        let catalog_client = tokio::task::spawn_blocking(models_dev::ModelsDevClient::load).await?;
-        let (base, key) = providers::ProviderStore::resolve_cloud_credentials(&cli.provider, &catalog_client.catalog)?;
-        let model = cli.cloud_model.clone()
-            .or_else(|| std::env::var("CLOUD_MODEL").ok())
-            .unwrap_or_else(|| DEFAULT_CLOUD_MODEL.to_string());
-        cfg.planner_model = std::env::var("PLANNER_MODEL").ok().unwrap_or_else(|| model.clone());
-        cfg.coder_model = std::env::var("CODER_MODEL").ok().unwrap_or_else(|| model.clone());
-        cfg.summarizer_model = std::env::var("SUMMARIZER_MODEL").ok().unwrap_or_else(|| model.clone());
-        println!("Cloud inference: provider='{}' base={} model={}", cli.provider, base, model);
-        Ok(LlmClient::cloud(&base, &key))
-    } else if cfg.use_local {
+/// Build the LLM router: a local backend (Ollama or local GGUF) plus, when
+/// `--cloud` is given, a cloud backend for the selected provider.
+async fn build_router(cli: &Cli, cfg: &mut Config) -> Result<LlmRouter> {
+    let local = if cfg.use_local {
         let model_name = cli.model.as_deref().unwrap_or("gemma3:1b");
         let blob_path = model_resolver::resolve_model(model_name, &cfg.models_dir)?;
         println!("Loading {} from {}...", model_name, blob_path.display());
@@ -161,21 +154,44 @@ async fn build_client(cli: &Cli, cfg: &mut Config) -> Result<LlmClient> {
                 println!("GPU acceleration active.");
             }
         }
-        Ok(LlmClient::local(engine))
+        LlmClient::local(engine)
     } else {
-        Ok(LlmClient::ollama(&cfg.ollama_host))
+        LlmClient::ollama(&cfg.ollama_host)
+    };
+    let router = LlmRouter::new(local);
+
+    if cli.cloud {
+        let base = router.set_provider(&cli.provider)?;
+        let model = cli.cloud_model.clone()
+            .or_else(|| std::env::var("CLOUD_MODEL").ok())
+            .unwrap_or_else(|| {
+                if cli.provider == "ollama-cloud" {
+                    OLLAMA_CLOUD_DEFAULT_MODEL.to_string()
+                } else {
+                    DEFAULT_CLOUD_MODEL.to_string()
+                }
+            });
+        cfg.planner_model = std::env::var("PLANNER_MODEL").ok().unwrap_or_else(|| model.clone());
+        cfg.coder_model = std::env::var("CODER_MODEL").ok().unwrap_or_else(|| model.clone());
+        cfg.summarizer_model = std::env::var("SUMMARIZER_MODEL").ok().unwrap_or_else(|| model.clone());
+        // Plain-name cloud models (e.g. Ollama Cloud) have no `/` prefix, so
+        // mark them explicitly so the router sends them to the cloud backend.
+        router.mark_cloud(&model);
+        println!("Cloud inference: provider='{}' base={} model={}", cli.provider, base, model);
     }
+    Ok(router)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).ok();
+    providers::load_dotenv();
     llm::infer::ops::init_thread_pool();
     let cli = Cli::parse();
     let mut cfg = Config::default();
     cfg.workspace_dir = PathBuf::from(&cli.dir);
     cfg.use_local = cli.local;
-    let client = build_client(&cli, &mut cfg).await?;
+    let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
     if cli.resume {
@@ -227,7 +243,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn repl(client: &LlmClient, state: &mut AgentState) -> Result<()> {
+async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
     use std::io::Write;
     loop {
         let prompt = match state.caveman {
@@ -275,10 +291,20 @@ async fn repl(client: &LlmClient, state: &mut AgentState) -> Result<()> {
                 println!("  /reset       Reset session");
                 println!("  /exit        Exit");
                 println!("  /check       Hardware check");
+                println!("  /models      List available models");
                 println!("  /caveman     Toggle caveman mode (off/lite/full/ultra)");
                 println!("  /caveman stats  Show caveman stats");
             }
             "/check" => hw_check().await?,
+            "/models" => {
+                let models = model_resolver::list_models(&state.config.models_dir);
+                if models.is_empty() {
+                    println!("  No models found in {}", state.config.models_dir.display());
+                } else {
+                    println!("  Available models:");
+                    for m in models { println!("    {}", m); }
+                }
+            }
             _ => run_agent_loop(client, state, input).await,
         }
     }

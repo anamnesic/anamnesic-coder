@@ -210,6 +210,17 @@ fn load_env_with_dotenv() -> HashMap<String, String> {
     map
 }
 
+/// Load `.env` (cwd + parent dirs) into the process environment so cloud keys
+/// and model overrides (e.g. `NVIDIA_API_KEY`, `CODER_MODEL`) are visible to
+/// `std::env::var` everywhere. Existing vars are not overridden (dotenv convention).
+pub fn load_dotenv() {
+    for (k, v) in load_env_with_dotenv() {
+        if std::env::var_os(&k).is_none() {
+            std::env::set_var(&k, v);
+        }
+    }
+}
+
 /// Pretty-print the store for `providers show`.
 /// Also shows any keys detectable from environment that aren't yet configured.
 pub fn print_store(store: &ProviderStore, catalog: &Catalog) {
@@ -267,4 +278,122 @@ pub fn print_store(store: &ProviderStore, catalog: &Catalog) {
 fn mask_key(key: &str) -> String {
     let n = key.len().min(4);
     format!("{}****", &key[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models_dev::types::{Catalog, ModelInfo, Provider};
+
+    fn sample_catalog() -> Catalog {
+        let mut m = HashMap::new();
+        m.insert(
+            "fake-model:1b".to_string(),
+            ModelInfo {
+                id: "fake-model:1b".into(),
+                name: "Fake Model".into(),
+                family: "fake".into(),
+                reasoning: false,
+                tool_call: true,
+                temperature: false,
+                open_weights: false,
+                attachment: false,
+                limit: Default::default(),
+                cost: Default::default(),
+                modalities: Default::default(),
+                knowledge: None,
+                release_date: None,
+            },
+        );
+        let mut provs = HashMap::new();
+        provs.insert(
+            "fakeco".to_string(),
+            Provider {
+                id: "fakeco".into(),
+                name: "Fake Co".into(),
+                api: "https://fake.example.com/v1".into(),
+                env: vec!["FAKECO_API_KEY".into()],
+                doc: String::new(),
+                models: m,
+            },
+        );
+        provs
+    }
+
+    #[test]
+    fn set_key_creates_enabled_entry() {
+        let mut s = ProviderStore::default();
+        s.set_key("fakeco", "k123");
+        let e = s.providers.get("fakeco").unwrap();
+        assert_eq!(e.api_key.as_deref(), Some("k123"));
+        assert!(e.enabled);
+        assert_eq!(s.api_key("fakeco"), Some("k123"));
+    }
+
+    #[test]
+    fn remove_deletes_entry() {
+        let mut s = ProviderStore::default();
+        s.set_key("fakeco", "k123");
+        s.remove("fakeco");
+        assert!(s.providers.is_empty());
+    }
+
+    #[test]
+    fn set_enabled_toggles_without_removing_key() {
+        let mut s = ProviderStore::default();
+        s.set_key("fakeco", "k123");
+        s.set_enabled("fakeco", false);
+        assert!(!s.providers["fakeco"].enabled);
+        assert!(s.api_key("fakeco").is_some());
+    }
+
+    #[test]
+    fn active_providers_only_returns_enabled_with_key() {
+        let mut s = ProviderStore::default();
+        s.set_key("a", "ka");
+        s.set_key("b", "kb");
+        s.set_enabled("b", false);
+        let active = s.active_providers();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "a");
+    }
+
+    #[test]
+    fn set_base_overrides_default() {
+        let mut s = ProviderStore::default();
+        s.set_base("fakeco", "https://proxy.example.com");
+        assert_eq!(s.providers["fakeco"].api_base.as_deref(), Some("https://proxy.example.com"));
+    }
+
+    #[test]
+    fn config_path_uses_home() {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/anamnesic-store-test");
+        let p = config_path().unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/anamnesic-store-test/.config/rustcode/providers.toml"));
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn detect_env_keys_finds_unconfigured_provider() {
+        let catalog = sample_catalog();
+        let prev = std::env::var_os("FAKECO_API_KEY");
+        std::env::set_var("FAKECO_API_KEY", "from-env");
+        let found = ProviderStore::detect_env_keys(&catalog);
+        let hit = found.iter().find(|(pid, _, _)| pid == "fakeco");
+        assert!(hit.is_some(), "expected fakeco in {found:?}");
+        match prev {
+            Some(v) => std::env::set_var("FAKECO_API_KEY", v),
+            None => std::env::remove_var("FAKECO_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn mask_key_hides_most_of_key() {
+        assert_eq!(mask_key("sk-abcdef123456"), "sk-a****");
+        assert_eq!(mask_key("ab"), "ab****");
+    }
 }

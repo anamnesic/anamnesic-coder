@@ -262,8 +262,92 @@ fn shorten_paths(input: &str) -> String {
 
 fn normalize_tokens(input: &str) -> String {
     let mut s = input.to_string();
-    s = regex_replace(&s, r"\be?[0-9a-fA-F]{32,}\b", "<HASH>");
-    s = regex_replace(&s, r"\beyJ[A-Za-z0-9_-]{20,}\.(?:[A-Za-z0-9_-]{10,}\.)[A-Za-z0-9_-]{10,}\b", "<JWT>");
     s = regex_replace(&s, r"\b[0-9a-fA-F]{64}\b", "<SHA256>");
+    s = regex_replace(&s, r"\be?[0-9a-fA-F]{32,}\b", "<HASH>");
+    s = regex_replace(&s, r"\beyJ[A-Za-z0-9_-]{10,}\.(?:[A-Za-z0-9_-]{10,}\.)[A-Za-z0-9_-]{10,}\b", "<JWT>");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_ansi_sequences() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("a\x1b[1m b"), "a b");
+    }
+
+    #[test]
+    fn removes_progress_and_build_lines() {
+        let input = "Compiling foo v0.1\n⠹ checking\nreal output here\n";
+        let out = remove_progress_bars(input);
+        assert!(!out.contains("Compiling foo"));
+        assert!(!out.contains("⠹"));
+        assert!(out.contains("real output here"));
+    }
+
+    #[test]
+    fn collapses_runs_of_blank_lines() {
+        let out = collapse_blank_lines("a\n\n\n\nb\n\nc");
+        assert_eq!(out, "a\n\nb\n\nc\n");
+    }
+
+    #[test]
+    fn dedups_repeated_templates_by_timestamp() {
+        let input = "2024-01-01T10:00:00 error boom\n2024-02-02T10:00:00 error boom";
+        let out = template_dedup(input);
+        assert!(out.contains("[×2]"), "got: {out}");
+        assert!(out.contains("<TS> error boom"), "got: {out}");
+    }
+
+    #[test]
+    fn collapses_framework_stack_frames() {
+        let input = "line1\n  at /usr/lib/python3/site-packages/a.py\n  at /usr/lib/python3/site-packages/b.py\n  at /usr/lib/python3/site-packages/c.py\nfinal";
+        let out = filter_stack_frames(input);
+        assert!(out.contains("3 framework frames omitted"), "got: {out}");
+        assert!(out.contains("line1"));
+        assert!(out.contains("final"));
+    }
+
+    #[test]
+    fn filters_passing_test_lines() {
+        let input = "test a ok\ntest result: ok. 2 passed\n";
+        let out = filter_test_pass(input);
+        assert!(!out.contains("test a ok"));
+        assert!(out.contains("test result: ok"));
+    }
+
+    #[test]
+    fn factors_common_prefix() {
+        let input = "error in module alpha worker\nerror in module beta worker\nerror in module gamma worker\n";
+        let out = factor_common_prefix(input);
+        assert!(out.contains("[common prefix:"), "got: {out}");
+    }
+
+    #[test]
+    fn shortens_long_quoted_paths() {
+        let input = "\"this/is/a/very/long/segment/path/to/file.txt\"";
+        let out = shorten_paths(input);
+        assert!(!out.contains("/very/long/"), "got: {out}");
+        assert!(out.ends_with("path/to/file.txt\""), "got: {out}");
+    }
+
+    #[test]
+    fn masks_hashes_and_tokens() {
+        let out = normalize_tokens("hash abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 done");
+        assert!(out.contains("<SHA256>"), "got: {out}");
+        assert!(!out.contains("abcdef0123456789"));
+    }
+
+    #[test]
+    fn compress_applies_rules_end_to_end() {
+        let input = "\x1b[32mCompiling app\x1b[0m\n\n\nreal output\n";
+        let result = compress(input);
+        assert!(result.output.contains("real output"));
+        assert!(result.applied_rules.contains(&"ansi_strip".to_string()));
+        assert!(result.applied_rules.contains(&"progress_bars".to_string()));
+        assert!(result.compressed_lines <= result.original_lines);
+    }
 }

@@ -261,3 +261,101 @@ pub fn build_default_chain(base_url: &str, nim_api_key: String, nim_model: Strin
 
     FallbackChain::new(vec![nim, local])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn run<F: std::future::Future<Output = T>, T>(fut: F) -> T {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    enum MockResult {
+        Ok(&'static str),
+        RateLimited,
+        CreditExhausted,
+        Fatal,
+    }
+
+    struct MockProvider {
+        name: &'static str,
+        result: MockResult,
+        calls: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new(name: &'static str, result: MockResult) -> Arc<Self> {
+            Arc::new(Self { name, result, calls: AtomicUsize::new(0) })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CompletionProvider for MockProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn complete(&self, _prompt: &str) -> Result<String, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.result {
+                MockResult::Ok(s) => Ok(s.to_string()),
+                MockResult::RateLimited => Err(ProviderError::RateLimited),
+                MockResult::CreditExhausted => Err(ProviderError::CreditExhausted),
+                MockResult::Fatal => Err(ProviderError::Fatal("boom".into())),
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_http_statuses() {
+        assert!(matches!(ProviderError::from_status(429, ""), ProviderError::RateLimited));
+        assert!(matches!(ProviderError::from_status(402, ""), ProviderError::CreditExhausted));
+        assert!(matches!(ProviderError::from_status(500, "boom"), ProviderError::Transient(_)));
+        assert!(matches!(ProviderError::from_status(403, "denied"), ProviderError::Fatal(_)));
+    }
+
+    #[test]
+    fn token_bucket_grants_initial_capacity() {
+        let bucket = TokenBucket::new(10.0);
+        run(bucket.acquire());
+    }
+
+    #[test]
+    fn chain_returns_first_ok() {
+        let ok = MockProvider::new("ok", MockResult::Ok("done"));
+        let chain = FallbackChain::new(vec![ok.clone()]);
+        assert_eq!(run(chain.complete("x")).unwrap(), "done");
+        assert_eq!(ok.calls(), 1);
+    }
+
+    #[test]
+    fn chain_skips_credit_exhausted_provider() {
+        let broke = MockProvider::new("broke", MockResult::CreditExhausted);
+        let ok = MockProvider::new("ok", MockResult::Ok("recovered"));
+        let chain = FallbackChain::new(vec![broke.clone(), ok.clone()]);
+        assert_eq!(run(chain.complete("x")).unwrap(), "recovered");
+        assert_eq!(broke.calls(), 1);
+        assert_eq!(ok.calls(), 1);
+    }
+
+    #[test]
+    fn chain_skips_fatal_provider() {
+        let bad = MockProvider::new("bad", MockResult::Fatal);
+        let ok = MockProvider::new("ok", MockResult::Ok("fine"));
+        let chain = FallbackChain::new(vec![bad.clone(), ok.clone()]);
+        assert_eq!(run(chain.complete("x")).unwrap(), "fine");
+    }
+
+    #[test]
+    fn chain_errors_when_all_providers_fail() {
+        let a = MockProvider::new("a", MockResult::CreditExhausted);
+        let b = MockProvider::new("b", MockResult::Fatal);
+        let chain = FallbackChain::new(vec![a, b]);
+        let err = run(chain.complete("x")).unwrap_err();
+        assert!(err.contains("falharam"), "got: {err}");
+    }
+}

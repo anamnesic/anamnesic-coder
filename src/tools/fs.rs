@@ -9,12 +9,72 @@ pub struct FileTools {
 #[cfg(test)]
 mod tests {
     use super::FileTools;
+    use std::fs;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_workspace() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "anamnesic-file-tools-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn rejects_parent_directory_paths() {
-        let workspace = std::env::temp_dir().join("anamnesic-file-tools-test");
-        let tools = FileTools::new(workspace);
+        let tools = FileTools::new(temp_workspace());
         assert!(tools.write_file("../outside.txt", "nope").is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_and_root_paths() {
+        let tools = FileTools::new(temp_workspace());
+        assert!(tools.write_file("/etc/passwd", "nope").is_err());
+        assert!(tools.append_file("/etc/hosts", "nope").is_err());
+        assert!(tools.read_file("/etc/hosts").is_none());
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let tools = FileTools::new(temp_workspace());
+        tools.write_file("src/main.rs", "fn main() {}\n").unwrap();
+        assert_eq!(tools.read_file("src/main.rs").unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn append_adds_to_existing_file() {
+        let tools = FileTools::new(temp_workspace());
+        tools.write_file("log.txt", "line1\n").unwrap();
+        tools.append_file("log.txt", "line2\n").unwrap();
+        assert_eq!(tools.read_file("log.txt").unwrap(), "line1\nline2\n");
+    }
+
+    #[test]
+    fn append_creates_file_when_missing() {
+        let tools = FileTools::new(temp_workspace());
+        tools.append_file("fresh.txt", "hi").unwrap();
+        assert_eq!(tools.read_file("fresh.txt").unwrap(), "hi");
+    }
+
+    #[test]
+    fn read_missing_file_returns_none() {
+        let tools = FileTools::new(temp_workspace());
+        assert!(tools.read_file("nope.txt").is_none());
+    }
+
+    #[test]
+    fn list_files_returns_files_within_workspace() {
+        let workspace = temp_workspace();
+        let tools = FileTools::new(workspace.clone());
+        tools.write_file("a.txt", "a").unwrap();
+        tools.write_file("sub/b.txt", "b").unwrap();
+        assert_eq!(tools.list_files(""), vec!["a.txt"]);
+        assert_eq!(tools.list_files("sub"), vec!["sub/b.txt"]);
     }
 }
 

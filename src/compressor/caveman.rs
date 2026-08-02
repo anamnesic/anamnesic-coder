@@ -70,3 +70,56 @@ CAVEMAN MODE: ULTRA
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_off_synonyms() {
+        for s in ["off", "normal", "stop", "disable", "OFF"] {
+            assert_eq!(CavemanLevel::from_str(s), CavemanLevel::Off, "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn parses_levels() {
+        assert_eq!(CavemanLevel::from_str("lite"), CavemanLevel::Lite);
+        assert_eq!(CavemanLevel::from_str("full"), CavemanLevel::Full);
+        assert_eq!(CavemanLevel::from_str("ULTRA"), CavemanLevel::Ultra);
+    }
+
+    #[test]
+    fn unknown_defaults_to_full() {
+        assert_eq!(CavemanLevel::from_str("banana"), CavemanLevel::Full);
+        assert_eq!(CavemanLevel::from_str(""), CavemanLevel::Full);
+    }
+
+    #[test]
+    fn tags_round_trip() {
+        assert_eq!(CavemanLevel::Off.tag(), "");
+        assert_eq!(CavemanLevel::Lite.tag(), "CAVEMAN:LITE");
+        assert_eq!(CavemanLevel::Full.tag(), "CAVEMAN:FULL");
+        assert_eq!(CavemanLevel::Ultra.tag(), "CAVEMAN:ULTRA");
+    }
+
+    #[test]
+    fn only_off_is_inactive() {
+        assert!(!CavemanLevel::Off.is_active());
+        assert!(CavemanLevel::Lite.is_active());
+        assert!(CavemanLevel::Full.is_active());
+        assert!(CavemanLevel::Ultra.is_active());
+    }
+
+    #[test]
+    fn system_prompt_suffix_content() {
+        assert!(CavemanLevel::Off.system_prompt_suffix().is_empty());
+        let full = CavemanLevel::Full.system_prompt_suffix();
+        assert!(full.to_lowercase().contains("caveman mode"));
+        let ultra = CavemanLevel::Ultra.system_prompt_suffix();
+        assert!(ultra.to_lowercase().contains("abbreviate"));
+        assert!(ultra.contains("→"));
+        let lite = CavemanLevel::Lite.system_prompt_suffix();
+        assert!(lite.to_lowercase().contains("lite"));
+    }
+}

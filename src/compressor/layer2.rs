@@ -53,7 +53,7 @@ fn estimate_tokens(input: &str) -> usize {
 
 fn normalize_opaque_tokens(input: &str) -> String {
     let mut s = input.to_string();
-    if let Ok(re) = regex::Regex::new(r"\beyJ[A-Za-z0-9_-]{20,}\.(?:[A-Za-z0-9_-]{10,}\.)[A-Za-z0-9_-]{10,}\b") {
+    if let Ok(re) = regex::Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.(?:[A-Za-z0-9_-]{10,}\.)[A-Za-z0-9_-]{10,}\b") {
         s = re.replace_all(&s, "<JWT>").to_string();
     }
     if let Ok(re) = regex::Regex::new(r"\b[0-9a-fA-F]{40,}\b") {
@@ -84,10 +84,9 @@ fn shorten_paths_l2(input: &str) -> String {
 fn collapse_whitespace(input: &str) -> String {
     input.lines()
         .map(|line| {
-            let trimmed_end = line.trim_end();
-            let indent = line.len() - trimmed_end.len();
+            let indent = line.len() - line.trim_start().len();
             if indent > 4 {
-                format!("{} {}", " ".repeat(4), trimmed_end.trim_start())
+                format!("{}{}", " ".repeat(4), line.trim())
             } else {
                 line.to_string()
             }
@@ -147,4 +146,77 @@ fn consolidate_prefixes(input: &str) -> String {
 fn get_prefix<'a>(line: &'a str, max_len: usize) -> &'a str {
     let end = line.len().min(max_len);
     &line[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimates_tokens_from_byte_length() {
+        assert!(estimate_tokens("") == 0);
+        assert!(estimate_tokens("hello world") > 0);
+        assert!(estimate_tokens("a very long line of text that keeps going") > 0);
+    }
+
+    #[test]
+    fn normalizes_opaque_tokens() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let out = normalize_opaque_tokens(format!("token={jwt}").as_str());
+        assert!(out.contains("<JWT>"), "got: {out}");
+
+        let url = normalize_opaque_tokens("see https://example.com/a/b?q=1");
+        assert!(url.contains("https://<URL>"), "got: {url}");
+
+        let hash = normalize_opaque_tokens("key 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef end");
+        assert!(hash.contains("<HASH>"), "got: {hash}");
+    }
+
+    #[test]
+    fn shortens_paths_keeping_last_segments() {
+        let out = shorten_paths_l2("\"very/long/segments/path/to/file.txt\"");
+        assert_eq!(out, "\"path/to/file.txt\"");
+    }
+
+    #[test]
+    fn leaves_short_paths_untouched() {
+        let out = shorten_paths_l2("\"one/two/three.txt\"");
+        assert_eq!(out, "\"one/two/three.txt\"");
+    }
+
+    #[test]
+    fn collapses_deep_indentation() {
+        let out = collapse_whitespace("        deeply indented");
+        assert_eq!(out, "    deeply indented");
+        let out = collapse_whitespace("  normal");
+        assert_eq!(out, "  normal");
+    }
+
+    #[test]
+    fn consolidates_repeated_prefixes() {
+        let input = [
+            "module/project/src/common/path.rs alpha one",
+            "module/project/src/common/path.rs beta two",
+            "module/project/src/common/path.rs gamma three",
+            "module/project/src/common/path.rs delta four",
+        ].join("\n");
+        let out = consolidate_prefixes(&input);
+        assert!(out.contains("[common:"), "got: {out}");
+        assert!(out.contains("×4 lines"), "got: {out}");
+    }
+
+    #[test]
+    fn leaves_short_inputs_untouched_by_consolidation() {
+        let out = consolidate_prefixes("a\nb\n");
+        assert_eq!(out, "a\nb\n");
+    }
+
+    #[test]
+    fn process_reports_rule_application() {
+        let mut l2 = CompressLayer2::new();
+        let input = "2024-01-01T10:00:00 https://example.com/a/very/long/path error\n2024-01-02T10:00:00 https://example.com/a/very/long/path error";
+        let out = l2.process(input);
+        assert!(out.contains("<URL>"), "got: {out}");
+        assert!(!l2.applied_rules.is_empty());
+    }
 }

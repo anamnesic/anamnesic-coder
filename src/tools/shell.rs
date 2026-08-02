@@ -129,6 +129,40 @@ mod tests {
         assert!(is_allowed("echo hello", &cfg));
     }
 
+    #[test]
+    fn empty_command_is_never_allowed() {
+        let cfg = test_config();
+        assert!(!is_allowed("", &cfg));
+        assert!(!is_allowed("   ", &cfg));
+    }
+
+    #[test]
+    fn run_command_refuses_disallowed_command_without_executing() {
+        let cfg = test_config();
+        let out = run_command("sudo whoami", &cfg);
+        assert!(out.contains("not in allowed list"));
+    }
+
+    #[test]
+    fn combined_joins_stdout_stderr_and_exit_code() {
+        let out = CommandOutput {
+            code: Some(2),
+            stdout: "one".into(),
+            stderr: "boom".into(),
+        };
+        let c = out.combined();
+        assert!(c.contains("one"));
+        assert!(c.contains("STDERR:"));
+        assert!(c.contains("boom"));
+        assert!(c.contains("exit code: 2"));
+    }
+
+    #[test]
+    fn combined_falls_back_to_no_output_label() {
+        let out = CommandOutput { code: Some(0), stdout: String::new(), stderr: String::new() };
+        assert_eq!(out.combined(), "(no output)");
+    }
+
     #[cfg(target_family = "unix")]
     #[test]
     fn runs_via_sh_on_unix() {

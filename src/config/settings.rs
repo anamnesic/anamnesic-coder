@@ -49,3 +49,44 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_reasonable() {
+        let cfg = Config::default();
+        assert!(cfg.max_context_tokens > 0);
+        assert!(cfg.max_retries > 0);
+        assert!(cfg.chunk_overlap < cfg.chunk_size);
+        assert!(!cfg.allowed_commands.is_empty());
+        assert!(!cfg.blocked_commands.is_empty());
+        assert!(cfg.allowed_commands.iter().any(|c| c == "cargo"));
+        assert!(cfg.blocked_commands.iter().any(|c| c == "sudo"));
+    }
+
+    #[test]
+    fn ollama_host_defaults_to_localhost() {
+        let prev = std::env::var_os("OLLAMA_HOST");
+        std::env::remove_var("OLLAMA_HOST");
+        let cfg = Config::default();
+        assert_eq!(cfg.ollama_host, "http://localhost:11434");
+        match prev {
+            Some(v) => std::env::set_var("OLLAMA_HOST", v),
+            None => std::env::remove_var("OLLAMA_HOST"),
+        }
+    }
+
+    #[test]
+    fn respects_max_context_env_override() {
+        let prev = std::env::var_os("MAX_CONTEXT_TOKENS");
+        std::env::set_var("MAX_CONTEXT_TOKENS", "8192");
+        let cfg = Config::default();
+        assert_eq!(cfg.max_context_tokens, 8192);
+        match prev {
+            Some(v) => std::env::set_var("MAX_CONTEXT_TOKENS", v),
+            None => std::env::remove_var("MAX_CONTEXT_TOKENS"),
+        }
+    }
+}
