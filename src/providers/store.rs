@@ -201,9 +201,15 @@ fn load_env_with_dotenv() -> HashMap<String, String> {
                     let line = line.strip_prefix("export ").unwrap_or(line);
                     if let Some((k, v)) = line.split_once('=') {
                         let k = k.trim().to_string();
-                        let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
-                        // real env takes precedence
-                        map.entry(k).or_insert(v);
+                        let v_trimmed = v.trim();
+                        let val = if (v_trimmed.starts_with('"') && v_trimmed.ends_with('"') && v_trimmed.len() >= 2)
+                            || (v_trimmed.starts_with('\'') && v_trimmed.ends_with('\'') && v_trimmed.len() >= 2)
+                        {
+                            v_trimmed[1..v_trimmed.len() - 1].to_string()
+                        } else {
+                            v_trimmed.split('#').next().unwrap_or("").trim().to_string()
+                        };
+                        map.entry(k).or_insert(val);
                     }
                 }
                 break; // use first .env found

@@ -74,9 +74,11 @@ pub fn is_allowed(cmd: &str, config: &Config) -> bool {
         Some(pair) => pair,
         None => return false,
     };
+    let cmd_lower = cmd.to_lowercase();
     let exe_lower = executable.to_lowercase();
     for blocked in &config.blocked_commands {
-        if exe_lower == blocked.to_lowercase() || exe_lower.starts_with(&format!("{blocked}/")) {
+        let b = blocked.to_lowercase();
+        if exe_lower == b || cmd_lower.contains(&b) || exe_lower.starts_with(&format!("{b}/")) {
             return false;
         }
     }
