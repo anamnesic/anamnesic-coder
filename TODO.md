@@ -283,6 +283,8 @@
 | 9 | Replaced unwrap calls with pattern matching in production | ADR 0008 |
 | 10 | `partial_cmp().unwrap()` NaN panic safety | ADR 0008 |
 | 11 | Top-K sampling NaN comparison safety | ADR 0008 |
+| 12 | HTTP error status check in OllamaClient | ADR 0008 |
+| 16 | Rename `r#loop` → `agent_loop` | ADR 0008 |
 | 21 | GPU info single file-read refactor | ADR 0008 |
 | 22 | `.env` value parser with quotes & inline comments | ADR 0008 |
 | 23 | Short API key masking safety | ADR 0008 |
@@ -322,35 +324,20 @@
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
 | G2 | **P0** | Wire approval broker to tool dispatch | Harness/Safety | Baixo |
-| G3 | **P0** | Context compaction / conversation summarization | Harness | Alto |
-| G4 | **P0** | Token counting | Harness | Médio |
-| 8 | P0 | TOCTOU race in `FileTools::resolve` | Safety | Médio |
-| — | P0 | Tests for path traversal, symlink escape, injection | Safety | Médio |
 | G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
 | G7 | P1 | MCP client (stdio transport) | Harness | Alto |
 | G9 | P1 | Streaming tool call deltas | Harness | Médio |
-| 9 | P1 | Fix `unwrap()` in production paths | Robustness | Baixo |
-| 10 | P1 | Fix `partial_cmp().unwrap()` NaN panic (3 sites) | Robustness | Baixo |
-| 11 | P1 | Fix `partial_cmp().unwrap()` in top-K sampling | Robustness | Baixo |
-| 12 | P1 | Fix `unwrap_or_default` HTTP error swallowing | Robustness | Baixo |
 | — | P1 | Provider health checks, circuit breaking | Robustness | Médio |
 | — | P1 | Prompts versioned/tested | Quality | Médio |
-| G11 | P2 | Repo map (Aider-style) | Harness | Alto |
 | G12 | P2 | Lint integration | Harness | Médio |
 | G13 | P2 | Web search tool | Harness | Médio |
 | G14 | P2 | Session persistence | Harness | Médio |
 | G15 | P2 | Background task execution | Harness | Alto |
 | G16 | P2 | Git branch/stash operations | Harness | Baixo |
-| 16 | P2 | Rename `r#loop` → `agent_loop` | Code Quality | Baixo |
 | 17 | P2 | Remove `#![allow(dead_code)]` | Code Quality | Baixo |
 | 18 | P2 | Fix `truncate_str` (head vs tail) | Code Quality | Baixo |
 | 19 | P2 | Fix conversation clone per iteration | Performance | Médio |
 | 20 | P2 | Fix embedding alloc per token | Performance | Baixo |
-| 21 | P2 | Fix GPU detection double-read | Code Quality | Baixo |
-| 22 | P2 | Fix `.env` parser `=` handling | Code Quality | Baixo |
-| 23 | P2 | Fix `mask_key` for short keys | Code Quality | Baixo |
-| 28 | P2 | Clean up multi-word blocked commands | Code Quality | Baixo |
-| 29 | P3 | Fix `extract_path` heuristic | Logic Bug | Baixo |
 | 30 | P2 | Make `get_cloud_models` data-driven | Code Quality | Baixo |
 | 31 | P2 | Split local/cloud benchmark files | Code Quality | Baixo |
 | — | P2 | Integration tests with mock provider | Testing | Médio |
