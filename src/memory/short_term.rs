@@ -79,6 +79,15 @@ impl ShortTermMemory {
         lines.join("\n")
     }
 
+    /// Messages in display order, for the interactive chat UI.
+    pub fn history(&self) -> Vec<(String, String)> {
+        self.messages.iter().cloned().collect()
+    }
+
+    pub fn last_message(&self) -> Option<(String, String)> {
+        self.messages.back().cloned()
+    }
+
     pub fn clear(&mut self) { self.messages.clear(); self.actions.clear(); self.files.clear(); self.summary = None; }
 }
 

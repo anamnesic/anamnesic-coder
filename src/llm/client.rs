@@ -35,6 +35,18 @@ pub struct ToolCallResult {
     pub content: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    JsonObject,
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: bool,
+    },
+}
+
 #[derive(Serialize)]
 struct GenerateRequest {
     model: String,
@@ -53,6 +65,7 @@ struct ChatRequest {
     messages: Vec<serde_json::Value>,
     stream: bool,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDef>>,
 }
 
@@ -74,7 +87,10 @@ struct CloudChatRequest {
     messages: Vec<serde_json::Value>,
     stream: bool,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Deserialize)]
@@ -101,7 +117,10 @@ struct CloudStreamRequest {
     messages: Vec<serde_json::Value>,
     stream: bool,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Deserialize)]
@@ -180,10 +199,19 @@ impl LlmClient {
         LlmClient::Cloud(CloudClient::new(base_url, api_key))
     }
 
-    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>) -> Result<String> {
+    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>) -> Result<String> {
         match self {
-            LlmClient::Ollama(c) => c.generate(model, prompt, tools).await,
-            LlmClient::Cloud(c)  => c.generate(model, prompt, tools).await,
+            LlmClient::Ollama(c) => c.generate(model, prompt, tools, response_format).await,
+            // NVIDIA NIM and the other supported cloud backends are
+            // OpenAI-compatible chat APIs.  Using chat here also preserves
+            // tool calls and reasoning-model responses; `/v1/completions`
+            // may return an empty `text` for chat-tuned models.
+            LlmClient::Cloud(c)  => c.chat(
+                model,
+                vec![serde_json::json!({ "role": "user", "content": prompt })],
+                tools,
+                response_format,
+            ).await,
             LlmClient::Local(eng) => {
                 let mut eng = eng.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
                 eng.generate(prompt, 512, 0.8, 40).map_err(|e| anyhow::anyhow!("Local inference error: {}", e))
@@ -192,10 +220,10 @@ impl LlmClient {
     }
 
     /// Generate with bounded retries and exponential backoff on transient failures.
-    pub async fn generate_with_retry(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>) -> Result<String> {
+    pub async fn generate_with_retry(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>) -> Result<String> {
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..3 {
-            match self.generate(model, prompt, tools).await {
+            match self.generate(model, prompt, tools, response_format).await {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     eprintln!("  ⚠ LLM call failed (attempt {}): {e}", attempt + 1);
@@ -212,12 +240,12 @@ impl LlmClient {
 
     /// Stream a response, invoking `on_token` for each text chunk.
     /// Falls back to non-streaming output for local engines.
-    pub async fn stream(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
+    pub async fn stream(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
         match self {
-            LlmClient::Ollama(c) => c.stream_generate(model, prompt, tools, on_token).await,
+            LlmClient::Ollama(c) => c.stream_generate(model, prompt, tools, response_format, on_token).await,
             LlmClient::Cloud(c) => {
                 let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-                c.stream_chat(model, messages, tools, on_token).await
+                c.stream_chat(model, messages, tools, response_format, on_token).await
             }
             LlmClient::Local(eng) => {
                 let mut eng = eng.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
@@ -229,10 +257,10 @@ impl LlmClient {
         }
     }
 
-    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>) -> Result<String> {
+    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>) -> Result<String> {
         match self {
-            LlmClient::Ollama(c) => c.chat(model, messages, tools).await,
-            LlmClient::Cloud(c)  => c.chat(model, messages, tools).await,
+            LlmClient::Ollama(c) => c.chat(model, messages, tools, response_format).await,
+            LlmClient::Cloud(c)  => c.chat(model, messages, tools, response_format).await,
             LlmClient::Local(eng) => {
                 // Flatten chat messages into a single prompt for local inference
                 let prompt = messages.iter()
@@ -258,7 +286,7 @@ impl OllamaClient {
         }
     }
 
-    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>) -> Result<String> {
+    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, _response_format: Option<&ResponseFormat>) -> Result<String> {
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -296,7 +324,7 @@ impl OllamaClient {
         Ok(data["response"].as_str().unwrap_or("").to_string())
     }
 
-    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>) -> Result<String> {
+    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>, _response_format: Option<&ResponseFormat>) -> Result<String> {
         let body = ChatRequest {
             model: model.to_string(),
             messages,
@@ -338,7 +366,7 @@ impl OllamaClient {
     /// Stream a `/api/generate` call (NDJSON lines), feeding text chunks to `on_token`.
     /// Supports tool calls — when the model emits tool_calls, they are returned
     /// as a JSON array string instead of streaming text.
-    pub async fn stream_generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
+    pub async fn stream_generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, _response_format: Option<&ResponseFormat>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -419,14 +447,32 @@ impl CloudClient {
     }
 
     /// Single-turn text completion (`POST /v1/completions`).
-    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>) -> Result<String> {
-        let body = serde_json::json!({
+    pub async fn generate(&self, model: &str, prompt: &str, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>) -> Result<String> {
+        let mut body = serde_json::json!({
             "model": model,
             "prompt": prompt,
             "stream": false,
             "max_tokens": 2048,
             "tools": tools.unwrap_or(&vec![]),
         });
+        if let Some(rf) = response_format {
+            match rf {
+                ResponseFormat::JsonObject => {
+                    body.as_object_mut().unwrap().insert("response_format".into(), serde_json::json!({"type": "json_object"}));
+                }
+                ResponseFormat::JsonSchema { name, schema, strict } => {
+                    body.as_object_mut().unwrap().insert("response_format".into(), serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": name,
+                            "schema": schema,
+                            "strict": strict,
+                        }
+                    }));
+                }
+                ResponseFormat::Text => {}
+            }
+        }
 
         let resp = self.client
             .post(format!("{}/completions", self.base_url))
@@ -436,9 +482,8 @@ impl CloudClient {
             .await
             .context("cloud completions request failed")?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // Newer OpenAI-compatible endpoints (e.g. NVIDIA NIM) are chat-only.
             let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-            return self.chat(model, messages, tools).await;
+            return self.chat(model, messages, tools, response_format).await;
         }
         if !resp.status().is_success() {
             let status = resp.status();
@@ -451,9 +496,10 @@ impl CloudClient {
             .await
             .context("Failed to parse cloud completions response")?;
 
-        // Check for tool_calls in the response
         if let Some(tool_calls) = data["choices"][0]["message"]["tool_calls"].as_array() {
-            return Ok(serde_json::to_string(tool_calls)?);
+            if !tool_calls.is_empty() {
+                return Ok(serde_json::to_string(tool_calls)?);
+            }
         }
 
         data["choices"][0]["text"].as_str()
@@ -463,14 +509,18 @@ impl CloudClient {
     }
 
     /// Chat completion (`POST /v1/chat/completions`).
-    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>) -> Result<String> {
-        let body = CloudChatRequest {
+    pub async fn chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>) -> Result<String> {
+        let mut body = CloudChatRequest {
             model: model.to_string(),
             messages,
             stream: false,
             max_tokens: 2048,
             tools: tools.cloned(),
+            response_format: None,
         };
+        if let Some(rf) = response_format {
+            body.response_format = Some(rf.clone());
+        }
 
         let resp = self.client
             .post(format!("{}/chat/completions", self.base_url))
@@ -490,26 +540,31 @@ impl CloudClient {
             .await
             .context("Failed to parse cloud chat response")?;
 
-        // Check for tool_calls in the response
         if let Some(tool_calls) = data["choices"][0]["message"]["tool_calls"].as_array() {
-            return Ok(serde_json::to_string(tool_calls)?);
+            if !tool_calls.is_empty() {
+                return Ok(serde_json::to_string(tool_calls)?);
+            }
         }
 
-        data["choices"][0]["message"]["content"].as_str()
-            .map(|s| s.to_string())
-            .context("cloud chat response missing content")
+        Ok(data["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// Stream a chat completion (SSE), feeding content deltas to `on_token`.
-    /// When tool_calls are emitted, they are passed to `on_token` as JSON.
-    pub async fn stream_chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
-        let body = CloudStreamRequest {
+    pub async fn stream_chat(&self, model: &str, messages: Vec<serde_json::Value>, tools: Option<&Vec<ToolDef>>, response_format: Option<&ResponseFormat>, on_token: &mut dyn FnMut(&str)) -> Result<String> {
+        let mut body = CloudStreamRequest {
             model: model.to_string(),
             messages,
             stream: true,
             max_tokens: 2048,
             tools: tools.cloned(),
+            response_format: None,
         };
+        if let Some(rf) = response_format {
+            body.response_format = Some(rf.clone());
+        }
 
         let mut resp = self.client
             .post(format!("{}/chat/completions", self.base_url))
@@ -526,7 +581,6 @@ impl CloudClient {
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut full = String::new();
-        let mut _saw_tool_calls = false;
         loop {
             let Some(chunk) = resp.chunk().await.context("cloud stream read failed")? else {
                 break;
@@ -552,7 +606,6 @@ impl CloudClient {
                             }
                         }
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            _saw_tool_calls = true;
                             for tc in tcs {
                                 on_token(&serde_json::json!({
                                     "tool_call": tc

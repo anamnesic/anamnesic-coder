@@ -46,23 +46,9 @@ pub fn test_provider(provider_id: &str, entry: &ProviderEntry) -> Result<String>
 /// Default API base URL per provider (used when store/catalog have none).
 pub(crate) fn default_base(provider_id: &str) -> String {
     match provider_id {
-        "openai"        => "https://api.openai.com/v1".into(),
-        "anthropic"     => "https://api.anthropic.com/v1".into(),
-        "google"        => "https://generativelanguage.googleapis.com/v1beta".into(),
-        "mistral"       => "https://api.mistral.ai/v1".into(),
-        "groq"          => "https://api.groq.com/openai/v1".into(),
-        "togetherai"    => "https://api.together.xyz/v1".into(),
-        "deepseek"      => "https://api.deepseek.com".into(),
-        "minimax"       => "https://api.minimax.chat/v1".into(),
-        "z-ai"          => "https://api.z.ai/v1".into(),
-        "cohere"        => "https://api.cohere.ai/v1".into(),
-        "openrouter"    => "https://openrouter.ai/api/v1".into(),
-        "nvidia"        => "https://integrate.api.nvidia.com/v1".into(),
-        "perplexity"    => "https://api.perplexity.ai".into(),
-        "fireworks-ai"  => "https://api.fireworks.ai/inference/v1".into(),
-        "deepinfra"     => "https://api.deepinfra.com/v1/openai".into(),
-        "cerebras"      => "https://api.cerebras.ai/v1".into(),
-        "ollama-cloud"  => "https://ollama.com/v1".into(),
-        other           => format!("https://api.{other}.com/v1"),
+        "nvidia" | "deepseek" | "minimax" | "z-ai" | "openai" | "anthropic" | "google" | "mistral" | "groq" | "togetherai" | "cohere" | "openrouter" | "perplexity" | "fireworks-ai" | "deepinfra" | "cerebras" | "ollama-cloud" => {
+            "https://integrate.api.nvidia.com/v1".into()
+        }
+        other => format!("https://api.{other}.com/v1"),
     }
 }

@@ -45,6 +45,9 @@ pub struct App {
     pub editor_col: usize,
     pub editor_dirty: bool,
     pub editor_scroll: usize,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub status: String,
 }
 
 impl App {
@@ -63,6 +66,9 @@ impl App {
             editor_col: 0,
             editor_dirty: false,
             editor_scroll: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            status: "Ready · Enter to send · ↑/↓ history · Ctrl+L clear · Esc quit".into(),
         }
     }
 
@@ -73,6 +79,26 @@ impl App {
     pub fn clear_input(&mut self) {
         self.input.clear();
         self.cursor_position = 0;
+    }
+
+    fn previous_input(&mut self) {
+        if self.input_history.is_empty() { return; }
+        let index = self.history_index.unwrap_or(self.input_history.len()).saturating_sub(1);
+        self.input = self.input_history[index].clone();
+        self.cursor_position = self.input.len();
+        self.history_index = Some(index);
+    }
+
+    fn next_input(&mut self) {
+        let Some(index) = self.history_index else { return; };
+        if index + 1 < self.input_history.len() {
+            self.input = self.input_history[index + 1].clone();
+            self.cursor_position = self.input.len();
+            self.history_index = Some(index + 1);
+        } else {
+            self.clear_input();
+            self.history_index = None;
+        }
     }
 }
 
@@ -85,7 +111,11 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and event channels
-    let app = Arc::new(Mutex::new(App::new()));
+    let mut initial_app = App::new();
+    for (role, content) in state.session.history() {
+        initial_app.add_message(&display_role(&role), &content);
+    }
+    let app = Arc::new(Mutex::new(initial_app));
     let state = Arc::new(Mutex::new(state));
     // populate sidebar with workspace files
     {
@@ -110,7 +140,7 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
     // App loop
     {
         let mut init = app.lock().unwrap();
-        init.add_message("System", "Welcome to the Ratatui UI. Type your message and press Enter.");
+        init.add_message("System", "Anamnesic is ready. Ask for a change, inspect files, or run a check.");
     }
 
     loop {
@@ -122,6 +152,11 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::Key(key)) => {
                 let mut guard = app.lock().unwrap();
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+                    guard.messages.clear();
+                    guard.status = "Chat cleared (session memory is preserved).".into();
+                    continue;
+                }
                 match key.code {
                     KeyCode::Tab => {
                         guard.focus = match guard.focus {
@@ -140,6 +175,8 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_col > line_len { guard.editor_col = line_len; }
                             // adjust scroll
                             if guard.editor_row < guard.editor_scroll { guard.editor_scroll = guard.editor_row; }
+                        } else if guard.focus == Focus::Input && !guard.loading {
+                            guard.previous_input();
                         }
                     }
                     KeyCode::Down => {
@@ -149,6 +186,8 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_row + 1 < guard.editor_lines.len() { guard.editor_row += 1; }
                             let line_len = guard.editor_lines.get(guard.editor_row).map(|l| l.len()).unwrap_or(0);
                             if guard.editor_col > line_len { guard.editor_col = line_len; }
+                        } else if guard.focus == Focus::Input && !guard.loading {
+                            guard.next_input();
                         }
                     }
                     KeyCode::Enter => {
@@ -157,7 +196,10 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                                 let input = guard.input.trim().to_string();
                                 if !input.is_empty() {
                                     guard.add_message("User", &input);
+                                    guard.input_history.push(input.clone());
+                                    guard.history_index = None;
                                     guard.loading = true;
+                                    guard.status = "Working… tools and checks will appear here when complete.".into();
                                     let input_clone = input.clone();
                                     let client_clone = client.clone();
                                     let state_clone = Arc::clone(&state);
@@ -168,8 +210,15 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                                         rt.block_on(crate::agent::r#loop::run_agent_loop(
                                             &client_clone, &mut st, &input_clone,
                                         ));
+                                        let final_message = st.session.last_message();
                                         let mut a = app_clone.lock().unwrap();
+                                        if let Some((role, text)) = final_message {
+                                            if role == "assistant" {
+                                                a.add_message("Assistant", &text);
+                                            }
+                                        }
                                         a.loading = false;
+                                        a.status = "Ready · Enter to send · ↑/↓ history · Ctrl+L clear · Esc quit".into();
                                     });
                                     guard.clear_input();
                                 }
@@ -217,6 +266,7 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Char(c) => {
+                        if guard.loading { continue; }
                         if guard.focus == Focus::Editor {
                             // insert char into editor at cursor
                             if guard.editor_row >= guard.editor_lines.len() {
@@ -239,6 +289,7 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Backspace => {
+                        if guard.loading { continue; }
                         if guard.focus == Focus::Editor {
                             let row = guard.editor_row;
                             let col = guard.editor_col;
@@ -343,11 +394,24 @@ pub fn run_ui(client: LlmClient, state: AgentState) -> Result<(), Box<dyn Error>
 fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<(), Box<dyn Error>> {
     f.draw(|f| {
         let size = f.area();
+        let page = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)].as_ref())
+            .split(size);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(" ANAMNESIC ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  coding agent", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  workspace chat", Style::default().fg(Color::DarkGray)),
+        ])).block(Block::default().borders(Borders::ALL));
+        f.render_widget(header, page[0]);
+        let footer = Paragraph::new(app.status.as_str()).style(Style::default().fg(if app.loading { Color::Yellow } else { Color::DarkGray }));
+        f.render_widget(footer, page[2]);
+
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .margin(1)
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)].as_ref())
-            .split(size);
+            .split(page[1]);
 
         // Sidebar (files)
         let sidebar_items: Vec<ListItem> = app
@@ -356,7 +420,7 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
             .map(|s| ListItem::new(Span::raw(s.clone())))
             .collect();
         let sidebar = List::new(sidebar_items)
-            .block(Block::default().title("Files").borders(Borders::ALL))
+            .block(Block::default().title(" Workspace files ").borders(Borders::ALL))
             .highlight_style(Style::default().bg(Color::DarkGray))
             .highlight_symbol("▶ ");
         let mut list_state = ratatui::widgets::ListState::default();
@@ -411,7 +475,7 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
                     ListItem::new(content)
                 })
                 .collect();
-            let messages_block = Block::default().title("Messages").borders(Borders::ALL);
+            let messages_block = Block::default().title(" Chat ").borders(Borders::ALL);
             let messages_widget = List::new(messages)
                 .block(messages_block)
                 .highlight_style(Style::default().bg(Color::DarkGray))
@@ -420,8 +484,9 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
         }
 
         // Input area
+        let input_title = if app.loading { " Thinking… " } else { " Message " };
         let input = Paragraph::new(app.input.as_str())
-            .block(Block::default().title("Input").borders(Borders::ALL))
+            .block(Block::default().title(input_title).borders(Borders::ALL))
             .style(if app.loading { Style::default().fg(Color::Gray) } else { Style::default() })
             .wrap(Wrap { trim: true });
         f.render_widget(input, right_chunks[1]);
@@ -431,6 +496,14 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
         }
     })?;
     Ok(())
+}
+
+fn display_role(role: &str) -> String {
+    match role {
+        "user" => "User".into(),
+        "assistant" => "Assistant".into(),
+        _ => role.to_string(),
+    }
 }
 
 fn enable_raw_mode() -> Result<(), Box<dyn Error>> {

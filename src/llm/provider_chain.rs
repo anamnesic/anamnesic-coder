@@ -87,15 +87,17 @@ pub struct NimProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    base_url: String,
     bucket: TokenBucket,
 }
 
 impl NimProvider {
-    pub fn new(api_key: String, model: String, rpm: f64) -> Self {
+    pub fn new(base_url: &str, api_key: String, model: String, rpm: f64) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
             model,
+            base_url: base_url.trim_end_matches('/').to_string(),
             bucket: TokenBucket::new(rpm),
         }
     }
@@ -112,11 +114,12 @@ impl CompletionProvider for NimProvider {
 
         let resp = self
             .client
-            .post("https://integrate.api.nvidia.com/v1/chat/completions")
+            .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&serde_json::json!({
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048,
             }))
             .send()
             .await
@@ -252,8 +255,8 @@ async fn backoff_sleep(attempt: u32) {
 
 // ---------- Exemplo de montagem ----------
 
-pub fn build_default_chain(nim_api_key: String) -> FallbackChain {
-    let nim = Arc::new(NimProvider::new(nim_api_key, "meta/llama-3.1-8b-instruct".into(), 40.0));
+pub fn build_default_chain(base_url: &str, nim_api_key: String, nim_model: String) -> FallbackChain {
+    let nim = Arc::new(NimProvider::new(base_url, nim_api_key, nim_model, 40.0));
     let local = Arc::new(LocalProvider::new("http://localhost:11434".into(), "nemotron-3-nano".into()));
 
     FallbackChain::new(vec![nim, local])

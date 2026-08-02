@@ -88,6 +88,9 @@ enum Commands {
         /// Output JSON file for results
         #[arg(short, long, default_value = "bench_results.json")]
         output: String,
+        /// Also benchmark cloud models (requires API keys)
+        #[arg(long)]
+        cloud: bool,
     },
 }
 
@@ -175,6 +178,9 @@ async fn main() -> Result<()> {
     let client = build_client(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
+    if cli.resume {
+        resume_session(&mut state)?;
+    }
 
     match cli.command {
         Some(Commands::Check) => hw_check().await?,
@@ -185,10 +191,15 @@ async fn main() -> Result<()> {
         Some(Commands::Providers { action }) => {
             handle_providers(action).await?;
         },
-        Some(Commands::Bench { category, output }) => {
+        Some(Commands::Bench { category, output, cloud }) => {
             let results = bench::model_bench::rank_models(&state.config.models_dir, &category);
             bench::model_bench::save_ranking(&results, std::path::Path::new(&output))?;
             bench::display::show_ranking_table(&results)?;
+            if cloud {
+                let cloud_results = bench::model_bench::rank_cloud_models(&get_cloud_models()).await;
+                bench::model_bench::save_ranking(&cloud_results, std::path::Path::new(&output))?;
+                bench::display::show_ranking_table(&cloud_results)?;
+            }
         },
         Some(Commands::Models) => {
             let models = model_resolver::list_models(&state.config.models_dir);
@@ -202,14 +213,14 @@ async fn main() -> Result<()> {
         Some(Commands::Tui) => {
             ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         },
-        Some(Commands::Repl) | None => {
-            if cli.resume {
-                resume_session(&mut state)?;
-            }
+        Some(Commands::Repl) => {
+            repl(&client, &mut state).await?;
+        }
+        None => {
             if let Some(task) = cli.task {
                 run_agent_loop(&client, &mut state, &task).await;
             } else {
-                repl(&client, &mut state).await?;
+                ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
         }
     }
@@ -316,6 +327,19 @@ async fn hw_check() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Returns the list of cloud models to benchmark, all via NVIDIA NIM.
+fn get_cloud_models() -> Vec<(String, String, String, String, f64)> {
+    let api_key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
+    vec![
+        ("nvidia/nvidia-nemotron-nano-9b-v2".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 40.0),
+        ("deepseek-ai/deepseek-v4-flash".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 20.0),
+        ("nvidia/llama-3.3-nemotron-super-49b-v1.5".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 20.0),
+        ("minimaxai/minimax-m3".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 10.0),
+        ("z-ai/glm-5.2".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 10.0),
+        ("deepseek-ai/deepseek-v4-pro".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 5.0),
+    ]
 }
 
 async fn handle_providers(action: ProvidersAction) -> Result<()> {

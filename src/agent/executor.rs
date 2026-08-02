@@ -97,7 +97,7 @@ async fn write_with_verification<F>(
     let mut extra = String::new();
     for attempt in 0..=MAX_FILE_FIX_ATTEMPTS {
         let prompt = make_prompt(&extra);
-        let content = match client.generate_with_retry(&state.config.coder_model, &prompt, None).await {
+        let content = match client.generate_with_retry(&state.config.coder_model, &prompt, None, None).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ✗ LLM call failed for {}: {e}", filename);
@@ -265,7 +265,7 @@ async fn execute_step_inner(client: &LlmClient, state: &mut AgentState, step: &P
             let system = CoderPrompt::with_caveman(&caveman);
             let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, step.description);
             let mut out = std::io::stdout();
-            let result = client.stream(&state.config.coder_model, &prompt, None, &mut |tok| {
+            let result = client.stream(&state.config.coder_model, &prompt, None, None, &mut |tok| {
                 let _ = write!(out, "{}", tok);
                 let _ = out.flush();
             }).await;

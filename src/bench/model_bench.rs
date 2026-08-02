@@ -268,7 +268,7 @@ pub async fn benchmark_cloud_model(
     }
 }
 
-/// Build a FallbackChain for a specific cloud model.
+/// Build a FallbackChain for a specific cloud model via NIM.
 fn build_cloud_chain(
     api_key: &str,
     model_id: &str,
@@ -276,7 +276,7 @@ fn build_cloud_chain(
 ) -> FallbackChain {
     use crate::llm::provider_chain::{NimProvider, LocalProvider, CompletionProvider};
 
-    let nim = Arc::new(NimProvider::new(api_key.to_string(), model_id.to_string(), rpm));
+    let nim = Arc::new(NimProvider::new("https://integrate.api.nvidia.com", api_key.to_string(), model_id.to_string(), rpm));
     let local = Arc::new(LocalProvider::new(
         "http://localhost:11434".to_string(),
         "nemotron-3-nano".to_string(),
