@@ -749,6 +749,7 @@ impl CloudClient {
 
     /// Chat completion that also exposes the backend's `finish_reason` so the
     /// agent loop can continue when the model is truncated or still calling tools.
+    /// Retries automatically on 429/500/502/503 with exponential backoff.
     pub async fn chat_meta(
         &self,
         model: &str,
@@ -771,36 +772,65 @@ impl CloudClient {
             body.response_format = Some(rf.clone());
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("cloud chat request failed")?;
-        if !resp.status().is_success() {
+        const MAX_RETRIES: u32 = 5;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            let resp = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .context("cloud chat request failed")?;
+
+            if resp.status().is_success() {
+                let data: CloudChatResponse = resp
+                    .json()
+                    .await
+                    .context("Failed to parse cloud chat response")?;
+                let choice = data
+                    .choices
+                    .into_iter()
+                    .next()
+                    .context("cloud chat response contained no choices")?;
+                let tool_calls = choice.message.tool_calls.unwrap_or_default();
+                return Ok(ChatCompletion {
+                    content: choice.message.content.unwrap_or_default(),
+                    tool_calls,
+                    finish_reason: choice.finish_reason,
+                });
+            }
+
             let status = resp.status();
+            let status_code = status.as_u16();
             let text = resp.text().await.unwrap_or_default();
+            let retryable =
+                status_code == 429 || status_code == 500 || status_code == 502 || status_code == 503;
+
+            if retryable && attempt < MAX_RETRIES {
+                let backoff_ms = match status_code {
+                    429 => 2000u64 * 2u64.pow(attempt), // longer for rate limits
+                    _ => 500u64 * 2u64.pow(attempt),
+                };
+                log::warn!(
+                    "cloud chat HTTP {status_code} (attempt {}/{}); retrying in {}ms",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    backoff_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                last_err = Some(anyhow::anyhow!(
+                    "cloud chat: HTTP {status} {text}"
+                ));
+                continue;
+            }
+
             anyhow::bail!("cloud chat request failed: HTTP {status} {text}");
         }
 
-        let data: CloudChatResponse = resp
-            .json()
-            .await
-            .context("Failed to parse cloud chat response")?;
-        let choice = data
-            .choices
-            .into_iter()
-            .next()
-            .context("cloud chat response contained no choices")?;
-        let tool_calls = choice.message.tool_calls.unwrap_or_default();
-
-        Ok(ChatCompletion {
-            content: choice.message.content.unwrap_or_default(),
-            tool_calls,
-            finish_reason: choice.finish_reason,
-        })
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("cloud chat failed after retries")))
     }
 
     /// Stream a chat completion (SSE), feeding content deltas to `on_token`.

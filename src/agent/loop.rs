@@ -307,7 +307,7 @@ async fn run_tool_use_iteration(
         } else {
             crate::llm::client::ToolChoice::Auto
         };
-        let completion = client
+        let completion = match client
             .chat_meta_with_fallback(
                 model,
                 conversation.clone(),
@@ -315,7 +315,15 @@ async fn run_tool_use_iteration(
                 Some(&tool_choice),
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let message = format!("{e}");
+                hooks.warn(&format!("  [llm error] {message}"));
+                return Err(e);
+            }
+        };
         let response = completion.content;
         let mut tool_calls = completion.tool_calls;
 
