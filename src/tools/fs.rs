@@ -25,6 +25,14 @@ pub struct FileTools {
     workspace: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultiEdit {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub old_content: Option<String>,
+    pub new_content: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::FileTools;
@@ -391,6 +399,79 @@ impl FileTools {
         }
     }
 
+    pub fn multi_edit_file(
+        &self,
+        path: &str,
+        edits: &[MultiEdit],
+    ) -> anyhow::Result<()> {
+        if edits.is_empty() {
+            anyhow::bail!("edits must not be empty");
+        }
+        let target = self
+            .resolve(path)
+            .ok_or_else(|| anyhow::anyhow!("path is outside workspace"))?;
+        let content = fs::read_to_string(&target)?;
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+
+        // Sort edits by start_line descending so earlier edits don't shift
+        // the line numbers of later edits. Reject overlapping ranges.
+        let mut sorted: Vec<&MultiEdit> = edits.iter().collect();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.start_line));
+        for window in sorted.windows(2) {
+            let earlier = &window[0];
+            let later = &window[1];
+            if earlier.start_line <= later.end_line {
+                anyhow::bail!(
+                    "overlapping edits are not allowed: lines {}-{} overlaps lines {}-{}",
+                    later.start_line, later.end_line,
+                    earlier.start_line, earlier.end_line
+                );
+            }
+        }
+
+        for edit in &sorted {
+            if edit.start_line == 0 || edit.start_line > lines.len() + 1 {
+                anyhow::bail!(
+                    "start_line {} is out of bounds (file has {} lines)",
+                    edit.start_line,
+                    lines.len()
+                );
+            }
+            if edit.end_line < edit.start_line {
+                anyhow::bail!(
+                    "end_line {} must be >= start_line {}",
+                    edit.end_line,
+                    edit.start_line
+                );
+            }
+            let end_idx = edit.end_line.min(lines.len());
+            let start_idx = edit.start_line - 1;
+
+            if let Some(old) = &edit.old_content {
+                let actual_slice = lines[start_idx..end_idx].join("\n");
+                if actual_slice.trim() != old.trim() {
+                    anyhow::bail!(
+                        "content mismatch at lines {}-{}:\nExpected:\n{}\n\nActual:\n{}",
+                        edit.start_line,
+                        edit.end_line,
+                        old.trim(),
+                        actual_slice.trim()
+                    );
+                }
+            }
+
+            let replacement: Vec<String> =
+                edit.new_content.lines().map(String::from).collect();
+            lines.splice(start_idx..end_idx, replacement);
+        }
+
+        let mut joined = lines.join("\n");
+        if content.ends_with('\n') && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        self.atomic_write(&target, &joined)
+    }
+
     fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         let parent = path
             .parent()
@@ -463,6 +544,56 @@ mod transactional_tests {
         tools.write_file("test.py", "line 1\nline 2\nline 3\nline 4\n").unwrap();
         tools.edit_file("test.py", Some(2), Some(3), Some("line 2\nline 3"), "NEW LINE 2AND3").unwrap();
         assert_eq!(tools.read_file("test.py").unwrap(), "line 1\nNEW LINE 2AND3\nline 4\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_edit_file_applies_non_overlapping_edits() {
+        use super::MultiEdit;
+        let root = workspace("multi_edit");
+        let tools = FileTools::new(root.clone());
+        tools
+            .write_file("src.rs", "a\nb\nc\nd\ne\nf\n")
+            .unwrap();
+        let edits = vec![
+            MultiEdit { start_line: 1, end_line: 1, old_content: None, new_content: "A".into() },
+            MultiEdit { start_line: 3, end_line: 4, old_content: None, new_content: "C\nD2".into() },
+            MultiEdit { start_line: 6, end_line: 6, old_content: None, new_content: "F2".into() },
+        ];
+        tools.multi_edit_file("src.rs", &edits).unwrap();
+        assert_eq!(tools.read_file("src.rs").unwrap(), "A\nb\nC\nD2\ne\nF2\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_edit_file_rejects_overlapping_edits() {
+        use super::MultiEdit;
+        let root = workspace("multi_overlap");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("src.rs", "a\nb\nc\nd\n").unwrap();
+        let edits = vec![
+            MultiEdit { start_line: 2, end_line: 3, old_content: None, new_content: "x".into() },
+            MultiEdit { start_line: 3, end_line: 4, old_content: None, new_content: "y".into() },
+        ];
+        assert!(tools.multi_edit_file("src.rs", &edits).is_err());
+        assert_eq!(tools.read_file("src.rs").unwrap(), "a\nb\nc\nd\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_edit_file_validates_old_content() {
+        use super::MultiEdit;
+        let root = workspace("multi_validate");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("src.rs", "alpha\nbeta\n").unwrap();
+        let edits = vec![MultiEdit {
+            start_line: 1,
+            end_line: 1,
+            old_content: Some("wrong".into()),
+            new_content: "ALPHA".into(),
+        }];
+        assert!(tools.multi_edit_file("src.rs", &edits).is_err());
+        assert_eq!(tools.read_file("src.rs").unwrap(), "alpha\nbeta\n");
         let _ = fs::remove_dir_all(root);
     }
 }

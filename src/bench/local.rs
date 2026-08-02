@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use crate::llm::model_resolver;
 use crate::llm::infer::{engine::InferenceEngine, gguf::GgufReader, model::Model, tokenizer::Tokenizer};
-use crate::hw_recommend::{detector, recommender, catalog, scoring};
+use crate::hw_recommend::{detector, recommender};
 use crate::models_dev::ModelsDevClient;
 use super::model_bench::{BenchResult, names_match, estimate_tps_from_catalog};
 

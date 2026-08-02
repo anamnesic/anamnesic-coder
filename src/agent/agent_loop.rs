@@ -527,7 +527,7 @@ fn tool_effect(name: &str) -> ToolEffect {
         "read_file" | "list_tree" | "search_code" | "git_status" | "git_diff" => {
             ToolEffect::ReadOnly
         }
-        "write_file" | "replace_exact" | "edit_file" => ToolEffect::Mutation,
+            "write_file" | "replace_exact" | "edit_file" | "multi_edit_file" => ToolEffect::Mutation,
         _ => ToolEffect::Command,
     }
 }
@@ -698,7 +698,7 @@ fn execute_tool(
     let cap = state.config.max_tool_output_bytes;
 
     match tc.function.name.as_str() {
-        "write_file" | "replace_exact" | "edit_file" => {
+        "write_file" | "replace_exact" | "edit_file" | "multi_edit_file" => {
             let Some(path) = string_arg("path") else {
                 return ToolExecutionResult::output("missing required argument: path");
             };
@@ -728,6 +728,44 @@ fn execute_tool(
                     Some(new_content) => state.files.edit_file(path, start, end, old, new_content),
                     None => Err(anyhow::anyhow!("missing required argument: new_content")),
                 }
+            } else if tc.function.name == "multi_edit_file" {
+                let parsed = || -> anyhow::Result<Vec<crate::tools::fs::MultiEdit>> {
+                    let arr = args
+                        .get("edits")
+                        .and_then(|value| value.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("missing required argument: edits"))?;
+                    let mut edits = Vec::with_capacity(arr.len());
+                    for entry in arr {
+                        let start_line = entry
+                            .get("start_line")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| usize::try_from(v).ok());
+                        let end_line = entry
+                            .get("end_line")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| usize::try_from(v).ok());
+                        let (Some(start_line), Some(end_line)) = (start_line, end_line) else {
+                            anyhow::bail!("each edit requires integer start_line and end_line");
+                        };
+                        let old_content = entry
+                            .get("old_content")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let new_content = entry
+                            .get("new_content")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow::anyhow!("each edit requires new_content"))?
+                            .to_string();
+                        edits.push(crate::tools::fs::MultiEdit {
+                            start_line,
+                            end_line,
+                            old_content,
+                            new_content,
+                        });
+                    }
+                    Ok(edits)
+                };
+                parsed().and_then(|edits| state.files.multi_edit_file(path, &edits))
             } else {
                 match (string_arg("old"), string_arg("new")) {
                     (Some(old), Some(new)) => state.files.replace_exact(path, old, new),
@@ -1054,6 +1092,31 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
                     "new_content":{"type":"string"}
                 }),
                 serde_json::json!(["path", "new_content"]),
+            ),
+        ),
+        tool(
+            "multi_edit_file",
+            "Apply several non-overlapping line-range edits to one file in a single call. Each edit uses 1-based start_line and end_line.",
+            object(
+                serde_json::json!({
+                    "path":{"type":"string"},
+                    "edits":{
+                        "type":"array",
+                        "items":{
+                            "type":"object",
+                            "properties":{
+                                "start_line":{"type":"integer","minimum":1},
+                                "end_line":{"type":"integer","minimum":1},
+                                "old_content":{"type":"string"},
+                                "new_content":{"type":"string"}
+                            },
+                            "required":["start_line","end_line","new_content"],
+                            "additionalProperties":false
+                        },
+                        "minItems":1
+                    }
+                }),
+                serde_json::json!(["path", "edits"]),
             ),
         ),
         tool(
@@ -1561,8 +1624,35 @@ mod tests {
         assert_eq!(tool_effect("git_diff"), ToolEffect::ReadOnly);
         assert_eq!(tool_effect("replace_exact"), ToolEffect::Mutation);
         assert_eq!(tool_effect("write_file"), ToolEffect::Mutation);
+        assert_eq!(tool_effect("edit_file"), ToolEffect::Mutation);
+        assert_eq!(tool_effect("multi_edit_file"), ToolEffect::Mutation);
         assert_eq!(tool_effect("run_tests"), ToolEffect::Command);
         assert_eq!(tool_effect("run_command"), ToolEffect::Command);
+    }
+
+    #[test]
+    fn multi_edit_file_dispatch_applies_several_edits() {
+        let (mut state, root) = test_state("multi_dispatch");
+        state.files.write_file("src.rs", "a\nb\nc\nd\n").unwrap();
+        let call = tool_call(
+            "multi_edit_file",
+            serde_json::json!({
+                "path": "src.rs",
+                "edits": [
+                    {"start_line": 1, "end_line": 1, "new_content": "A"},
+                    {"start_line": 3, "end_line": 4, "new_content": "C\nD2"}
+                ]
+            }),
+        );
+
+        let result = execute_tool(&mut state, &call, &AgentHooks::default());
+
+        assert!(result.mutated, "got: {}", result.output);
+        assert_eq!(
+            state.files.read_file("src.rs").as_deref(),
+            Some("A\nb\nC\nD2\n")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

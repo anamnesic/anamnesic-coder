@@ -40,12 +40,13 @@
 
 > See full report: `docs/gap-analysis-2026-08.md`
 
-### G1. Line-Range Code Editing (edit_file / multi_edit_file)
+### ~~G1. Line-Range Code Editing (edit_file / multi_edit_file)~~ ✅ DONE
 - **Gap:** `replace_exact` exige match exato de string e não suporta edições multi-site. Todos os líderes (Claude Code, Antigravity, Cursor) usam edição por line-range.
 - **Impact:** Crítico para SWE-bench — modelos erram whitespace/indentation frequentemente, causando falha de match.
-- **Files:** `src/tools/fs.rs`, `src/agent/executor.rs`
-- **Fix:** Implementar `edit_file(path, start_line, end_line, old_content, new_content)` com line-range anchoring. Adicionar `multi_edit_file(path, edits[])` para edições não-contíguas no mesmo arquivo. Manter `replace_exact` como fallback.
+- **Files:** `src/tools/fs.rs`, `src/agent/agent_loop.rs`
+- **Fix:** Implementado `edit_file(path, start_line, end_line, old_content, new_content)` com line-range anchoring e validação de conteúdo. Implementado `multi_edit_file(path, edits[])` para edições não-contíguas no mesmo arquivo, aplicadas em ordem descendente de linha. Ambos registrados em `coding_tools()` e dispatch em `execute_tool()` com gate de aprovação `ToolEffect::Mutation`. `replace_exact` mantido como fallback.
 - **Ref:** Antigravity `replace_file_content` / `multi_replace_file_content`; Claude Code `Edit` tool.
+- **ADR:** 0006
 
 ### G2. Approval Broker Not Wired (security gap)
 - **Gap:** Os tipos `ApprovalRequest`, `ApprovalDecision` e `AgentHooks.on_approval` existem em `src/agent/loop.rs:50-71`, mas `execute_tool_call()` nunca chama `on_approval()`. Writes e commands executam sem gate, mesmo com `write_tool_policy: Ask`.
@@ -309,7 +310,7 @@
 | `list_files` includes directories (G10) | ✅ Done | 0004 |
 | Token usage & cost tracking per turn (G6) | ✅ Done | 0005 |
 | Windows cross-platform path resolution fixes | ✅ Done | 0005 |
-| Line-range surgical code editing (`edit_file`) (G1) | ✅ Done | 0006 |
+| Line-range surgical code editing (`edit_file`, `multi_edit_file`) (G1) | ✅ Done | 0006 |
 | GGUF safe parsing & bounds-checked dequantization | ✅ Done | 0007 |
 | Floating point safety & complete key masking | ✅ Done | 0008 |
 | Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
@@ -342,9 +343,8 @@
 | Sprint | Focus | Items | Timeline |
 |--------|-------|-------|----------|
 | **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
-| **2** | Edição | G1 (edit_file + multi_edit_file) | 3-5 dias |
-| **3** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **4** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+| **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
+| **3** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
 
 ### Test Coverage
 
