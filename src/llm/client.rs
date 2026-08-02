@@ -56,6 +56,13 @@ pub struct ToolCallResult {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
 /// A normalized chat completion. Tool calls are kept separate from assistant
 /// text so the agent never has to guess whether arbitrary content is JSON.
 #[derive(Clone, Debug)]
@@ -63,6 +70,7 @@ pub struct ChatCompletion {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -132,6 +140,10 @@ struct ChatResponse {
     message: ChatMessage,
     #[serde(default)]
     done_reason: Option<String>,
+    #[serde(default)]
+    prompt_eval_count: Option<usize>,
+    #[serde(default)]
+    eval_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +171,18 @@ struct CloudChatRequest {
 #[derive(Deserialize)]
 struct CloudChatResponse {
     choices: Vec<CloudChoice>,
+    #[serde(default)]
+    usage: Option<CloudUsage>,
+}
+
+#[derive(Deserialize)]
+struct CloudUsage {
+    #[serde(default)]
+    prompt_tokens: usize,
+    #[serde(default)]
+    completion_tokens: usize,
+    #[serde(default)]
+    total_tokens: usize,
 }
 
 #[derive(Deserialize)]
@@ -409,6 +433,7 @@ impl LlmClient {
                     content,
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    usage: None,
                 })
             }
         }
@@ -533,10 +558,23 @@ impl OllamaClient {
             Some("tool_calls".to_string())
         };
 
+        let prompt_tokens = data.prompt_eval_count.unwrap_or(0);
+        let completion_tokens = data.eval_count.unwrap_or(0);
+        let usage = if prompt_tokens > 0 || completion_tokens > 0 {
+            Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            })
+        } else {
+            None
+        };
+
         Ok(ChatCompletion {
             content: data.message.content.unwrap_or_default(),
             tool_calls,
             finish_reason,
+            usage,
         })
     }
 
@@ -796,10 +834,16 @@ impl CloudClient {
                     .next()
                     .context("cloud chat response contained no choices")?;
                 let tool_calls = choice.message.tool_calls.unwrap_or_default();
+                let usage = data.usage.map(|u| TokenUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                });
                 return Ok(ChatCompletion {
                     content: choice.message.content.unwrap_or_default(),
                     tool_calls,
                     finish_reason: choice.finish_reason,
+                    usage,
                 });
             }
 

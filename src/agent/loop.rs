@@ -326,6 +326,12 @@ async fn run_tool_use_iteration(
                 return Err(e);
             }
         };
+        if let Some(usage) = &completion.usage {
+            hooks.note(&format!(
+                "  [usage] {} prompt + {} completion = {} total tokens",
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+            ));
+        }
         let response = completion.content;
         let mut tool_calls = completion.tool_calls;
 
@@ -958,9 +964,10 @@ fn search_workspace_without_rg(root: &std::path::Path, pattern: &str) -> String 
             for (line_index, line) in content.lines().enumerate() {
                 if matcher.is_match(line) {
                     let relative = path.strip_prefix(root).unwrap_or(&path);
+                    let rel_str = relative.display().to_string().replace('\\', "/");
                     matches.push(format!(
                         "{}:{}:{}",
-                        relative.display(),
+                        rel_str,
                         line_index + 1,
                         line
                     ));

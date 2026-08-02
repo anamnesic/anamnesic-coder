@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use anyhow::{Context, Result};
@@ -44,7 +45,7 @@ impl ProviderStore {
         toml::from_str(&text).context("parsing providers.toml")
     }
 
-    /// Persist to disk with 0600 permissions (owner read/write only).
+    /// Persist to disk with 0600 permissions (owner read/write only on Unix).
     pub fn save(&self) -> Result<()> {
         let path = config_path()?;
         if let Some(parent) = path.parent() {
@@ -54,9 +55,11 @@ impl ProviderStore {
         let text = toml::to_string_pretty(self).context("serialising providers")?;
         std::fs::write(&path, &text)
             .with_context(|| format!("writing {}", path.display()))?;
-        // Restrict to owner-only
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 600 {}", path.display()))?;
+        }
         Ok(())
     }
 

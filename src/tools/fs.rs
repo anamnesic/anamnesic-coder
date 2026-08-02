@@ -135,9 +135,6 @@ impl FileTools {
 
     fn resolve(&self, path: &str) -> Option<PathBuf> {
         let raw = PathBuf::from(path);
-        if raw.components().any(|c| matches!(c, Component::Prefix(_))) {
-            return None;
-        }
         let joined = if raw.is_absolute() {
             raw
         } else {
@@ -173,7 +170,7 @@ impl FileTools {
 
     pub fn read_file(&self, path: &str) -> Option<String> {
         let p = self.resolve(path)?;
-        fs::read_to_string(&p).ok()
+        fs::read_to_string(p).ok()
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> anyhow::Result<()> {
@@ -205,12 +202,15 @@ impl FileTools {
         }) else {
             return entries_out;
         };
-        if let Ok(entries) = fs::read_dir(&p) {
+        let ws = self.workspace.canonicalize().unwrap_or_else(|_| self.workspace.clone());
+        let real_p = p.canonicalize().unwrap_or(p);
+        if let Ok(entries) = fs::read_dir(&real_p) {
             for entry in entries.flatten() {
-                if let Ok(rel) = entry.path().strip_prefix(&self.workspace) {
+                let entry_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
+                if let Ok(rel) = entry_path.strip_prefix(&ws) {
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let mut name = rel.to_string_lossy().to_string();
-                    if is_dir {
+                    let mut name = rel.to_string_lossy().replace('\\', "/");
+                    if is_dir && !name.ends_with('/') {
                         name.push('/');
                     }
                     entries_out.push(name);
@@ -289,7 +289,7 @@ impl FileTools {
                     .strip_prefix(&self.workspace)
                     .unwrap_or(&entry.path())
                     .to_string_lossy()
-                    .to_string();
+                    .replace('\\', "/");
                 if file_type.is_dir() {
                     output.push(format!("{relative}/"));
                     if depth < max_depth {
