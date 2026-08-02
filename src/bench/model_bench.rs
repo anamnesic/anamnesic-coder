@@ -172,7 +172,7 @@ pub fn save_ranking(results: &[BenchResult], path: &Path) -> Result<()> {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 impl BenchResult {
-    fn error(model: &str, msg: String) -> Self {
+    pub(crate) fn error(model: &str, msg: String) -> Self {
         println!("  [{model}] ERROR: {msg}");
         BenchResult {
             model: model.to_string(),
@@ -187,7 +187,7 @@ impl BenchResult {
 
 /// Fuzzy name match between catalog name (e.g. "llama3.2:3b") and local name (e.g. "llama3.2:3b").
 /// Also handles "mistral:7b" ↔ "mistral:latest".
-fn names_match(catalog: &str, local: &str) -> bool {
+pub(crate) fn names_match(catalog: &str, local: &str) -> bool {
     if catalog == local { return true; }
     // strip tags and compare families
     let cfam = catalog.split(':').next().unwrap_or(catalog);
@@ -199,7 +199,7 @@ fn names_match(catalog: &str, local: &str) -> bool {
     ctag == ltag || ltag == "latest" || ctag == "latest"
 }
 
-fn estimate_tps_from_catalog(
+pub(crate) fn estimate_tps_from_catalog(
     hw: &detector::HardwareInfo,
     model: &catalog::ModelEntry,
     category: &str,

@@ -30,4 +30,5 @@ Each index.md file contains a list of files in that directory with brief descrip
 - [`docs/adr/0007-gguf-safety-and-bounds-checking.md`](docs/adr/0007-gguf-safety-and-bounds-checking.md) — GGUF & Dequantization Memory Safety
 - [`docs/adr/0008-robustness-and-floating-point-safety.md`](docs/adr/0008-robustness-and-floating-point-safety.md) — Robustness, Floating Point Safety & Store Key Masking
 - [`docs/adr/0009-context-intelligence-and-repo-map.md`](docs/adr/0009-context-intelligence-and-repo-map.md) — Context Intelligence, Calibrated Token Estimation & Repo Map
+- [`docs/adr/0010-benchmark-module-refactoring.md`](docs/adr/0010-benchmark-module-refactoring.md) — Benchmark Module Refactoring (Local / Cloud Split)
 - [`docs/gap-analysis-2026-08.md`](docs/gap-analysis-2026-08.md) — 2026 Competitor Gap Analysis Report

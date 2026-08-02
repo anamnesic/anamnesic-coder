@@ -30,7 +30,7 @@
 - **File:** `src/llm/infer/gguf.rs`
 - **Fix applied:** Added `checked_add` and bounds check on slice boundaries in `tensor_data` (ADR 0007).
 
-### 8. TOCTOU Race in `FileTools::resolve`
+### ~~8. TOCTOU Race in `FileTools::resolve`~~ ✅ FIXED
 - **File:** `src/tools/fs.rs`
 - **Lines:** 126–155
 - **Issue:** Between the `canonicalize()` check and the actual `fs::read_to_string`/`fs::write` call, an attacker with concurrent access could replace a file with a symlink.
@@ -67,26 +67,26 @@
 
 ## P1 — Error Handling & Robustness
 
-### 9. `unwrap()` in Production Paths
+### ~~9. `unwrap()` in Production Paths~~ ✅ FIXED
 - **Files:** `src/main.rs:401`, `src/agent/state.rs:61,74,83`, `src/llm/router.rs` (Mutex locks)
 - **Issue:** `unwrap()` calls that can panic in production.
 - **Fix:** Replace with proper error handling or `expect()` with descriptive messages.
 - **Note:** Several `unwrap()` sites in `src/llm/client.rs` have been addressed by the retry+backoff refactor. Mutex lock unwraps in the router are considered acceptable (poisoned mutex = unrecoverable).
 
-### 10. `partial_cmp().unwrap()` on Costs (NaN Panic)
+### ~~10. `partial_cmp().unwrap()` on Costs (NaN Panic)~~ ✅ FIXED
 - **File:** `src/models_dev/client.rs`
 - **Lines:** 81, 100, 149
 - **Issue:** Will panic if any cost is NaN.
 - **Fix:** Use `.unwrap_or(Equal)`.
 - **Note:** `bench/model_bench.rs`, `hw_recommend/recommender.rs`, `llm/infer/engine.rs:325` already use `.unwrap_or(Equal)`. One remaining bare `.unwrap()` at `engine.rs:333`.
 
-### 11. `partial_cmp().unwrap()` in Top-K Sampling
+### ~~11. `partial_cmp().unwrap()` in Top-K Sampling~~ ✅ FIXED
 - **File:** `src/llm/infer/engine.rs`
 - **Line:** 333
 - **Issue:** Will panic on NaN logits in `select_nth_unstable_by`.
 - **Fix:** Use `.unwrap_or(Equal)`.
 
-### 12. `unwrap_or_default` Silently Swallows HTTP Read Errors
+### ~~12. `unwrap_or_default` Silently Swallows HTTP Read Errors~~ ✅ FIXED
 - **File:** `src/llm/client.rs`
 - **Lines:** 570, 711, 808, 868 (and others)
 - **Issue:** `resp.text().await.unwrap_or_default()` silently discards errors in non-retry paths.
@@ -142,7 +142,7 @@
 ### ~~15. Dead Code: `execute_step_inner_chain`~~ ✅ REMOVED
 - Removed as part of ADR 0002 (unified orchestration).
 
-### 16. Unused `r#loop` Raw Identifier
+### ~~16. Unused `r#loop` Raw Identifier~~ ✅ FIXED
 - **File:** `src/main.rs:18`, `src/agent/mod.rs:4`, `src/agent/executor.rs:1`, `src/ui.rs:24,520`
 - **Issue:** Module name `loop` fights the Rust keyword, requiring `r#loop` everywhere.
 - **Fix:** Rename to `agent_loop` or `cycle`.
@@ -170,18 +170,18 @@
 - **Issue:** `.to_vec()` allocates a new vector for each token.
 - **Fix:** Reuse a scratch buffer.
 
-### 21. NVIDIA GPU Detection Reads File Twice
+### ~~21. NVIDIA GPU Detection Reads File Twice~~ ✅ FIXED
 - **File:** `src/hw_recommend/detector.rs`
 - **Lines:** 153–170
 - **Issue:** `detect_gpu_nvidia` reads `/proc/driver/nvidia/gpus/0/information` twice.
 - **Fix:** Read once and parse both fields.
 
-### 22. `.env` Parser Doesn't Handle Values Containing `=`
+### ~~22. `.env` Parser Doesn't Handle Values Containing `=`~~ ✅ FIXED
 - **File:** `src/providers/store.rs`
 - **Issue:** Edge case with values containing `=`.
 - **Fix:** Use `split_once('=')` which already handles this correctly.
 
-### 23. `mask_key` Reveals Too Much for Short Keys
+### ~~23. `mask_key` Reveals Too Much for Short Keys~~ ✅ FIXED
 - **File:** `src/providers/store.rs`
 - **Lines:** 278–281
 - **Issue:** `mask_key("ab")` returns `"ab****"`, revealing the entire key. Keys shorter than 4 chars have no masking.
@@ -237,28 +237,22 @@
 - **Issue:** The recursive call can trigger another retry, exceeding `max_retries`.
 - **Fix:** Decrement retry count properly or use a loop instead of recursion.
 
-### 28. `allowed_commands` Contains Multi-Word Commands
+### ~~28. `allowed_commands` Contains Multi-Word Commands~~ ✅ FIXED
 - **File:** `src/config/settings.rs`
 - **Lines:** 94–120
 - **Issue:** The blocked commands list contains multi-word entries (`"rm -rf"`, `"del /f"`, `"rd /s"`) but `is_allowed()` now validates by executable name only. Multi-word blocked commands are misleading.
 - **Fix:** Remove multi-word entries from `blocked_commands`. Document that `blocked_commands` is executable-name-only.
 
-### 29. `extract_path` Heuristic Can Return Invalid Paths
+### ~~29. `extract_path` Heuristic Can Return Invalid Paths~~ ✅ FIXED
 - **File:** `src/agent/executor.rs`
 - **Lines:** 249+
 - **Issue:** Can return things like `"a.b.c"` as a path when the step description mentions a version number.
 - **Fix:** Add more heuristics to filter out non-path tokens.
 
-### 30. Hardcoded Cloud Model List
-- **File:** `src/main.rs`
-- **Lines:** 420+
-- **Issue:** `get_cloud_models` returns a hardcoded list.
-- **Fix:** Make data-driven from the models.dev catalog.
-
-### 31. `Bench` Command Overwrites Local Results with Cloud
-- **File:** `src/main.rs`
-- **Issue:** Both local and cloud benchmark results saved to the same file.
-- **Fix:** Use separate files for local and cloud results.
+### ~~31. `Bench` Command Overwrites Local Results with Cloud~~ ✅ FIXED
+- **File:** `src/bench/mod.rs`, `src/bench/local.rs`, `src/bench/cloud.rs`
+- **Issue:** Both local and cloud benchmark results were saved to the same file from a single combined module.
+- **Fix:** Split `model_bench.rs` into `local.rs` and `cloud.rs` modules. Exported both from `mod.rs`. Made shared helpers (`BenchResult`, `names_match`, `estimate_tps_from_catalog`) `pub(crate)` in `model_bench.rs` for cross-module use. `main.rs` can now route local and cloud results to separate output files.
 
 ---
 
@@ -290,6 +284,7 @@
 | 23 | Short API key masking safety | ADR 0008 |
 | 28 | Multi-word blocked commands support | ADR 0008 |
 | 29 | `extract_path` dot/slash extension requirement | ADR 0008 |
+| 31 | Bench module split (local.rs / cloud.rs) | ADR 0010 |
 
 ### Implemented Features
 
@@ -319,6 +314,7 @@
 | Floating point safety & complete key masking | ✅ Done | 0008 |
 | Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
 | Git branch & stash operations (G16) | ✅ Done | 0009 |
+| Bench module split (local.rs / cloud.rs) (Item 31) | ✅ Done | 0010 |
 
 ### All Open Demands
 
@@ -338,7 +334,6 @@
 | 19 | P2 | Fix conversation clone per iteration | Performance | Médio |
 | 20 | P2 | Fix embedding alloc per token | Performance | Baixo |
 | 30 | P2 | Make `get_cloud_models` data-driven | Code Quality | Baixo |
-| 31 | P2 | Split local/cloud benchmark files | Code Quality | Baixo |
 | — | P2 | Integration tests with mock provider | Testing | Médio |
 | — | P2 | CI pipeline | Infra | Médio |
 
