@@ -16,6 +16,48 @@ pub enum GgmlType {
     TQ1_0 = 31, TQ2_0 = 32, NVFP4 = 33,
 }
 
+impl TryFrom<i32> for GgmlType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(GgmlType::F32),
+            1 => Ok(GgmlType::F16),
+            2 => Ok(GgmlType::Q4_0),
+            3 => Ok(GgmlType::Q4_1),
+            6 => Ok(GgmlType::Q5_0),
+            7 => Ok(GgmlType::Q5_1),
+            8 => Ok(GgmlType::Q8_0),
+            9 => Ok(GgmlType::Q8_1),
+            10 => Ok(GgmlType::Q2_K),
+            11 => Ok(GgmlType::Q3_K),
+            12 => Ok(GgmlType::Q4_K),
+            13 => Ok(GgmlType::Q5_K),
+            14 => Ok(GgmlType::Q6_K),
+            15 => Ok(GgmlType::Q8_K),
+            16 => Ok(GgmlType::IQ2_XXS),
+            17 => Ok(GgmlType::IQ2_XS),
+            18 => Ok(GgmlType::IQ3_XXS),
+            19 => Ok(GgmlType::IQ1_S),
+            20 => Ok(GgmlType::IQ4_NL),
+            21 => Ok(GgmlType::IQ3_S),
+            22 => Ok(GgmlType::IQ2_S),
+            23 => Ok(GgmlType::IQ4_XS),
+            24 => Ok(GgmlType::I8),
+            25 => Ok(GgmlType::I16),
+            26 => Ok(GgmlType::I32),
+            27 => Ok(GgmlType::I64),
+            28 => Ok(GgmlType::F64),
+            29 => Ok(GgmlType::IQ1_M),
+            30 => Ok(GgmlType::BF16),
+            31 => Ok(GgmlType::TQ1_0),
+            32 => Ok(GgmlType::TQ2_0),
+            33 => Ok(GgmlType::NVFP4),
+            other => anyhow::bail!("Unsupported or invalid GgmlType tag: {other}"),
+        }
+    }
+}
+
 pub fn ggml_blck_size(t: GgmlType) -> usize {
     match t {
         GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I8
@@ -75,45 +117,45 @@ impl GgufReader {
         let mut pos = 0usize;
         let mut rdr = GgufReader { data, alignment: 32, tensors: HashMap::new(), metadata_str: HashMap::new(), metadata_int: HashMap::new(), metadata_float: HashMap::new(), tensor_data_offset: 0 };
 
-        let magic = rdr.read_u32(&mut pos);
+        let magic = rdr.read_u32(&mut pos)?;
         anyhow::ensure!(magic == GGUF_MAGIC, "Not a valid GGUF file");
-        let _version = rdr.read_u32(&mut pos);
+        let _version = rdr.read_u32(&mut pos)?;
 
-        let tensor_count = rdr.read_u64(&mut pos) as usize;
-        let kv_count = rdr.read_u64(&mut pos) as usize;
+        let tensor_count = rdr.read_u64(&mut pos)? as usize;
+        let kv_count = rdr.read_u64(&mut pos)? as usize;
 
         for _ in 0..kv_count {
-            let key = rdr.read_string(&mut pos);
-            let val_type_i = rdr.read_i32(&mut pos);
+            let key = rdr.read_string(&mut pos)?;
+            let val_type_i = rdr.read_i32(&mut pos)?;
             match val_type_i {
-                0 => { rdr.metadata_uint32_insert(&key, rdr.read_u8(&mut pos) as u32); },
-                1 => { rdr.metadata_int.insert(key.clone(), rdr.read_i8(&mut pos) as i64); },
-                2 => { rdr.metadata_uint32_insert(&key, rdr.read_u16(&mut pos) as u32); },
-                3 => { rdr.metadata_int.insert(key.clone(), rdr.read_i16(&mut pos) as i64); },
-                4 => { rdr.metadata_uint32_insert(&key, rdr.read_u32(&mut pos)); },
-                5 => { rdr.metadata_int.insert(key.clone(), rdr.read_i32(&mut pos) as i64); },
-                6 => { rdr.metadata_float.insert(key.clone(), rdr.read_f32(&mut pos) as f64); },
-                7 => { rdr.metadata_int.insert(key.clone(), rdr.read_u8(&mut pos) as i64); },
-                8 => { rdr.metadata_str.insert(key.clone(), rdr.read_string(&mut pos)); },
-                10 | 11 => { rdr.metadata_int.insert(key.clone(), rdr.read_i64(&mut pos)); },
-                12 => { rdr.metadata_float.insert(key.clone(), rdr.read_f64(&mut pos)); },
+                0 => { let v = rdr.read_u8(&mut pos)?; rdr.metadata_uint32_insert(&key, v as u32); },
+                1 => { let v = rdr.read_i8(&mut pos)?; rdr.metadata_int.insert(key.clone(), v as i64); },
+                2 => { let v = rdr.read_u16(&mut pos)?; rdr.metadata_uint32_insert(&key, v as u32); },
+                3 => { let v = rdr.read_i16(&mut pos)?; rdr.metadata_int.insert(key.clone(), v as i64); },
+                4 => { let v = rdr.read_u32(&mut pos)?; rdr.metadata_uint32_insert(&key, v); },
+                5 => { let v = rdr.read_i32(&mut pos)?; rdr.metadata_int.insert(key.clone(), v as i64); },
+                6 => { let v = rdr.read_f32(&mut pos)?; rdr.metadata_float.insert(key.clone(), v as f64); },
+                7 => { let v = rdr.read_u8(&mut pos)?; rdr.metadata_int.insert(key.clone(), v as i64); },
+                8 => { let v = rdr.read_string(&mut pos)?; rdr.metadata_str.insert(key.clone(), v); },
+                10 | 11 => { let v = rdr.read_i64(&mut pos)?; rdr.metadata_int.insert(key.clone(), v); },
+                12 => { let v = rdr.read_f64(&mut pos)?; rdr.metadata_float.insert(key.clone(), v); },
                 9 => {
-                    let arr_type = rdr.read_i32(&mut pos);
-                    let arr_n = rdr.read_u64(&mut pos) as usize;
+                    let arr_type = rdr.read_i32(&mut pos)?;
+                    let arr_n = rdr.read_u64(&mut pos)? as usize;
                     for i in 0..arr_n {
                         match arr_type {
-                            0 | 1 | 7 => { rdr.read_u8(&mut pos); },
-                            2 | 3     => { rdr.read_u16(&mut pos); },
+                            0 | 1 | 7 => { rdr.read_u8(&mut pos)?; },
+                            2 | 3     => { rdr.read_u16(&mut pos)?; },
                             4 | 5 | 6 => {
-                                let v = rdr.read_u32(&mut pos);
+                                let v = rdr.read_u32(&mut pos)?;
                                 rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
                             },
                             8 => {
-                                let s = rdr.read_string(&mut pos);
+                                let s = rdr.read_string(&mut pos)?;
                                 rdr.metadata_str.insert(format!("{}_{}", key, i), s);
                             },
                             10 | 11 | 12 => {
-                                let v = rdr.read_u64(&mut pos);
+                                let v = rdr.read_u64(&mut pos)?;
                                 rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
                             },
                             _ => {},
@@ -128,15 +170,15 @@ impl GgufReader {
         }
 
         for _ in 0..tensor_count {
-            let name = rdr.read_string(&mut pos);
-            let n_dims = rdr.read_u32(&mut pos) as usize;
+            let name = rdr.read_string(&mut pos)?;
+            let n_dims = rdr.read_u32(&mut pos)? as usize;
             let mut dims = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                dims.push(rdr.read_i64(&mut pos));
+                dims.push(rdr.read_i64(&mut pos)?);
             }
-            let ty_i = rdr.read_i32(&mut pos);
-            let ty = unsafe { std::mem::transmute::<i32, GgmlType>(ty_i) };
-            let offset = rdr.read_u64(&mut pos);
+            let ty_i = rdr.read_i32(&mut pos)?;
+            let ty = GgmlType::try_from(ty_i)?;
+            let offset = rdr.read_u64(&mut pos)?;
             rdr.tensors.insert(name.clone(), GgufTensorInfo { name, dims, ty, offset });
         }
 
@@ -148,30 +190,46 @@ impl GgufReader {
 
     pub fn tensor_data(&self, name: &str) -> Option<&[u8]> {
         let info = self.tensors.get(name)?;
-        let start = self.tensor_data_offset + info.offset as usize;
+        let start = self.tensor_data_offset.checked_add(info.offset as usize)?;
         let blck = ggml_blck_size(info.ty);
+        if blck == 0 {
+            return None;
+        }
         let ts = ggml_type_size(info.ty);
         let n_blocks = (info.nelements() + blck as i64 - 1) / blck as i64;
-        let nbytes = n_blocks as usize * ts;
-        Some(&self.data[start..start + nbytes])
+        let nbytes = (n_blocks as usize).checked_mul(ts)?;
+        let end = start.checked_add(nbytes)?;
+        if end > self.data.len() {
+            return None;
+        }
+        Some(&self.data[start..end])
     }
 
-    fn read_u8(&self, pos: &mut usize) -> u8 { let v = self.data[*pos]; *pos += 1; v }
-    fn read_i8(&self, pos: &mut usize) -> i8 { let v = self.data[*pos] as i8; *pos += 1; v }
-    fn read_u16(&self, pos: &mut usize) -> u16 { let v = u16::from_le_bytes(self.data[*pos..*pos+2].try_into().unwrap()); *pos += 2; v }
-    fn read_i16(&self, pos: &mut usize) -> i16 { let v = i16::from_le_bytes(self.data[*pos..*pos+2].try_into().unwrap()); *pos += 2; v }
-    fn read_u32(&self, pos: &mut usize) -> u32 { let v = u32::from_le_bytes(self.data[*pos..*pos+4].try_into().unwrap()); *pos += 4; v }
-    fn read_i32(&self, pos: &mut usize) -> i32 { let v = i32::from_le_bytes(self.data[*pos..*pos+4].try_into().unwrap()); *pos += 4; v }
-    fn read_u64(&self, pos: &mut usize) -> u64 { let v = u64::from_le_bytes(self.data[*pos..*pos+8].try_into().unwrap()); *pos += 8; v }
-    fn read_i64(&self, pos: &mut usize) -> i64 { let v = i64::from_le_bytes(self.data[*pos..*pos+8].try_into().unwrap()); *pos += 8; v }
-    fn read_f32(&self, pos: &mut usize) -> f32 { let v = f32::from_le_bytes(self.data[*pos..*pos+4].try_into().unwrap()); *pos += 4; v }
-    fn read_f64(&self, pos: &mut usize) -> f64 { let v = f64::from_le_bytes(self.data[*pos..*pos+8].try_into().unwrap()); *pos += 8; v }
+    fn read_bytes<'a>(&'a self, pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+        let end = pos.checked_add(len).context("GGUF offset overflow")?;
+        if end > self.data.len() {
+            anyhow::bail!("unexpected EOF parsing GGUF at pos {pos} (requested {len} bytes, data len {})", self.data.len());
+        }
+        let slice = &self.data[*pos..end];
+        *pos = end;
+        Ok(slice)
+    }
 
-    fn read_string(&self, pos: &mut usize) -> String {
-        let len = self.read_u64(pos) as usize;
-        let s = String::from_utf8_lossy(&self.data[*pos..*pos+len]).to_string();
-        *pos += len;
-        s
+    fn read_u8(&self, pos: &mut usize) -> Result<u8> { Ok(self.read_bytes(pos, 1)?[0]) }
+    fn read_i8(&self, pos: &mut usize) -> Result<i8> { Ok(self.read_bytes(pos, 1)?[0] as i8) }
+    fn read_u16(&self, pos: &mut usize) -> Result<u16> { Ok(u16::from_le_bytes(self.read_bytes(pos, 2)?.try_into().unwrap())) }
+    fn read_i16(&self, pos: &mut usize) -> Result<i16> { Ok(i16::from_le_bytes(self.read_bytes(pos, 2)?.try_into().unwrap())) }
+    fn read_u32(&self, pos: &mut usize) -> Result<u32> { Ok(u32::from_le_bytes(self.read_bytes(pos, 4)?.try_into().unwrap())) }
+    fn read_i32(&self, pos: &mut usize) -> Result<i32> { Ok(i32::from_le_bytes(self.read_bytes(pos, 4)?.try_into().unwrap())) }
+    fn read_u64(&self, pos: &mut usize) -> Result<u64> { Ok(u64::from_le_bytes(self.read_bytes(pos, 8)?.try_into().unwrap())) }
+    fn read_i64(&self, pos: &mut usize) -> Result<i64> { Ok(i64::from_le_bytes(self.read_bytes(pos, 8)?.try_into().unwrap())) }
+    fn read_f32(&self, pos: &mut usize) -> Result<f32> { Ok(f32::from_le_bytes(self.read_bytes(pos, 4)?.try_into().unwrap())) }
+    fn read_f64(&self, pos: &mut usize) -> Result<f64> { Ok(f64::from_le_bytes(self.read_bytes(pos, 8)?.try_into().unwrap())) }
+
+    fn read_string(&self, pos: &mut usize) -> Result<String> {
+        let len = self.read_u64(pos)? as usize;
+        let bytes = self.read_bytes(pos, len)?;
+        Ok(String::from_utf8_lossy(bytes).to_string())
     }
 
     fn metadata_uint32_insert(&mut self, key: &str, val: u32) {
@@ -196,5 +254,34 @@ impl GgufTensorInfo {
         let mut n = 1i64;
         for &d in &self.dims { n *= d; }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_ggml_type_returns_error() {
+        assert!(GgmlType::try_from(999).is_err());
+        assert_eq!(GgmlType::try_from(0).unwrap(), GgmlType::F32);
+        assert_eq!(GgmlType::try_from(2).unwrap(), GgmlType::Q4_0);
+    }
+
+    #[test]
+    fn truncated_gguf_returns_error_without_panic() {
+        let truncated_data = vec![0x47, 0x55, 0x47, 0x46, 0x01]; // magic + 1 byte
+        let mut pos = 0usize;
+        let rdr = GgufReader {
+            data: truncated_data,
+            alignment: 32,
+            tensors: HashMap::new(),
+            metadata_str: HashMap::new(),
+            metadata_int: HashMap::new(),
+            metadata_float: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        assert!(rdr.read_u32(&mut pos).is_ok());
+        assert!(rdr.read_u32(&mut pos).is_err()); // should safely fail on truncated bytes
     }
 }

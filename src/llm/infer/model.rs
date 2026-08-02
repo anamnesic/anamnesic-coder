@@ -21,15 +21,23 @@ fn half_to_f32(h: u16) -> f32 {
 fn dequantize_q4_0_row(block: &[u8], out: &mut [f32], n: i64) {
     let num_blocks = (n + 31) / 32;
     for b in 0..num_blocks {
-        let d_bits = u16::from_le_bytes(block[b as usize * 18..b as usize * 18 + 2].try_into().unwrap());
+        let b_offset = b as usize * 18;
+        if b_offset + 18 > block.len() {
+            break;
+        }
+        let d_bits = u16::from_le_bytes(block[b_offset..b_offset + 2].try_into().unwrap_or_default());
         let d = half_to_f32(d_bits);
         for i in 0..16 {
-            let q = block[b as usize * 18 + 2 + i as usize];
-            let idx_base = b * 32 + i * 2;
+            let q = block[b_offset + 2 + i];
+            let idx_base = b * 32 + i as i64 * 2;
             let q0 = (((q & 0x0F) as i8) << 4) as f32 * 0.0625f32;
             let q1 = (((q & 0xF0) as i8)) as f32 * 0.0625f32;
-            if idx_base < n { out[idx_base as usize] = q0 * d; }
-            if idx_base + 1 < n { out[(idx_base + 1) as usize] = q1 * d; }
+            if idx_base < n && (idx_base as usize) < out.len() {
+                out[idx_base as usize] = q0 * d;
+            }
+            if idx_base + 1 < n && ((idx_base + 1) as usize) < out.len() {
+                out[(idx_base + 1) as usize] = q1 * d;
+            }
         }
     }
 }
@@ -37,20 +45,30 @@ fn dequantize_q4_0_row(block: &[u8], out: &mut [f32], n: i64) {
 fn dequantize_q8_0_row(block: &[u8], out: &mut [f32], n: i64) {
     let num_blocks = (n + 31) / 32;
     for b in 0..num_blocks {
-        let d_bits = u16::from_le_bytes(block[b as usize * 34..b as usize * 34 + 2].try_into().unwrap());
+        let b_offset = b as usize * 34;
+        if b_offset + 34 > block.len() {
+            break;
+        }
+        let d_bits = u16::from_le_bytes(block[b_offset..b_offset + 2].try_into().unwrap_or_default());
         let d = half_to_f32(d_bits);
         for i in 0..32 {
-            let q = block[b as usize * 34 + 2 + i as usize] as i8;
-            if b * 32 + (i as i64) < n {
-                out[(b * 32 + i as i64) as usize] = (q as f32) * d;
+            let q = block[b_offset + 2 + i] as i8;
+            let idx = (b * 32 + i as i64) as usize;
+            if (b * 32 + i as i64) < n && idx < out.len() {
+                out[idx] = (q as f32) * d;
             }
         }
     }
 }
 
 fn dequantize_f16_row(block: &[u8], out: &mut [f32], n: i64) {
-    for i in 0..n as usize {
-        let h = u16::from_le_bytes(block[i * 2..i * 2 + 2].try_into().unwrap());
+    let count = (n as usize).min(out.len());
+    for i in 0..count {
+        let offset = i * 2;
+        if offset + 2 > block.len() {
+            break;
+        }
+        let h = u16::from_le_bytes(block[offset..offset + 2].try_into().unwrap_or_default());
         out[i] = half_to_f32(h);
     }
 }

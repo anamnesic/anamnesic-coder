@@ -14,29 +14,21 @@
 - **File:** `src/tools/shell.rs`
 - **Fix applied:** `run_command_raw` now validates through `is_allowed()` first and returns an error `CommandOutput` if rejected.
 
-### 4. `unsafe` `transmute` on Untrusted GGUF Data
+### ~~4. `unsafe` `transmute` on Untrusted GGUF Data~~ ✅ FIXED
 - **File:** `src/llm/infer/gguf.rs`
-- **Line:** 138
-- **Issue:** `std::mem::transmute::<i32, GgmlType>(ty_i)` converts a raw integer from a GGUF file into an enum. If the file is crafted or corrupted with an out-of-range integer, this is **undefined behavior**.
-- **Fix:** Use `TryFrom<i32>` with explicit validation and return an error for invalid values.
+- **Fix applied:** Replaced `unsafe transmute` with `TryFrom<i32>` for `GgmlType` (ADR 0007).
 
-### 5. GGUF Parsing Panics on Truncated/Corrupt Files
+### ~~5. GGUF Parsing Panics on Truncated/Corrupt Files~~ ✅ FIXED
 - **File:** `src/llm/infer/gguf.rs`
-- **Lines:** 161–168
-- **Issue:** All `read_u8`, `read_u16`, `read_u32`, `read_u64`, `read_f32`, `read_f64` methods use `try_into().unwrap()` and slice indexing without bounds checks. A truncated GGUF will panic rather than return an error.
-- **Fix:** Replace `unwrap()` with proper error propagation. Add bounds checks before slicing.
+- **Fix applied:** All binary read methods use bounds-checked `read_bytes` with explicit EOF error propagation (ADR 0007).
 
-### 6. Q4_0/Q8_0 Dequantization Panics on Corrupt Data
+### ~~6. Q4_0/Q8_0 Dequantization Panics on Corrupt Data~~ ✅ FIXED
 - **File:** `src/llm/infer/model.rs`
-- **Lines:** 24, 40, 53
-- **Issue:** `u16::from_le_bytes(block[...].try_into().unwrap())` will panic if the tensor data is shorter than expected (corrupt GGUF).
-- **Fix:** Replace `unwrap()` with proper error handling and bounds checking.
+- **Fix applied:** Added bounds checks to `dequantize_q4_0_row`, `dequantize_q8_0_row`, and `dequantize_f16_row` (ADR 0007).
 
-### 7. `tensor_data` Can Read Beyond Buffer
+### ~~7. `tensor_data` Can Read Beyond Buffer~~ ✅ FIXED
 - **File:** `src/llm/infer/gguf.rs`
-- **Lines:** 149–157
-- **Issue:** `&self.data[start..start + nbytes]` does not check that `start + nbytes <= self.data.len()`. A malformed GGUF with a bogus offset or size will panic.
-- **Fix:** Add bounds check before slicing, return error if out of bounds.
+- **Fix applied:** Added `checked_add` and bounds check on slice boundaries in `tensor_data` (ADR 0007).
 
 ### 8. TOCTOU Race in `FileTools::resolve`
 - **File:** `src/tools/fs.rs`
@@ -283,6 +275,10 @@
 | 14 | Dead code: `run_agent_loop_with_fallback` | ADR 0002 |
 | 15 | Dead code: `execute_step_inner_chain` | ADR 0002 |
 | 24 | `needs_fix` false-positive logic | ADR 0002 |
+| 4 | `unsafe transmute` on untrusted GGUF data | ADR 0007 |
+| 5 | GGUF parsing panics on truncated files | ADR 0007 |
+| 6 | Q4_0/Q8_0 dequantization bounds checks | ADR 0007 |
+| 7 | `tensor_data` out-of-bounds check | ADR 0007 |
 
 ### Implemented Features
 
@@ -308,6 +304,7 @@
 | Token usage & cost tracking per turn (G6) | ✅ Done | 0005 |
 | Windows cross-platform path resolution fixes | ✅ Done | 0005 |
 | Line-range surgical code editing (`edit_file`) (G1) | ✅ Done | 0006 |
+| GGUF safe parsing & bounds-checked dequantization | ✅ Done | 0007 |
 
 ### All Open Demands
 
@@ -316,10 +313,6 @@
 | G2 | **P0** | Wire approval broker to tool dispatch | Harness/Safety | Baixo |
 | G3 | **P0** | Context compaction / conversation summarization | Harness | Alto |
 | G4 | **P0** | Token counting | Harness | Médio |
-| 4 | P0 | Fix `unsafe transmute` on GGUF data | Safety | Baixo |
-| 5 | P0 | Bounds-check GGUF parsing (panics) | Safety | Médio |
-| 6 | P0 | Bounds-check dequantization (Q4_0/Q8_0) | Safety | Baixo |
-| 7 | P0 | Bounds-check `tensor_data` slice | Safety | Baixo |
 | 8 | P0 | TOCTOU race in `FileTools::resolve` | Safety | Médio |
 | — | P0 | Tests for path traversal, symlink escape, injection | Safety | Médio |
 | G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
