@@ -279,10 +279,14 @@
 | 5 | GGUF parsing panics on truncated files | ADR 0007 |
 | 6 | Q4_0/Q8_0 dequantization bounds checks | ADR 0007 |
 | 7 | `tensor_data` out-of-bounds check | ADR 0007 |
+| 8 | Path traversal, symlink escape & injection safety | ADR 0008 |
+| 9 | Replaced unwrap calls with pattern matching in production | ADR 0008 |
 | 10 | `partial_cmp().unwrap()` NaN panic safety | ADR 0008 |
 | 11 | Top-K sampling NaN comparison safety | ADR 0008 |
 | 21 | GPU info single file-read refactor | ADR 0008 |
+| 22 | `.env` value parser with quotes & inline comments | ADR 0008 |
 | 23 | Short API key masking safety | ADR 0008 |
+| 28 | Multi-word blocked commands support | ADR 0008 |
 
 ### Implemented Features
 

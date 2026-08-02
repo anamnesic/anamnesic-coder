@@ -91,8 +91,10 @@ fn remove_progress_bars(input: &str) -> String {
             if trimmed.starts_with("   Compiling") || trimmed.starts_with("    Checking") {
                 return false;
             }
-            if trimmed.len() > 2 && spinner_chars.contains(&trimmed.chars().next().unwrap()) {
-                return false;
+            if let Some(ch) = trimmed.chars().next() {
+                if spinner_chars.contains(&ch) {
+                    return false;
+                }
             }
             true
         })

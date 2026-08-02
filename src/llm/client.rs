@@ -704,31 +704,33 @@ impl CloudClient {
             "tools": tools.unwrap_or(&vec![]),
         });
         if let Some(rf) = response_format {
-            match rf {
-                ResponseFormat::JsonObject => {
-                    body.as_object_mut().unwrap().insert(
-                        "response_format".into(),
-                        serde_json::json!({"type": "json_object"}),
-                    );
+            if let Some(obj) = body.as_object_mut() {
+                match rf {
+                    ResponseFormat::JsonObject => {
+                        obj.insert(
+                            "response_format".into(),
+                            serde_json::json!({"type": "json_object"}),
+                        );
+                    }
+                    ResponseFormat::JsonSchema {
+                        name,
+                        schema,
+                        strict,
+                    } => {
+                        obj.insert(
+                            "response_format".into(),
+                            serde_json::json!({
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": name,
+                                    "schema": schema,
+                                    "strict": strict,
+                                }
+                            }),
+                        );
+                    }
+                    ResponseFormat::Text => {}
                 }
-                ResponseFormat::JsonSchema {
-                    name,
-                    schema,
-                    strict,
-                } => {
-                    body.as_object_mut().unwrap().insert(
-                        "response_format".into(),
-                        serde_json::json!({
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": name,
-                                "schema": schema,
-                                "strict": strict,
-                            }
-                        }),
-                    );
-                }
-                ResponseFormat::Text => {}
             }
         }
 

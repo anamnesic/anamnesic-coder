@@ -87,6 +87,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_deep_path_traversal_and_injection_strings() {
+        let tools = FileTools::new(temp_workspace());
+        assert!(tools.read_file("../../../../../../../../etc/passwd").is_none());
+        assert!(tools.write_file("foo/../../../../outside.txt", "data").is_err());
+        assert!(tools.read_file("foo; rm -rf /").is_none());
+    }
+
+    #[test]
     fn write_then_read_roundtrip() {
         let tools = FileTools::new(temp_workspace());
         tools.write_file("src/main.rs", "fn main() {}\n").unwrap();
