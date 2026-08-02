@@ -310,6 +310,7 @@
 | Line-range surgical code editing (`edit_file`) (G1) | ✅ Done | 0006 |
 | GGUF safe parsing & bounds-checked dequantization | ✅ Done | 0007 |
 | Floating point safety & complete key masking | ✅ Done | 0008 |
+| Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
 
 ### All Open Demands
 

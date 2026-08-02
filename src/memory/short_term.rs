@@ -8,11 +8,41 @@ pub struct ShortTermMemory {
     max_messages: usize,
 }
 
-/// Rough token estimate — code-heavy text is denser than plain prose.
+/// Calibrated BPE token estimator for code, prose, and JSON structures.
 pub fn estimate_tokens(text: &str) -> usize {
-    let chars = text.chars().count();
-    let non_ascii = text.chars().filter(|c| !c.is_ascii()).count();
-    chars / 3 + non_ascii
+    if text.is_empty() {
+        return 0;
+    }
+    let mut tokens = 0usize;
+    let mut current_word_len = 0usize;
+
+    for c in text.chars() {
+        if c.is_ascii_whitespace() {
+            if current_word_len > 0 {
+                tokens += (current_word_len + 3) / 4;
+                current_word_len = 0;
+            }
+            tokens += 1;
+        } else if c.is_ascii_punctuation() {
+            if current_word_len > 0 {
+                tokens += (current_word_len + 3) / 4;
+                current_word_len = 0;
+            }
+            tokens += 1;
+        } else if !c.is_ascii() {
+            if current_word_len > 0 {
+                tokens += (current_word_len + 3) / 4;
+                current_word_len = 0;
+            }
+            tokens += 2;
+        } else {
+            current_word_len += 1;
+        }
+    }
+    if current_word_len > 0 {
+        tokens += (current_word_len + 3) / 4;
+    }
+    tokens.max(1)
 }
 
 impl ShortTermMemory {

@@ -66,6 +66,10 @@ impl CoderPrompt {
                 }
             }
         }
+        let map = crate::repo::RepoMapGenerator::generate_map(workspace, 2000);
+        if !map.is_empty() && map != "No symbols found in workspace." {
+            loaded.push(map);
+        }
         loaded.join("\n\n")
     }
 

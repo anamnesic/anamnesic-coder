@@ -11,6 +11,7 @@ mod llm;
 mod memory;
 mod models_dev;
 mod providers;
+mod repo;
 mod tools;
 mod types;
 mod ui;
