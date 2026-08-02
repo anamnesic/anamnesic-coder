@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use crate::llm::client::{LlmClient, ResponseFormat, ToolDef};
+use crate::models_dev::{ModelsDevClient, base_id};
 
 /// Default cloud provider id used when none is explicitly selected.
 pub const DEFAULT_PROVIDER: &str = "ollama-cloud";
@@ -13,27 +14,40 @@ pub const DEFAULT_PROVIDER: &str = "ollama-cloud";
 /// providers and models live.  This router decides, per model id, whether a
 /// request should go to the local server or to the cloud:
 ///
-/// * provider-qualified ids (`nvidia/…`) → cloud
 /// * ids explicitly marked as cloud (picked from a provider's model list) → cloud
+/// * ids present in the active provider's catalog (matched by base id, so a
+///   single model like `glm-5.2` can be served by several providers) → cloud
+/// * provider-qualified ids (`nvidia/…`) → cloud
 /// * everything else → local
 ///
-/// `cloud` and `provider` live behind `Arc<Mutex<…>>` so a clone handed to the
-/// agent thread sees provider changes made in the UI thread.
+/// The resolved id sent to the API is the active provider's catalog id (e.g.
+/// `z-ai/glm-5.2` on NVIDIA NIM vs `glm-5.2` on Ollama Cloud), so one base
+/// model works across providers.
+///
+/// `cloud`, `provider` and `cloud_models` live behind `Arc<Mutex<…>>` so a
+/// clone handed to the agent thread sees provider changes made in the UI thread.
 #[derive(Clone)]
 pub struct LlmRouter {
     local: LlmClient,
     cloud: Arc<Mutex<Option<LlmClient>>>,
     provider: Arc<Mutex<String>>,
     cloud_models: Arc<Mutex<HashSet<String>>>,
+    catalog: Arc<ModelsDevClient>,
 }
 
 impl LlmRouter {
     pub fn new(local: LlmClient) -> Self {
+        Self::with_catalog(local, ModelsDevClient::load())
+    }
+
+    /// Build a router against a specific catalog (used by tests).
+    pub fn with_catalog(local: LlmClient, catalog: ModelsDevClient) -> Self {
         Self {
             local,
             cloud: Arc::new(Mutex::new(None)),
             provider: Arc::new(Mutex::new(DEFAULT_PROVIDER.to_string())),
             cloud_models: Arc::new(Mutex::new(HashSet::new())),
+            catalog: Arc::new(catalog),
         }
     }
 
@@ -77,9 +91,30 @@ impl LlmRouter {
         self.cloud_models.lock().unwrap().clear();
     }
 
+    /// Resolve a model id against the active provider: `(is_cloud, api_id)`.
+    ///
+    /// The `api_id` is the provider-specific catalog id when the model is a
+    /// cloud model, so one base model (`glm-5.2`) works under any provider
+    /// (`z-ai/glm-5.2` on NVIDIA NIM, `glm-5.2` on Ollama Cloud). The catalog
+    /// takes precedence over the marked set so a marked base id is still sent
+    /// to the API under the active provider's id.
+    pub fn resolve(&self, model: &str) -> (bool, String) {
+        let provider = self.provider.lock().unwrap().clone();
+        if let Some(api_id) = self.catalog.provider_model_api_id(&provider, model) {
+            return (true, api_id);
+        }
+        if self.cloud_models.lock().unwrap().contains(model) {
+            return (true, model.to_string());
+        }
+        if base_id(model) != model {
+            return (true, model.to_string());
+        }
+        (false, model.to_string())
+    }
+
     /// True when `model` should be sent to the cloud backend.
     pub fn is_cloud_model(&self, model: &str) -> bool {
-        model.contains('/') || self.cloud_models.lock().unwrap().contains(model)
+        self.resolve(model).0
     }
 
     /// Pick the concrete client for a model id (cloned; cheap for reqwest).
@@ -104,7 +139,8 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
-        self.client_for(model)?.generate(model, prompt, tools, response_format).await
+        let (_, api_id) = self.resolve(model);
+        self.client_for(model)?.generate(&api_id, prompt, tools, response_format).await
     }
 
     pub async fn generate_with_retry(
@@ -114,8 +150,9 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
+        let (_, api_id) = self.resolve(model);
         self.client_for(model)?
-            .generate_with_retry(model, prompt, tools, response_format)
+            .generate_with_retry(&api_id, prompt, tools, response_format)
             .await
     }
 
@@ -126,7 +163,8 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
-        self.client_for(model)?.chat(model, messages, tools, response_format).await
+        let (_, api_id) = self.resolve(model);
+        self.client_for(model)?.chat(&api_id, messages, tools, response_format).await
     }
 
     pub async fn stream(
@@ -137,16 +175,63 @@ impl LlmRouter {
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.client_for(model)?.stream(model, prompt, tools, response_format, on_token).await
+        let (_, api_id) = self.resolve(model);
+        self.client_for(model)?.stream(&api_id, prompt, tools, response_format, on_token).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models_dev::types::{Catalog, Cost, Limits, ModelInfo, Modalities, Provider};
+
+    fn model(id: &str, tool: bool) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            family: id.into(),
+            reasoning: false,
+            tool_call: tool,
+            temperature: false,
+            open_weights: true,
+            attachment: false,
+            limit: Limits { context: 131_072, output: 4096 },
+            cost: Cost { input: 0.0, output: 0.0, cache_read: None, cache_write: None },
+            modalities: Modalities { input: vec!["text".into()], output: vec!["text".into()] },
+            knowledge: None,
+            release_date: None,
+        }
+    }
+
+    fn provider(id: &str, models: Vec<ModelInfo>) -> Provider {
+        let map = models.into_iter().map(|m| (m.id.clone(), m)).collect();
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            api: String::new(),
+            env: vec![],
+            doc: String::new(),
+            models: map,
+        }
+    }
+
+    fn test_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.insert("ollama-cloud".into(), provider("ollama-cloud", vec![
+            model("glm-5.2", true),
+            model("nemotron-3-nano:30b", true),
+        ]));
+        catalog.insert("nvidia".into(), provider("nvidia", vec![
+            model("z-ai/glm-5.2", true),
+        ]));
+        catalog
+    }
 
     fn router() -> LlmRouter {
-        LlmRouter::new(LlmClient::ollama("http://localhost:11434"))
+        LlmRouter::with_catalog(
+            LlmClient::ollama("http://localhost:11434"),
+            ModelsDevClient { catalog: test_catalog() },
+        )
     }
 
     #[test]
@@ -164,22 +249,44 @@ mod tests {
     }
 
     #[test]
+    fn single_model_resolves_per_active_provider() {
+        let r = router();
+        // Default provider is ollama-cloud, which serves glm-5.2 as "glm-5.2".
+        assert_eq!(r.resolve("glm-5.2"), (true, "glm-5.2".to_string()));
+        // Switch to NVIDIA NIM: same base model, provider-specific id.
+        *r.provider.lock().unwrap() = "nvidia".to_string();
+        assert_eq!(r.resolve("glm-5.2"), (true, "z-ai/glm-5.2".to_string()));
+        assert_eq!(r.resolve("z-ai/glm-5.2"), (true, "z-ai/glm-5.2".to_string()));
+        // A model the provider does not serve stays local.
+        assert_eq!(r.resolve("qwen3:1.7b"), (false, "qwen3:1.7b".to_string()));
+    }
+
+    #[test]
+    fn marked_base_model_still_uses_provider_catalog_id() {
+        let r = router();
+        *r.provider.lock().unwrap() = "nvidia".to_string();
+        // Marking a base id must not bypass the catalog's provider-specific id.
+        r.mark_cloud("glm-5.2");
+        assert_eq!(r.resolve("glm-5.2"), (true, "z-ai/glm-5.2".to_string()));
+    }
+
+    #[test]
     fn marked_models_route_to_cloud() {
         let r = router();
-        r.mark_cloud("nemotron-3-nano:30b");
-        assert!(r.is_cloud_model("nemotron-3-nano:30b"));
-        r.unmark_cloud("nemotron-3-nano:30b");
-        assert!(!r.is_cloud_model("nemotron-3-nano:30b"));
+        r.mark_cloud("custom-cloud");
+        assert!(r.is_cloud_model("custom-cloud"));
+        r.unmark_cloud("custom-cloud");
+        assert!(!r.is_cloud_model("custom-cloud"));
     }
 
     #[test]
     fn clear_cloud_marks_resets_marked_set() {
         let r = router();
-        r.mark_cloud("glm-5.1");
-        r.mark_cloud("kimi-k2.7-code");
+        r.mark_cloud("custom-a");
+        r.mark_cloud("custom-b");
         r.clear_cloud_marks();
-        assert!(!r.is_cloud_model("glm-5.1"));
-        assert!(!r.is_cloud_model("kimi-k2.7-code"));
+        assert!(!r.is_cloud_model("custom-a"));
+        assert!(!r.is_cloud_model("custom-b"));
     }
 
     #[test]

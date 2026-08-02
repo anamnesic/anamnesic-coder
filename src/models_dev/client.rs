@@ -117,6 +117,21 @@ impl ModelsDevClient {
             .unwrap_or_default()
     }
 
+    /// Find the provider-specific API model id for `model` inside `provider`'s
+    /// catalog, matching on exact id or normalized base id. One model may be
+    /// served by several providers under different ids (e.g. `glm-5.2` on
+    /// Ollama vs `z-ai/glm-5.2` on NVIDIA NIM), so the router resolves the id
+    /// per active provider.
+    pub fn provider_model_api_id(&self, provider: &str, model: &str) -> Option<String> {
+        let base = base_id(model);
+        for (id, _) in self.catalog.get(provider)?.models.iter() {
+            if id == model || base_id(id) == base {
+                return Some(id.clone());
+            }
+        }
+        None
+    }
+
     /// Print a human-readable list of models matching a query string.
     pub fn print_list(&self, query: &str) {
         let q = query.to_lowercase();
@@ -203,6 +218,13 @@ fn normalize_family(ollama_name: &str) -> String {
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() }
     else { format!("{}…", &s[..max.saturating_sub(1)]) }
+}
+
+/// Canonical base id for a model: the last `/`-separated segment, lowercased,
+/// with any `:tag` suffix kept. `z-ai/glm-5.2` → `glm-5.2`,
+/// `zai-org/GLM-5.2` → `glm-5.2`, `qwen3:1.7b` → `qwen3:1.7b`.
+pub fn base_id(id: &str) -> String {
+    id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -302,5 +324,24 @@ mod tests {
     fn all_models_spans_providers() {
         let c = sample_client();
         assert_eq!(c.all_models().len(), 3);
+    }
+
+    #[test]
+    fn base_id_normalizes_provider_qualified_ids() {
+        assert_eq!(base_id("glm-5.2"), "glm-5.2");
+        assert_eq!(base_id("z-ai/glm-5.2"), "glm-5.2");
+        assert_eq!(base_id("zai-org/GLM-5.2"), "glm-5.2");
+        assert_eq!(base_id("workers-ai/@cf/zai-org/glm-5.2"), "glm-5.2");
+        assert_eq!(base_id("qwen3:1.7b"), "qwen3:1.7b");
+        assert_eq!(base_id("zai-org/glm-5.2:thinking"), "glm-5.2:thinking");
+    }
+
+    #[test]
+    fn provider_model_api_id_matches_exact_or_base_id() {
+        let c = sample_client();
+        assert_eq!(c.provider_model_api_id("fakea", "cheap:1b").as_deref(), Some("fakea/cheap:1b"));
+        assert_eq!(c.provider_model_api_id("fakea", "fakea/cheap:1b").as_deref(), Some("fakea/cheap:1b"));
+        assert!(c.provider_model_api_id("fakea", "nope").is_none());
+        assert!(c.provider_model_api_id("missing-provider", "cheap:1b").is_none());
     }
 }

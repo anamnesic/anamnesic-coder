@@ -26,20 +26,31 @@ Introduce `LlmRouter` (`src/llm/router.rs`) that holds:
 
 Routing per model id:
 
-1. provider-qualified ids (`nvidia/…`, `ollama-cloud/…`) → cloud;
+1. catalog match: the id (exact or normalized base id, e.g. `glm-5.2` also matches
+   `z-ai/glm-5.2`) present in the **active provider's** models.dev catalog → cloud,
+   and the request uses the provider-specific catalog id (`z-ai/glm-5.2` on NVIDIA
+   NIM, `glm-5.2` on Ollama Cloud). One model can thus be served by several
+   providers from a single selection;
 2. ids explicitly marked cloud (picked from `/model`'s cloud list, or the model
    set by `--cloud`) → cloud;
-3. everything else → local.
+3. provider-qualified ids (`nvidia/…`) → cloud;
+4. everything else → local.
 
 `/provider` now rebuilds the cloud backend live; the default provider is
 `ollama-cloud`, and `OLLAMA_API_KEY` lives in the git-ignored `.env`. The agent
-loop, repl and TUI all use the router, resolving the concrete client for the
-planner/coder/summarizer model per call.
+loop, repl and TUI all use the router — planner, executor, summarizer and the
+tool-use loop all resolve through `LlmRouter`, so the selected model drives the
+whole lifecycle and retries reuse the same resolved client.
 
 ## Consequences
 
-- Selecting a cloud model in the TUI now actually reaches the cloud backend.
-- Switching providers (`/provider`) works without restarting.
+- Selecting a cloud model in the TUI now actually reaches the cloud backend,
+  and the same base model (`glm-5.2`) works under any configured provider
+  (NVIDIA NIM sends `z-ai/glm-5.2`, Ollama Cloud sends `glm-5.2`).
+- Switching providers (`/provider`) works without restarting; the model
+  picker lists each model once (base id) and routing picks the provider id.
 - Local-first behavior is preserved: plain local models still go to Ollama.
-- Added unit tests for router routing, provider store, tools, compressor,
-  memory, models.dev queries and UI helpers (111 total, all passing).
+- Planner and executor no longer resolve their own client — the router is the
+  single source of truth for provider choice across the whole agent lifecycle.
+- Added unit tests for router routing/resolution, provider store, tools,
+  compressor, memory, models.dev queries and UI helpers (118 total, all passing).

@@ -295,19 +295,11 @@ pub async fn run_agent_loop_with_hooks(
             filename: None, pattern: None, command: None,
         }],
     };
-    let plan = match client.client_for(&state.config.planner_model) {
-        Ok(planner_client) => {
-            planner::plan_task(&planner_client, &state.config.planner_model, task, &context, &state.caveman).await
-                .unwrap_or_else(|e| {
-                    hooks.warn(&format!("Planner error: {}. Falling back to direct execution.", e));
-                    fallback_plan()
-                })
-        }
-        Err(e) => {
-            hooks.warn(&format!("Planner backend unavailable: {e}"));
+    let plan = planner::plan_task(client, &state.config.planner_model, task, &context, &state.caveman).await
+        .unwrap_or_else(|e| {
+            hooks.warn(&format!("Planner error: {}. Falling back to direct execution.", e));
             fallback_plan()
-        }
-    };
+        });
 
     let steps = plan.steps;
     hooks.warn(&format!("  [plan] {} step(s)", steps.len()));
@@ -316,13 +308,12 @@ pub async fn run_agent_loop_with_hooks(
         return;
     }
 
-    let coder_client = match client.client_for(&state.config.coder_model) {
-        Ok(c) => c,
-        Err(e) => {
-            hooks.warn(&format!("Coder backend unavailable: {e}"));
-            return;
-        }
-    };
+    // Fail fast with a clear message if the selected coder model's backend is
+    // not available (e.g. a cloud model with no configured provider).
+    if let Err(e) = client.client_for(&state.config.coder_model) {
+        hooks.warn(&format!("Coder backend unavailable: {e}"));
+        return;
+    }
 
     let total = steps.len();
     for (i, step) in steps.iter().enumerate() {
@@ -336,7 +327,7 @@ pub async fn run_agent_loop_with_hooks(
             total,
             description: step.description.clone(),
         });
-        executor::execute_step(&coder_client, state, step).await;
+        executor::execute_step(client, state, step).await;
     }
 
     let summary: Vec<&str> = steps.iter().map(|s| s.description.as_str()).collect();

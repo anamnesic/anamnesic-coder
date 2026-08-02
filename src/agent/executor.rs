@@ -1,6 +1,6 @@
 use crate::types::plan::PlanStep;
 use crate::agent::state::AgentState;
-use crate::llm::client::LlmClient;
+use crate::llm::router::LlmRouter;
 use crate::llm::provider_chain::FallbackChain;
 use crate::llm::prompt::CoderPrompt;
 use crate::tools::shell;
@@ -86,7 +86,7 @@ fn verify_cargo(state: &AgentState) -> Option<String> {
 /// Generate file content via the coder model, write it, and verify `.rs` files
 /// with `cargo check`, feeding errors back until it passes (bounded retries).
 async fn write_with_verification<F>(
-    client: &LlmClient,
+    client: &LlmRouter,
     state: &mut AgentState,
     filename: &str,
     make_prompt: F,
@@ -163,7 +163,7 @@ fn extract_path(description: &str) -> Option<String> {
     None
 }
 
-pub async fn execute_step(client: &LlmClient, state: &mut AgentState, step: &PlanStep) {
+pub async fn execute_step(client: &LlmRouter, state: &mut AgentState, step: &PlanStep) {
     let caveman = state.caveman;
     execute_step_inner(client, state, step, caveman).await
 }
@@ -174,7 +174,7 @@ pub async fn execute_step_with_chain(chain: &FallbackChain, state: &mut AgentSta
     execute_step_inner_chain(chain, state, step, caveman).await
 }
 
-async fn execute_step_inner(client: &LlmClient, state: &mut AgentState, step: &PlanStep, caveman: crate::compressor::caveman::CavemanLevel) {
+async fn execute_step_inner(client: &LlmRouter, state: &mut AgentState, step: &PlanStep, caveman: crate::compressor::caveman::CavemanLevel) {
     match step.step_type.as_str() {
         "create_file" => {
             if let Some(filename) = step.filename.clone().or_else(|| extract_path(&step.description)) {

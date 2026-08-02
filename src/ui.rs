@@ -169,8 +169,9 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
                 .provider_models(&provider)
                 .into_iter()
                 .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-                .map(|m| format!("{} [cloud]", m.id))
+                .map(|m| format!("{} [cloud]", crate::models_dev::base_id(&m.id)))
                 .collect();
+            let cloud = unique_model_ids(cloud);
             if local.is_empty() && cloud.is_empty() {
                 app.add_message("System", &format!("No models found in {} or for provider {} in the models.dev catalog.", dir.display(), provider));
             } else {
@@ -266,10 +267,10 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
                     .provider_models(&provider)
                     .into_iter()
                     .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-                    .map(|m| format!("{} [cloud]", m.id))
+                    .map(|m| format!("{} [cloud]", crate::models_dev::base_id(&m.id)))
                     .collect();
                 let mut items: Vec<String> = local.clone();
-                items.extend(cloud);
+                items.extend(unique_model_ids(cloud));
                 items.dedup();
                 if items.is_empty() {
                     app.add_message(
@@ -303,6 +304,12 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
     }
 }
 
+/// Dedupe a model id list while preserving order (used by the model pickers).
+fn unique_model_ids(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    items.into_iter().filter(|m| seen.insert(m.clone())).collect()
+}
+
 /// Set the active coder model for subsequent agent turns.  Strips the
 /// " [cloud]" picker suffix and tells the router whether the model is a cloud
 /// model so requests go to the right backend.
@@ -311,10 +318,10 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
     let mut is_cloud = name.ends_with(" [cloud]");
     if !is_cloud {
         // Typed names: resolve against the active provider's catalog so plain
-        // cloud ids (e.g. Ollama Cloud "glm-5.1") still route to the cloud.
+        // cloud ids (e.g. Ollama Cloud "glm-5.2") still route to the cloud.
         let provider = app.provider.clone();
         let catalog = crate::models_dev::ModelsDevClient::load();
-        is_cloud = catalog.provider_models(&provider).iter().any(|m| m.id == clean);
+        is_cloud = catalog.provider_model_api_id(&provider, &clean).is_some();
     }
     if is_cloud {
         router.mark_cloud(&clean);
@@ -323,7 +330,14 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
     }
     {
         let mut st = state.lock().unwrap();
+        // The selected model drives the whole agent lifecycle (mirrors
+        // `--model`, which sets planner/coder/summarizer).  Keeping the
+        // planner and summarizer on separate local default models while the
+        // coder runs on a cloud model would silently send planning and
+        // compaction requests to Ollama.
         st.config.coder_model = clean.clone();
+        st.config.planner_model = clean.clone();
+        st.config.summarizer_model = clean.clone();
     }
     app.model = clean.clone();
     app.add_message("System", &format!("Model set to {clean}{}", if is_cloud { " (cloud)" } else { "" }));
@@ -1126,5 +1140,60 @@ mod tests {
     fn git_branch_reports_no_git_outside_repo() {
         let dir = std::env::temp_dir();
         assert_eq!(git_branch(&dir), "no git");
+    }
+
+    fn test_app_state_router() -> (App, Arc<Mutex<AgentState>>, LlmRouter) {
+        let mut cfg = crate::config::settings::Config::default();
+        let base = std::env::temp_dir().join(format!("anamnesic-ui-{}", std::process::id()));
+        cfg.workspace_dir = base.join("workspace");
+        cfg.memory_dir = base.join("memory");
+        let state = Arc::new(Mutex::new(crate::agent::state::AgentState::new(cfg).unwrap()));
+        let app = App::new(&state.lock().unwrap().config.coder_model, "off");
+        let router = LlmRouter::new(crate::llm::client::LlmClient::ollama("http://localhost:11434"));
+        (app, state, router)
+    }
+
+    #[test]
+    fn selecting_cloud_model_drives_entire_lifecycle_to_cloud() {
+        let (mut app, state, router) = test_app_state_router();
+        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]");
+        let st = state.lock().unwrap();
+        assert_eq!(st.config.coder_model, "z-ai/glm-5.2");
+        assert_eq!(st.config.planner_model, "z-ai/glm-5.2");
+        assert_eq!(st.config.summarizer_model, "z-ai/glm-5.2");
+        assert_eq!(app.model, "z-ai/glm-5.2");
+        assert!(router.is_cloud_model("z-ai/glm-5.2"));
+        match router.client_for("z-ai/glm-5.2") {
+            Ok(_) => panic!("expected cloud model to fail without configured provider"),
+            Err(e) => assert!(e.to_string().contains("no cloud provider is configured")),
+        }
+    }
+
+    #[test]
+    fn selecting_local_model_keeps_lifecycle_on_ollama() {
+        let (mut app, state, router) = test_app_state_router();
+        set_active_model(&mut app, &state, &router, "qwen3:1.7b");
+        let st = state.lock().unwrap();
+        assert_eq!(st.config.coder_model, "qwen3:1.7b");
+        assert_eq!(st.config.planner_model, "qwen3:1.7b");
+        assert_eq!(st.config.summarizer_model, "qwen3:1.7b");
+        assert!(!router.is_cloud_model("qwen3:1.7b"));
+        match router.client_for("qwen3:1.7b").unwrap() {
+            crate::llm::client::LlmClient::Ollama(_) => {}
+            _ => panic!("expected local Ollama client for local model"),
+        }
+    }
+
+    #[test]
+    fn planner_summarizer_default_to_local_models() {
+        let (mut app, state, router) = test_app_state_router();
+        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]");
+        // Switching back to a local model must also move planner/summarizer.
+        set_active_model(&mut app, &state, &router, "granite3.3:2b");
+        let st = state.lock().unwrap();
+        assert_eq!(st.config.planner_model, "granite3.3:2b");
+        assert_eq!(st.config.coder_model, "granite3.3:2b");
+        assert_eq!(st.config.summarizer_model, "granite3.3:2b");
+        assert!(!router.is_cloud_model("granite3.3:2b"));
     }
 }
