@@ -260,9 +260,11 @@ fn extract_path(description: &str) -> Option<String> {
         if clean.contains('/') || clean.contains('\\') {
             return Some(clean.to_string());
         }
-        if let Some(ext) = clean.rsplit('.').next() {
-            if known_ext.contains(&ext) && clean != "." {
-                return Some(clean.to_string());
+        if clean.contains('.') && !clean.starts_with('.') {
+            if let Some(ext) = clean.rsplit('.').next() {
+                if known_ext.contains(&ext) {
+                    return Some(clean.to_string());
+                }
             }
         }
     }
@@ -547,5 +549,13 @@ mod tests {
     fn keeps_single_line_code() {
         let out = extract_code_block("```rust\nfn main() {}\n```");
         assert_eq!(out, "fn main() {}");
+    }
+
+    #[test]
+    fn extract_path_requires_dot_or_slash() {
+        use super::extract_path;
+        assert_eq!(extract_path("create src/lib.rs with helper"), Some("src/lib.rs".into()));
+        assert_eq!(extract_path("create main.py file"), Some("main.py".into()));
+        assert_eq!(extract_path("run R script"), None);
     }
 }
