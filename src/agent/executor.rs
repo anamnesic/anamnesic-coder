@@ -1,4 +1,4 @@
-use crate::agent::r#loop::AgentHooks;
+use crate::agent::agent_loop::AgentHooks;
 use crate::agent::state::AgentState;
 use crate::compressor::layer1;
 use crate::llm::prompt::CoderPrompt;

@@ -16,7 +16,7 @@ mod tools;
 mod types;
 mod ui;
 
-use agent::r#loop::run_agent_loop;
+use agent::agent_loop::run_agent_loop;
 use agent::state::AgentState;
 use anyhow::Result;
 use clap::{Parser, Subcommand};

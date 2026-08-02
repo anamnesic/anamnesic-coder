@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::r#loop::{AgentEvent, AgentHooks, ApprovalDecision, ApprovalRequest};
+use crate::agent::agent_loop::{AgentEvent, AgentHooks, ApprovalDecision, ApprovalRequest};
 use crate::agent::state::AgentState;
 use crate::config::settings::ApprovalPolicy;
 use crate::llm::router::{LlmRouter, DEFAULT_PROVIDER};
@@ -517,7 +517,7 @@ fn run_input(
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut st = state_clone.lock().unwrap();
-        rt.block_on(crate::agent::r#loop::run_agent_loop_with_hooks(
+        rt.block_on(crate::agent::agent_loop::run_agent_loop_with_hooks(
             &client_clone,
             &mut st,
             &input_clone,
