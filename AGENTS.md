@@ -18,3 +18,12 @@ This file lists all the index.md files created in the src directory and its subd
  - [`src/types/index.md`](src/types/index.md) - Documentation for shared types
 
 Each index.md file contains a list of files in that directory with brief descriptions of their purpose.
+
+## Architectural Decision Records (ADRs)
+
+- [`docs/adr/0001-llm-router.md`](docs/adr/0001-llm-router.md) — Route LLM traffic through a runtime LlmRouter
+- [`docs/adr/0002-harness-parity-glm52.md`](docs/adr/0002-harness-parity-glm52.md) — Harness Parity (GLM-5.2)
+- [`docs/adr/0003-resilient-routing.md`](docs/adr/0003-resilient-routing.md) — Resilient Routing: Same-Tier Fallback, Backoff & Error Surfacing
+- [`docs/adr/0004-project-context-and-workspace-structure.md`](docs/adr/0004-project-context-and-workspace-structure.md) — Project Context Auto-Loading & Workspace Directory Discovery
+- [`docs/adr/0005-token-usage-tracking.md`](docs/adr/0005-token-usage-tracking.md) — Token Usage & Cost Tracking Per Turn
+- [`docs/gap-analysis-2026-08.md`](docs/gap-analysis-2026-08.md) — 2026 Competitor Gap Analysis Report
