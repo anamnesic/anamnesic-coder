@@ -303,6 +303,10 @@
 | LLM error surfacing in TUI chat | ✅ Done | 0003 |
 | Mouse wheel scrolling in TUI | ✅ Done | 0003 |
 | Workspace defaults to current directory | ✅ Done | 0003 |
+| Auto-read project context (`AGENTS.md`) (G8) | ✅ Done | 0004 |
+| `list_files` includes directories (G10) | ✅ Done | 0004 |
+| Token usage & cost tracking per turn (G6) | ✅ Done | 0005 |
+| Windows cross-platform path resolution fixes | ✅ Done | 0005 |
 
 ### All Open Demands
 
@@ -319,11 +323,8 @@
 | 8 | P0 | TOCTOU race in `FileTools::resolve` | Safety | Médio |
 | — | P0 | Tests for path traversal, symlink escape, injection | Safety | Médio |
 | G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
-| G6 | P1 | Cost tracking per turn | Harness | Baixo |
 | G7 | P1 | MCP client (stdio transport) | Harness | Alto |
-| G8 | P1 | Auto-read project context (AGENTS.md) | Harness | Baixo |
 | G9 | P1 | Streaming tool call deltas | Harness | Médio |
-| G10 | P1 | `list_files` include directories | Harness | Baixo |
 | 9 | P1 | Fix `unwrap()` in production paths | Robustness | Baixo |
 | 10 | P1 | Fix `partial_cmp().unwrap()` NaN panic (3 sites) | Robustness | Baixo |
 | 11 | P1 | Fix `partial_cmp().unwrap()` in top-K sampling | Robustness | Baixo |
