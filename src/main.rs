@@ -245,6 +245,17 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Tui) => {
+            // TUI defaults to the GLM-5.2 cloud model when no explicit --cloud
+            // flag was given and the nvidia provider is available.
+            if !cli.cloud {
+                if let Ok(_base) = client.set_provider("nvidia") {
+                    let model = DEFAULT_CLOUD_MODEL.to_string();
+                    state.config.coder_model = model.clone();
+                    state.config.planner_model = model.clone();
+                    state.config.summarizer_model = model.clone();
+                    client.mark_cloud(&model);
+                }
+            }
             ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
         Some(Commands::Repl) => {
@@ -254,6 +265,16 @@ async fn main() -> Result<()> {
             if let Some(task) = cli.task {
                 run_agent_loop(&client, &mut state, &task).await;
             } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                // Interactive TUI defaults to GLM-5.2 cloud model.
+                if !cli.cloud {
+                    if let Ok(_base) = client.set_provider("nvidia") {
+                        let model = DEFAULT_CLOUD_MODEL.to_string();
+                        state.config.coder_model = model.clone();
+                        state.config.planner_model = model.clone();
+                        state.config.summarizer_model = model.clone();
+                        client.mark_cloud(&model);
+                    }
+                }
                 ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             } else {
                 anyhow::bail!("no task or subcommand supplied; use --help for usage");
