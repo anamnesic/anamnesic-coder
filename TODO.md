@@ -279,6 +279,10 @@
 | 5 | GGUF parsing panics on truncated files | ADR 0007 |
 | 6 | Q4_0/Q8_0 dequantization bounds checks | ADR 0007 |
 | 7 | `tensor_data` out-of-bounds check | ADR 0007 |
+| 10 | `partial_cmp().unwrap()` NaN panic safety | ADR 0008 |
+| 11 | Top-K sampling NaN comparison safety | ADR 0008 |
+| 21 | GPU info single file-read refactor | ADR 0008 |
+| 23 | Short API key masking safety | ADR 0008 |
 
 ### Implemented Features
 
@@ -305,6 +309,7 @@
 | Windows cross-platform path resolution fixes | ✅ Done | 0005 |
 | Line-range surgical code editing (`edit_file`) (G1) | ✅ Done | 0006 |
 | GGUF safe parsing & bounds-checked dequantization | ✅ Done | 0007 |
+| Floating point safety & complete key masking | ✅ Done | 0008 |
 
 ### All Open Demands
 

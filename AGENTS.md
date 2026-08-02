@@ -28,4 +28,5 @@ Each index.md file contains a list of files in that directory with brief descrip
 - [`docs/adr/0005-token-usage-tracking.md`](docs/adr/0005-token-usage-tracking.md) — Token Usage & Cost Tracking Per Turn
 - [`docs/adr/0006-line-range-code-editing.md`](docs/adr/0006-line-range-code-editing.md) — Line-Range Code Editing (`edit_file`)
 - [`docs/adr/0007-gguf-safety-and-bounds-checking.md`](docs/adr/0007-gguf-safety-and-bounds-checking.md) — GGUF & Dequantization Memory Safety
+- [`docs/adr/0008-robustness-and-floating-point-safety.md`](docs/adr/0008-robustness-and-floating-point-safety.md) — Robustness, Floating Point Safety & Store Key Masking
 - [`docs/gap-analysis-2026-08.md`](docs/gap-analysis-2026-08.md) — 2026 Competitor Gap Analysis Report

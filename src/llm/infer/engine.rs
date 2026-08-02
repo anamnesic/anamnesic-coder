@@ -330,7 +330,7 @@ impl InferenceEngine {
                 for l in logits.iter_mut() { *l /= temperature; }
                 if top_k > 0 && top_k < n_vocab {
                     let mut scored: Vec<(f32, usize)> = logits.iter().enumerate().map(|(i, &v)| (v, i)).collect();
-                    scored.select_nth_unstable_by(top_k - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    scored.select_nth_unstable_by(top_k - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let threshold = scored[top_k - 1].0;
                     for (_i, v) in logits.iter_mut().enumerate() {
                         if *v < threshold { *v = f32::NEG_INFINITY; }

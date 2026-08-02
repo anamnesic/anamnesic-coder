@@ -156,15 +156,13 @@ fn detect_gpu_nvidia() -> Option<(String, String, u32)> {
         .find(|l| l.starts_with("Model"))?
         .split(':').nth(1)?
         .trim().to_string();
-    let vram_mb = fs::read_to_string("/proc/driver/nvidia/gpus/0/information").ok()
-        .and_then(|s| s.lines()
-            .find(|l| l.starts_with("Total"))
-            .and_then(|l| {
-                l.split_whitespace()
-                    .find(|w| w.parse::<u32>().is_ok())
-                    .and_then(|w| w.parse::<u32>().ok())
-            })
-        )
+    let vram_mb = info.lines()
+        .find(|l| l.starts_with("Total"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find(|w| w.parse::<u32>().is_ok())
+                .and_then(|w| w.parse::<u32>().ok())
+        })
         .unwrap_or(0);
     Some((model, "NVIDIA".into(), vram_mb))
 }

@@ -78,7 +78,7 @@ impl ModelsDevClient {
             })
             .collect();
 
-        candidates.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap());
+        candidates.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap_or(std::cmp::Ordering::Equal));
         candidates.into_iter().take(top_n).collect()
     }
 
@@ -97,7 +97,7 @@ impl ModelsDevClient {
             .collect();
 
         // Sort by cheapest input cost
-        matches.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap());
+        matches.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap_or(std::cmp::Ordering::Equal));
 
         matches.first().map(|(pid, m)| CloudMatch {
             provider:   pid.to_string(),
@@ -146,7 +146,7 @@ impl ModelsDevClient {
             })
             .collect();
 
-        rows.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap());
+        rows.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap_or(std::cmp::Ordering::Equal));
 
         println!("\n{:<30} {:<14} {:>9} {:>9} {:>9}  {}", "Model ID", "Provider", "In$/MTok", "Out$/MTok", "Ctx(K)", "Caps");
         println!("{}", "─".repeat(95));

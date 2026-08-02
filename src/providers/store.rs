@@ -277,10 +277,15 @@ pub fn print_store(store: &ProviderStore, catalog: &Catalog) {
     println!();
 }
 
-/// Show only 4 chars of the key then asterisks.
+/// Show at most min(4, len/2) chars for keys > 4 chars, and completely mask shorter keys.
 fn mask_key(key: &str) -> String {
-    let n = key.len().min(4);
-    format!("{}****", &key[..n])
+    let len = key.len();
+    if len <= 4 {
+        "****".to_string()
+    } else {
+        let visible = 4.min(len / 2);
+        format!("{}****", &key[..visible])
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +402,7 @@ mod tests {
     #[test]
     fn mask_key_hides_most_of_key() {
         assert_eq!(mask_key("sk-abcdef123456"), "sk-a****");
-        assert_eq!(mask_key("ab"), "ab****");
+        assert_eq!(mask_key("ab"), "****");
+        assert_eq!(mask_key("abcdef"), "abc****");
     }
 }
