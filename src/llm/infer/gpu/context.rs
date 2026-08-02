@@ -1,11 +1,11 @@
 //! GpuContext — OpenCL 1.1+ context + pre-uploaded weight buffers.
 
-use std::collections::HashMap;
-use ocl::{Platform, Device, DeviceType, Context, Queue, Program, Buffer, MemFlags, Kernel};
-use anyhow::{Result, bail};
+use super::kernels::KERNELS_SRC;
 use crate::llm::infer::gguf::GgmlType;
 use crate::llm::infer::model::Model;
-use super::kernels::KERNELS_SRC;
+use anyhow::Result;
+use ocl::{Buffer, Context, Device, DeviceType, Kernel, MemFlags, Platform, Program, Queue};
+use std::collections::HashMap;
 
 /// Returns the first OpenCL GPU platform+device found, or None.
 pub fn probe_gpu() -> Option<(Platform, Device)> {
@@ -20,28 +20,28 @@ pub fn probe_gpu() -> Option<(Platform, Device)> {
 }
 
 struct GpuBuf {
-    buf:  Buffer<u8>,
-    ty:   GgmlType,
+    buf: Buffer<u8>,
+    ty: GgmlType,
     rows: usize,
     cols: usize,
 }
 
 /// OpenCL context with all model weights pre-uploaded to GPU VRAM.
 pub struct GpuContext {
-    queue:   Queue,
+    queue: Queue,
     program: Program,
     weights: HashMap<String, GpuBuf>,
     /// Scratch buffer for the input vector (re-used each call).
-    x_buf:   Buffer<f32>,
-    x_len:   usize,
+    x_buf: Buffer<f32>,
+    x_len: usize,
 }
 
 impl GpuContext {
     /// Build GPU context and upload all tensors from the model.
     /// Returns error if no GPU found or total VRAM insufficient.
     pub fn new(model: &Model) -> Result<Self> {
-        let (platform, device) = probe_gpu()
-            .ok_or_else(|| anyhow::anyhow!("No OpenCL GPU found"))?;
+        let (platform, device) =
+            probe_gpu().ok_or_else(|| anyhow::anyhow!("No OpenCL GPU found"))?;
 
         let device_name: String = device.name().unwrap_or_default();
         log::info!("GPU: {}", device_name);
@@ -65,16 +65,26 @@ impl GpuContext {
         let mut total_bytes: usize = 0;
 
         for (name, tensor) in &model.tensors {
-            if tensor.data.is_empty() { continue; }
+            if tensor.data.is_empty() {
+                continue;
+            }
 
             // Only tensor types for which we have GPU kernels.
             let supported = matches!(
                 tensor.ty,
-                GgmlType::F32 | GgmlType::Q4_0 | GgmlType::Q8_0
-                | GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_K
+                GgmlType::F32
+                    | GgmlType::Q4_0
+                    | GgmlType::Q8_0
+                    | GgmlType::Q4_K
+                    | GgmlType::Q6_K
+                    | GgmlType::Q8_K
             );
             if !supported {
-                log::debug!("GPU: skipping unsupported tensor {} ({:?})", name, tensor.ty);
+                log::debug!(
+                    "GPU: skipping unsupported tensor {} ({:?})",
+                    name,
+                    tensor.ty
+                );
                 continue;
             }
 
@@ -82,7 +92,11 @@ impl GpuContext {
             //   rows = n_out (number of output features = dim 1 in GGUF row-major)
             //   cols = n_in  (number of input  features = dim 0)
             let cols = tensor.dims[0] as usize; // inner dimension
-            let rows = if tensor.dims.len() > 1 { tensor.dims[1] as usize } else { 1 };
+            let rows = if tensor.dims.len() > 1 {
+                tensor.dims[1] as usize
+            } else {
+                1
+            };
 
             let buf = Buffer::<u8>::builder()
                 .queue(queue.clone())
@@ -93,14 +107,27 @@ impl GpuContext {
                 .map_err(|e| anyhow::anyhow!("GPU upload failed for {}: {}", name, e))?;
 
             total_bytes += tensor.data.len();
-            weights.insert(name.clone(), GpuBuf { buf, ty: tensor.ty, rows, cols });
+            weights.insert(
+                name.clone(),
+                GpuBuf {
+                    buf,
+                    ty: tensor.ty,
+                    rows,
+                    cols,
+                },
+            );
         }
 
-        log::info!("GPU: uploaded {:.1} MB of weights ({} tensors)",
-            total_bytes as f64 / 1_048_576.0, weights.len());
+        log::info!(
+            "GPU: uploaded {:.1} MB of weights ({} tensors)",
+            total_bytes as f64 / 1_048_576.0,
+            weights.len()
+        );
 
         // Allocate scratch x_buf with max possible input dimension.
-        let max_cols = model.tensors.values()
+        let max_cols = model
+            .tensors
+            .values()
             .map(|t| t.dims[0] as usize)
             .max()
             .unwrap_or(4096);
@@ -111,7 +138,13 @@ impl GpuContext {
             .len(max_cols)
             .build()?;
 
-        Ok(GpuContext { queue, program, weights, x_buf, x_len: max_cols })
+        Ok(GpuContext {
+            queue,
+            program,
+            weights,
+            x_buf,
+            x_len: max_cols,
+        })
     }
 
     /// GPU GEMV: out = W × x  where W is the named weight tensor.
@@ -119,7 +152,7 @@ impl GpuContext {
     pub fn gemv(&mut self, name: &str, x: &[f32], out: &mut [f32]) -> Result<bool> {
         let entry = match self.weights.get(name) {
             Some(e) => e,
-            None    => return Ok(false),
+            None => return Ok(false),
         };
 
         let rows = entry.rows;
@@ -149,12 +182,20 @@ impl GpuContext {
 
         let kernel_name = kernel_for(entry.ty);
         let kernel = build_kernel(
-            &self.program, &self.queue,
-            kernel_name, &entry.buf, &self.x_buf, &y_buf,
-            rows, cols, entry.ty,
+            &self.program,
+            &self.queue,
+            kernel_name,
+            &entry.buf,
+            &self.x_buf,
+            &y_buf,
+            rows,
+            cols,
+            entry.ty,
         )?;
 
-        unsafe { kernel.cmd().global_work_size(rows).enq()?; }
+        unsafe {
+            kernel.cmd().global_work_size(rows).enq()?;
+        }
 
         y_buf.read(&mut out[..rows]).enq()?;
         Ok(true)
@@ -167,13 +208,13 @@ impl GpuContext {
 
 fn kernel_for(ty: GgmlType) -> &'static str {
     match ty {
-        GgmlType::F32   => "f32_gemv",
-        GgmlType::Q4_0  => "q4_0_gemv",
-        GgmlType::Q8_0  => "q8_0_gemv",
-        GgmlType::Q4_K  => "q4k_gemv",
-        GgmlType::Q6_K  => "q6k_gemv",
-        GgmlType::Q8_K  => "q8k_gemv",
-        _               => "f32_gemv",
+        GgmlType::F32 => "f32_gemv",
+        GgmlType::Q4_0 => "q4_0_gemv",
+        GgmlType::Q8_0 => "q8_0_gemv",
+        GgmlType::Q4_K => "q4k_gemv",
+        GgmlType::Q6_K => "q6k_gemv",
+        GgmlType::Q8_K => "q8k_gemv",
+        _ => "f32_gemv",
     }
 }
 
@@ -190,29 +231,25 @@ fn build_kernel(
 ) -> Result<Kernel> {
     // Simple types (f32/q4_0/q8_0) take 4 args; K-quant types take 5 (rows + cols).
     let k = match ty {
-        GgmlType::F32 | GgmlType::Q4_0 | GgmlType::Q8_0 => {
-            Kernel::builder()
-                .program(program)
-                .name(name)
-                .queue(queue.clone())
-                .arg(a_buf)
-                .arg(x_buf)
-                .arg(y_buf)
-                .arg(cols as i32)
-                .build()?
-        }
-        _ => {
-            Kernel::builder()
-                .program(program)
-                .name(name)
-                .queue(queue.clone())
-                .arg(a_buf)
-                .arg(x_buf)
-                .arg(y_buf)
-                .arg(rows as i32)
-                .arg(cols as i32)
-                .build()?
-        }
+        GgmlType::F32 | GgmlType::Q4_0 | GgmlType::Q8_0 => Kernel::builder()
+            .program(program)
+            .name(name)
+            .queue(queue.clone())
+            .arg(a_buf)
+            .arg(x_buf)
+            .arg(y_buf)
+            .arg(cols as i32)
+            .build()?,
+        _ => Kernel::builder()
+            .program(program)
+            .name(name)
+            .queue(queue.clone())
+            .arg(a_buf)
+            .arg(x_buf)
+            .arg(y_buf)
+            .arg(rows as i32)
+            .arg(cols as i32)
+            .build()?,
     };
     Ok(k)
 }

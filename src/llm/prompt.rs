@@ -48,15 +48,7 @@ pub struct CoderPrompt;
 
 impl CoderPrompt {
     pub fn system() -> &'static str {
-        r#"You are a code generation assistant. You write clean, idiomatic code.
-Given context and a task, produce the code changes or answer.
-
-Rules:
-- Return only the code/content requested
-- For files, use code blocks
-- Keep explanations minimal
-- Follow existing code style
-- Never modify existing tests to make them pass; fix the implementation instead"#
+        include_str!("../../prompts/coder.txt").trim()
     }
 
     pub fn with_caveman(level: &CavemanLevel) -> String {

@@ -1,36 +1,40 @@
-﻿// Experimental subsystems (GPU inference kernels, bench, hardware detection) expose
+// Experimental subsystems (GPU inference kernels, bench, hardware detection) expose
 // API that is not yet wired into the CLI — keep them compiling without dead-code noise.
 #![allow(dead_code)]
 
 mod agent;
-mod llm;
-mod tools;
-mod memory;
-mod types;
+mod bench;
+mod compressor;
 mod config;
 mod hw_recommend;
-mod compressor;
-mod bench;
-mod ui;
+mod llm;
+mod memory;
 mod models_dev;
 mod providers;
+mod tools;
+mod types;
+mod ui;
 
+use agent::r#loop::run_agent_loop;
+use agent::state::AgentState;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::settings::Config;
-use agent::state::AgentState;
-use agent::r#loop::run_agent_loop;
 use llm::client::LlmClient;
-use llm::router::{LlmRouter, DEFAULT_PROVIDER};
-use llm::model_resolver;
 use llm::infer::engine::InferenceEngine;
 use llm::infer::gguf::GgufReader;
 use llm::infer::model::Model;
 use llm::infer::tokenizer::Tokenizer;
+use llm::model_resolver;
+use llm::router::{LlmRouter, DEFAULT_PROVIDER};
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use anyhow::Result;
 
 #[derive(Parser)]
-#[command(name = "slowcode", about = "Local coding agent — TinyCoder + llm-on-legacy-gpus fusion")]
+#[command(
+    name = "slowcode",
+    about = "Local coding agent — TinyCoder + llm-on-legacy-gpus fusion"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -50,7 +54,7 @@ struct Cli {
     /// Use a cloud provider (OpenAI-compatible, e.g. NVIDIA NIM) for inference
     #[arg(long)]
     cloud: bool,
-    /// Cloud provider id (default: ollama-cloud — Ollama Cloud)
+    /// Cloud provider id (default: nvidia — NVIDIA NIM)
     #[arg(long, default_value = DEFAULT_PROVIDER)]
     provider: String,
     /// Cloud model id for inference (overrides planner/coder/summarizer defaults)
@@ -113,9 +117,7 @@ enum ProvidersAction {
         base: Option<String>,
     },
     /// Remove a provider's API key and config
-    Remove {
-        provider: String,
-    },
+    Remove { provider: String },
     /// Enable or disable a provider without removing its key
     Enable {
         provider: String,
@@ -123,16 +125,14 @@ enum ProvidersAction {
         enabled: bool,
     },
     /// Test connectivity and API key validity for a provider
-    Test {
-        provider: String,
-    },
+    Test { provider: String },
     /// Import API keys from environment variables (reads models.dev env var names)
     Import,
 }
 
 /// Default model for cloud inference.  Plain-name providers (Ollama Cloud)
 /// use their own default; provider-qualified ids like NVIDIA's use `nvidia/…`.
-const DEFAULT_CLOUD_MODEL: &str = "nvidia/llama-3.3-nemotron-super-49b-v1.5";
+const DEFAULT_CLOUD_MODEL: &str = "z-ai/glm-5.2";
 const OLLAMA_CLOUD_DEFAULT_MODEL: &str = "nemotron-3-nano:30b";
 
 /// Build the LLM router: a local backend (Ollama or local GGUF) plus, when
@@ -162,7 +162,9 @@ async fn build_router(cli: &Cli, cfg: &mut Config) -> Result<LlmRouter> {
 
     if cli.cloud {
         let base = router.set_provider(&cli.provider)?;
-        let model = cli.cloud_model.clone()
+        let model = cli
+            .cloud_model
+            .clone()
             .or_else(|| std::env::var("CLOUD_MODEL").ok())
             .unwrap_or_else(|| {
                 if cli.provider == "ollama-cloud" {
@@ -171,13 +173,22 @@ async fn build_router(cli: &Cli, cfg: &mut Config) -> Result<LlmRouter> {
                     DEFAULT_CLOUD_MODEL.to_string()
                 }
             });
-        cfg.planner_model = std::env::var("PLANNER_MODEL").ok().unwrap_or_else(|| model.clone());
-        cfg.coder_model = std::env::var("CODER_MODEL").ok().unwrap_or_else(|| model.clone());
-        cfg.summarizer_model = std::env::var("SUMMARIZER_MODEL").ok().unwrap_or_else(|| model.clone());
+        cfg.planner_model = std::env::var("PLANNER_MODEL")
+            .ok()
+            .unwrap_or_else(|| model.clone());
+        cfg.coder_model = std::env::var("CODER_MODEL")
+            .ok()
+            .unwrap_or_else(|| model.clone());
+        cfg.summarizer_model = std::env::var("SUMMARIZER_MODEL")
+            .ok()
+            .unwrap_or_else(|| model.clone());
         // Plain-name cloud models (e.g. Ollama Cloud) have no `/` prefix, so
         // mark them explicitly so the router sends them to the cloud backend.
         router.mark_cloud(&model);
-        println!("Cloud inference: provider='{}' base={} model={}", cli.provider, base, model);
+        println!(
+            "Cloud inference: provider='{}' base={} model={}",
+            cli.provider, base, model
+        );
     }
     Ok(router)
 }
@@ -203,40 +214,49 @@ async fn main() -> Result<()> {
         Some(Commands::Cloud { query }) => {
             let catalog = models_dev::ModelsDevClient::load();
             catalog.print_list(&query);
-        },
+        }
         Some(Commands::Providers { action }) => {
             handle_providers(action).await?;
-        },
-        Some(Commands::Bench { category, output, cloud }) => {
+        }
+        Some(Commands::Bench {
+            category,
+            output,
+            cloud,
+        }) => {
             let results = bench::model_bench::rank_models(&state.config.models_dir, &category);
             bench::model_bench::save_ranking(&results, std::path::Path::new(&output))?;
             bench::display::show_ranking_table(&results)?;
             if cloud {
-                let cloud_results = bench::model_bench::rank_cloud_models(&get_cloud_models()).await;
+                let cloud_results =
+                    bench::model_bench::rank_cloud_models(&get_cloud_models()).await;
                 bench::model_bench::save_ranking(&cloud_results, std::path::Path::new(&output))?;
                 bench::display::show_ranking_table(&cloud_results)?;
             }
-        },
+        }
         Some(Commands::Models) => {
             let models = model_resolver::list_models(&state.config.models_dir);
             if models.is_empty() {
                 println!("No models found in {}", state.config.models_dir.display());
             } else {
                 println!("Available models:");
-                for m in models { println!("  {}", m); }
+                for m in models {
+                    println!("  {}", m);
+                }
             }
-        },
+        }
         Some(Commands::Tui) => {
             ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        },
+        }
         Some(Commands::Repl) => {
             repl(&client, &mut state).await?;
         }
         None => {
             if let Some(task) = cli.task {
                 run_agent_loop(&client, &mut state, &task).await;
-            } else {
+            } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 ui::run_ui(client, state).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            } else {
+                anyhow::bail!("no task or subcommand supplied; use --help for usage");
             }
         }
     }
@@ -245,17 +265,27 @@ async fn main() -> Result<()> {
 
 async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
     use std::io::Write;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     loop {
-        let prompt = match state.caveman {
-            compressor::caveman::CavemanLevel::Off => "\n[you] ",
-            _ => "\n🪨 ",
-        };
-        print!("{}", prompt);
-        std::io::stdout().flush()?;
+        if interactive {
+            let prompt = match state.caveman {
+                compressor::caveman::CavemanLevel::Off => "\n[you] ",
+                _ => "\n🪨 ",
+            };
+            print!("{}", prompt);
+            std::io::stdout().flush()?;
+        }
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
+        if std::io::stdin().read_line(&mut input)? == 0 {
+            if interactive {
+                println!();
+            }
+            break;
+        }
         let input = input.trim();
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
 
         if input.starts_with("/caveman") {
             let rest = input.trim_start_matches("/caveman").trim();
@@ -278,14 +308,20 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
                 println!("  Sessions:  this session only");
                 println!("  Tip:       run /caveman [lite|full|ultra|off]");
             } else {
-                println!("Unknown caveman level: '{}'. Use: lite, full, ultra, off, stats", rest);
+                println!(
+                    "Unknown caveman level: '{}'. Use: lite, full, ultra, off, stats",
+                    rest
+                );
             }
             continue;
         }
 
         match input {
             "/exit" | "/quit" => break,
-            "/reset" => { state.reset(); println!("Session reset."); }
+            "/reset" => {
+                state.reset();
+                println!("Session reset.");
+            }
             "/help" => {
                 println!("  /help        Help");
                 println!("  /reset       Reset session");
@@ -302,7 +338,9 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
                     println!("  No models found in {}", state.config.models_dir.display());
                 } else {
                     println!("  Available models:");
-                    for m in models { println!("    {}", m); }
+                    for m in models {
+                        println!("    {}", m);
+                    }
                 }
             }
             _ => run_agent_loop(client, state, input).await,
@@ -349,7 +387,10 @@ async fn hw_check() -> Result<()> {
     for cat in &["coding", "reasoning", "chat"] {
         let recs = hw_recommend::recommender::recommend(&hw, cat);
         if let Some(top) = recs.first() {
-            println!("  Best for {:>10}: {:<30} ({:.1})", cat, top.model.name, top.score.total);
+            println!(
+                "  Best for {:>10}: {:<30} ({:.1})",
+                cat, top.model.name, top.score.total
+            );
         }
     }
     Ok(())
@@ -359,17 +400,53 @@ async fn hw_check() -> Result<()> {
 fn get_cloud_models() -> Vec<(String, String, String, String, f64)> {
     let api_key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
     vec![
-        ("nvidia/nvidia-nemotron-nano-9b-v2".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 40.0),
-        ("deepseek-ai/deepseek-v4-flash".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 20.0),
-        ("nvidia/llama-3.3-nemotron-super-49b-v1.5".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 20.0),
-        ("minimaxai/minimax-m3".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 10.0),
-        ("z-ai/glm-5.2".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 10.0),
-        ("deepseek-ai/deepseek-v4-pro".into(), "nvidia".into(), api_key.clone(), "https://integrate.api.nvidia.com".into(), 5.0),
+        (
+            "nvidia/nvidia-nemotron-nano-9b-v2".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            40.0,
+        ),
+        (
+            "deepseek-ai/deepseek-v4-flash".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            20.0,
+        ),
+        (
+            "nvidia/llama-3.3-nemotron-super-49b-v1.5".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            20.0,
+        ),
+        (
+            "minimaxai/minimax-m3".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            10.0,
+        ),
+        (
+            "z-ai/glm-5.2".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            10.0,
+        ),
+        (
+            "deepseek-ai/deepseek-v4-pro".into(),
+            "nvidia".into(),
+            api_key.clone(),
+            "https://integrate.api.nvidia.com".into(),
+            5.0,
+        ),
     ]
 }
 
 async fn handle_providers(action: ProvidersAction) -> Result<()> {
-    use providers::{ProviderStore, print_store, test_provider};
+    use providers::{print_store, test_provider, ProviderEntry, ProviderStore};
     let catalog_client = tokio::task::spawn_blocking(models_dev::ModelsDevClient::load).await?;
     let catalog = &catalog_client.catalog;
 
@@ -379,7 +456,10 @@ async fn handle_providers(action: ProvidersAction) -> Result<()> {
             ids.sort();
             println!("\n  Available providers from models.dev catalog");
             println!("{}", "─".repeat(80));
-            println!("  {:<20} {:<40} {:<15}", "Provider ID", "API base", "Env var");
+            println!(
+                "  {:<20} {:<40} {:<15}",
+                "Provider ID", "API base", "Env var"
+            );
             println!("{}", "─".repeat(80));
             for id in ids {
                 let p = &catalog[id];
@@ -392,7 +472,11 @@ async fn handle_providers(action: ProvidersAction) -> Result<()> {
             let store = ProviderStore::load();
             print_store(&store, catalog);
         }
-        ProvidersAction::Set { provider, api_key, base } => {
+        ProvidersAction::Set {
+            provider,
+            api_key,
+            base,
+        } => {
             let key = match api_key {
                 Some(k) => k,
                 None => {
@@ -410,7 +494,11 @@ async fn handle_providers(action: ProvidersAction) -> Result<()> {
                 store.set_base(&provider, &b);
             }
             store.save()?;
-            println!("  ✓ API key saved for '{}' ({})", provider, ProviderStore::config_path_display());
+            println!(
+                "  ✓ API key saved for '{}' ({})",
+                provider,
+                ProviderStore::config_path_display()
+            );
         }
         ProvidersAction::Remove { provider } => {
             let mut store = ProviderStore::load();
@@ -422,41 +510,45 @@ async fn handle_providers(action: ProvidersAction) -> Result<()> {
             let mut store = ProviderStore::load();
             store.set_enabled(&provider, enabled);
             store.save()?;
-            println!("  ✓ '{}' is now {}", provider, if enabled { "enabled" } else { "disabled" });
+            println!(
+                "  ✓ '{}' is now {}",
+                provider,
+                if enabled { "enabled" } else { "disabled" }
+            );
         }
         ProvidersAction::Test { provider } => {
-            let mut store = ProviderStore::load();
-            let entry = store.providers.entry(provider.clone()).or_default();
-            // fill api_base from catalog if not set
-            if entry.api_base.is_none() {
-                if let Some(prov) = catalog.get(&provider) {
-                    if !prov.api.is_empty() {
-                        entry.api_base = Some(prov.api.clone());
-                    }
-                }
-            }
-            let entry = entry.clone();
             print!("  Testing '{}' ... ", provider);
             std::io::Write::flush(&mut std::io::stdout()).ok();
-            match test_provider(&provider, &entry) {
-                Ok(msg) => println!("✓ {msg}"),
-                Err(e)  => println!("✗ {e}"),
+
+            match ProviderStore::resolve_cloud_credentials(&provider, catalog) {
+                Ok((base, api_key)) => {
+                    let entry = ProviderEntry {
+                        api_key: Some(api_key),
+                        api_base: Some(base),
+                        enabled: true,
+                    };
+                    match test_provider(&provider, &entry).await {
+                        Ok(msg) => println!("✓ {msg}"),
+                        Err(e) => println!("✗ {e}"),
+                    }
+                }
+                Err(e) => println!("✗ {e}"),
             }
         }
-        ProvidersAction::Import => {
-            match ProviderStore::import_from_env(catalog) {
-                Ok(imported) if imported.is_empty() => {
-                    println!("  No new API keys found in environment.");
-                    println!("  Set env vars like OPENAI_API_KEY, GROQ_API_KEY, etc. before running.");
-                }
-                Ok(imported) => {
-                    println!("  ✓ Imported {} provider(s):", imported.len());
-                    for s in &imported { println!("    • {s}"); }
-                    println!("  Saved to: {}", ProviderStore::config_path_display());
-                }
-                Err(e) => eprintln!("  ✗ Import failed: {e}"),
+        ProvidersAction::Import => match ProviderStore::import_from_env(catalog) {
+            Ok(imported) if imported.is_empty() => {
+                println!("  No new API keys found in environment.");
+                println!("  Set env vars like OPENAI_API_KEY, GROQ_API_KEY, etc. before running.");
             }
-        }
+            Ok(imported) => {
+                println!("  ✓ Imported {} provider(s):", imported.len());
+                for s in &imported {
+                    println!("    • {s}");
+                }
+                println!("  Saved to: {}", ProviderStore::config_path_display());
+            }
+            Err(e) => eprintln!("  ✗ Import failed: {e}"),
+        },
     }
     Ok(())
 }

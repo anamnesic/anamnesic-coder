@@ -1,3 +1,8 @@
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -6,11 +11,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{
     error::Error,
     io,
@@ -18,12 +20,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
-use crate::agent::r#loop::{AgentEvent, AgentHooks};
-use crate::llm::router::{LlmRouter, DEFAULT_PROVIDER};
+use crate::agent::r#loop::{AgentEvent, AgentHooks, ApprovalDecision, ApprovalRequest};
 use crate::agent::state::AgentState;
+use crate::config::settings::ApprovalPolicy;
+use crate::llm::router::{LlmRouter, DEFAULT_PROVIDER};
 
 const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
@@ -31,9 +32,15 @@ const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
     ("/status", "Show model, provider, directory, context tokens"),
-    ("/model", "Select the active model (no arg = pick from list)"),
+    (
+        "/model",
+        "Select the active model (no arg = pick from list)",
+    ),
     ("/models", "List available models"),
-    ("/provider", "Select cloud model provider (no arg = pick from list)"),
+    (
+        "/provider",
+        "Select cloud model provider (no arg = pick from list)",
+    ),
     ("/reset", "Reset session"),
 ];
 
@@ -45,6 +52,14 @@ pub enum Focus {
     Editor,
 }
 
+/// Agent execution mode: Agent uses tool-use iteration (interactive),
+/// Plan generates a plan first then executes steps sequentially.
+#[derive(PartialEq, Clone, Copy)]
+pub enum AgentMode {
+    Agent,
+    Plan,
+}
+
 pub struct App {
     pub messages: Vec<(String, String)>, // (role, content)
     pub input: String,
@@ -53,6 +68,7 @@ pub struct App {
     pub sidebar_items: Vec<String>,
     pub sidebar_selected: usize,
     pub focus: Focus,
+    pub agent_mode: AgentMode,
     pub editor_file: Option<String>,
     pub editor_lines: Vec<String>,
     pub editor_row: usize,
@@ -81,6 +97,9 @@ pub struct App {
     pub provider_selector: bool,
     pub provider_items: Vec<String>,
     pub provider_selected: usize,
+    /// Pending approval prompt (`ask` policy): the worker blocks until the
+    /// user answers, but rendering and input keep running.
+    pub pending_approval: Option<ApprovalRequest>,
 }
 
 impl App {
@@ -93,6 +112,7 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_selected: 0,
             focus: Focus::Input,
+            agent_mode: AgentMode::Agent,
             editor_file: None,
             editor_lines: Vec::new(),
             editor_row: 0,
@@ -101,7 +121,8 @@ impl App {
             editor_scroll: 0,
             input_history: Vec::new(),
             history_index: None,
-            status: "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into(),
+            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · Esc quit"
+                .into(),
             scroll_offset: 0,
             follow: true,
             model: model.to_string(),
@@ -121,6 +142,7 @@ impl App {
             provider_selector: false,
             provider_items: Vec::new(),
             provider_selected: 0,
+            pending_approval: None,
         }
     }
 
@@ -134,15 +156,22 @@ impl App {
     }
 
     fn previous_input(&mut self) {
-        if self.input_history.is_empty() { return; }
-        let index = self.history_index.unwrap_or(self.input_history.len()).saturating_sub(1);
+        if self.input_history.is_empty() {
+            return;
+        }
+        let index = self
+            .history_index
+            .unwrap_or(self.input_history.len())
+            .saturating_sub(1);
         self.input = self.input_history[index].clone();
         self.cursor_position = self.input.len();
         self.history_index = Some(index);
     }
 
     fn next_input(&mut self) {
-        let Some(index) = self.history_index else { return; };
+        let Some(index) = self.history_index else {
+            return;
+        };
         if index + 1 < self.input_history.len() {
             self.input = self.input_history[index + 1].clone();
             self.cursor_position = self.input.len();
@@ -156,7 +185,12 @@ impl App {
 
 /// Handle TUI slash commands (e.g. /models). Returns true if the command was
 /// handled locally and should not be sent to the agent.
-fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmRouter) -> bool {
+fn handle_slash_command(
+    input: &str,
+    app: &mut App,
+    state: &Arc<Mutex<AgentState>>,
+    router: &LlmRouter,
+) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("");
     match cmd {
         "/models" => {
@@ -173,16 +207,27 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
                 .collect();
             let cloud = unique_model_ids(cloud);
             if local.is_empty() && cloud.is_empty() {
-                app.add_message("System", &format!("No models found in {} or for provider {} in the models.dev catalog.", dir.display(), provider));
+                app.add_message(
+                    "System",
+                    &format!(
+                        "No models found in {} or for provider {} in the models.dev catalog.",
+                        dir.display(),
+                        provider
+                    ),
+                );
             } else {
                 let mut out = String::from("Local models:");
-                if local.is_empty() { out.push_str(" (none)"); }
+                if local.is_empty() {
+                    out.push_str(" (none)");
+                }
                 for m in &local {
                     out.push_str("\n  ");
                     out.push_str(m);
                 }
                 out.push_str(&format!("\nCloud models ({provider}):"));
-                if cloud.is_empty() { out.push_str(" (none)"); }
+                if cloud.is_empty() {
+                    out.push_str(" (none)");
+                }
                 for m in &cloud {
                     out.push_str("\n  ");
                     out.push_str(m);
@@ -219,14 +264,16 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
                 .catalog
                 .iter()
                 .map(|(pid, p)| {
-                    let n = p.models.values()
+                    let n = p
+                        .models
+                        .values()
                         .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
                         .count();
                     (pid.clone(), p.name.clone(), n)
                 })
                 .filter(|(_, _, n)| *n > 0)
                 .collect();
-            provs.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            provs.sort_by_key(|item| item.1.to_lowercase());
             if !arg.is_empty() {
                 provs.retain(|(pid, name, _)| {
                     pid.to_lowercase().contains(&arg) || name.to_lowercase().contains(&arg)
@@ -242,7 +289,8 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
             } else if provs.len() == 1 && !arg.is_empty() {
                 set_active_provider(app, state, router, &provs[0].0);
             } else {
-                app.provider_items = provs.iter()
+                app.provider_items = provs
+                    .iter()
                     .map(|(pid, name, n)| format!("{} — {} ({n} models)", pid, name))
                     .collect();
                 app.provider_selected = app
@@ -277,7 +325,8 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
                         "System",
                         &format!("No models found in {}. models.dev catalog also empty (offline?). Use /model <name> to set one anyway.", dir.display()),
                     );
-                    app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
+                    app.status =
+                        "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
                 } else {
                     app.model_items = items;
                     app.model_selected = app
@@ -296,7 +345,10 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
             let cmds: Vec<&str> = SLASH_COMMANDS.iter().map(|(c, _)| *c).collect();
             app.add_message(
                 "System",
-                &format!("Commands: {}\nKeys: PgUp/PgDn scroll chat · Ctrl+L clear · Esc interrupt/quit", cmds.join(" · ")),
+                &format!(
+                    "Commands: {}\nKeys: PgUp/PgDn scroll chat · Ctrl+L clear · Esc interrupt/quit",
+                    cmds.join(" · ")
+                ),
             );
             true
         }
@@ -307,7 +359,10 @@ fn handle_slash_command(input: &str, app: &mut App, state: &Arc<Mutex<AgentState
 /// Dedupe a model id list while preserving order (used by the model pickers).
 fn unique_model_ids(items: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    items.into_iter().filter(|m| seen.insert(m.clone())).collect()
+    items
+        .into_iter()
+        .filter(|m| seen.insert(m.clone()))
+        .collect()
 }
 
 /// Set the active coder model for subsequent agent turns.  Strips the
@@ -340,19 +395,31 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
         st.config.summarizer_model = clean.clone();
     }
     app.model = clean.clone();
-    app.add_message("System", &format!("Model set to {clean}{}", if is_cloud { " (cloud)" } else { "" }));
+    app.add_message(
+        "System",
+        &format!(
+            "Model set to {clean}{}",
+            if is_cloud { " (cloud)" } else { "" }
+        ),
+    );
     app.status = format!("Ready · model: {clean} · Esc quit");
 }
 
 /// Set the active cloud provider: rebuilds the router's cloud backend using
 /// the models.dev catalog base URL + the configured/env API key.
-fn set_active_provider(app: &mut App, _state: &Arc<Mutex<AgentState>>, router: &LlmRouter, name: &str) {
+fn set_active_provider(
+    app: &mut App,
+    _state: &Arc<Mutex<AgentState>>,
+    router: &LlmRouter,
+    name: &str,
+) {
     match router.set_provider(name) {
         Ok(base) => {
             router.clear_cloud_marks();
             app.provider = name.to_string();
             app.add_message("System", &format!("Cloud provider set to {name} ({base})"));
-            app.status = format!("Ready · provider: {name} · run /models or /model to list its models");
+            app.status =
+                format!("Ready · provider: {name} · run /models or /model to list its models");
         }
         Err(e) => {
             app.add_message("Error", &format!("Provider {name} not configured: {e}"));
@@ -371,7 +438,11 @@ fn git_branch(dir: &std::path::Path) -> String {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
             let s = s.trim();
-            if s.is_empty() { "detached".into() } else { s.to_string() }
+            if s.is_empty() {
+                "detached".into()
+            } else {
+                s.to_string()
+            }
         }
         _ => "no git".into(),
     }
@@ -394,12 +465,15 @@ fn refresh_command_menu(app: &mut App) {
 }
 
 /// Submit a user input line: run slash commands locally or spawn the agent turn.
+#[allow(clippy::too_many_arguments)]
 fn run_input(
     app: &mut App,
     state: &Arc<Mutex<AgentState>>,
     client: &LlmRouter,
     interrupt: &Arc<AtomicBool>,
     agent_tx: &mpsc::Sender<AgentEvent>,
+    approval_tx: &mpsc::Sender<ApprovalRequest>,
+    approval_rx: &Arc<Mutex<mpsc::Receiver<ApprovalDecision>>>,
     start: &mut Instant,
     input: &str,
 ) {
@@ -421,17 +495,33 @@ fn run_input(
     let state_clone = Arc::clone(state);
     let interrupt_clone = Arc::clone(interrupt);
     let agent_tx_clone = agent_tx.clone();
+    let approval_tx_clone = approval_tx.clone();
+    let approval_rx_clone = Arc::clone(approval_rx);
+    let agent_mode = app.agent_mode;
     thread::spawn(move || {
         let hooks = AgentHooks {
             on_event: Some(Arc::new(move |ev| {
                 let _ = agent_tx_clone.send(ev);
+            })),
+            on_approval: Some(Arc::new(move |request| {
+                if approval_tx_clone.send(request).is_err() {
+                    return ApprovalDecision::Deny;
+                }
+                approval_rx_clone
+                    .lock()
+                    .map(|rx| rx.recv().unwrap_or(ApprovalDecision::Deny))
+                    .unwrap_or(ApprovalDecision::Deny)
             })),
             interrupt: Some(interrupt_clone),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut st = state_clone.lock().unwrap();
         rt.block_on(crate::agent::r#loop::run_agent_loop_with_hooks(
-            &client_clone, &mut st, &input_clone, &hooks,
+            &client_clone,
+            &mut st,
+            &input_clone,
+            &hooks,
+            agent_mode,
         ));
     });
     app.clear_input();
@@ -448,14 +538,24 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     // Create app and event channels
     let model_name = state.config.coder_model.clone();
     let caveman_tag = state.caveman.tag();
-    let mut initial_app = App::new(&model_name, if caveman_tag.is_empty() { "off" } else { caveman_tag });
+    let mut initial_app = App::new(
+        &model_name,
+        if caveman_tag.is_empty() {
+            "off"
+        } else {
+            caveman_tag
+        },
+    );
     initial_app.dir = state.config.workspace_dir.display().to_string();
     initial_app.git_branch = git_branch(&state.config.workspace_dir);
-    // Bring the default cloud provider online (e.g. ollama-cloud with
-    // OLLAMA_API_KEY from .env) so cloud models work without the --cloud flag.
+    // Bring the default cloud provider online (e.g. nvidia with
+    // NVIDIA_API_KEY from .env) so cloud models work without the --cloud flag.
     let provider_msg = match client.set_provider(&initial_app.provider) {
         Ok(base) => format!("Cloud provider ready: {} ({base})", initial_app.provider),
-        Err(e) => format!("Cloud provider {} not configured: {e}", initial_app.provider),
+        Err(e) => format!(
+            "Cloud provider {} not configured: {e}",
+            initial_app.provider
+        ),
     };
     initial_app.add_message("System", &provider_msg);
     for (role, content) in state.session.history() {
@@ -472,6 +572,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     let (tx, rx) = mpsc::channel();
     // Agent progress stream + interrupt flag (Esc while loading cancels the turn).
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>();
+    // Approval broker: worker → UI requests, UI → worker decisions.
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>();
+    let (decision_tx, decision_rx) = mpsc::channel::<ApprovalDecision>();
+    let decision_rx = Arc::new(Mutex::new(decision_rx));
     let interrupt = Arc::new(AtomicBool::new(false));
     let mut start = Instant::now();
 
@@ -480,7 +584,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
         let tx = tx.clone();
         loop {
             if let Ok(event) = event::read() {
-                if let Err(_) = tx.send(event) {
+                if tx.send(event).is_err() {
                     break;
                 }
             }
@@ -505,13 +609,38 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         let s: String = summary.chars().take(120).collect();
                         a.add_message("Tool", &format!("{name} — {s}"));
                     }
-                    AgentEvent::PlanStep { index, total, description } => {
+                    AgentEvent::PlanStep {
+                        index,
+                        total,
+                        description,
+                    } => {
                         a.add_message("Plan", &format!("[{index}/{total}] {description}"));
+                    }
+                    AgentEvent::FileChanged { path } => {
+                        a.add_message("File", &format!("changed {path}"));
+                    }
+                    AgentEvent::Verification {
+                        status,
+                        command,
+                        summary,
+                    } => {
+                        let command = command.unwrap_or_else(|| "auto-detect".into());
+                        a.add_message("Verify", &format!("[{status}] {command} — {summary}"));
                     }
                     AgentEvent::Done { message } => {
                         a.add_message("Assistant", &message);
                         a.loading = false;
-                        a.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
+                        a.status =
+                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit"
+                                .into();
+                    }
+                    AgentEvent::Transaction { action, summary } => {
+                        a.add_message("Workspace", &format!("[{action}] {summary}"));
+                    }
+                    AgentEvent::Failed { message } => {
+                        a.add_message("Error", &message);
+                        a.loading = false;
+                        a.status = "Failed · Enter to retry · Esc quit".into();
                     }
                     AgentEvent::Interrupted => {
                         a.add_message("System", "Turn interrupted by user.");
@@ -521,9 +650,15 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 }
             }
         }
+        // Surface any pending approval request from the worker.
+        if let Ok(request) = approval_rx.try_recv() {
+            let mut a = app.lock().unwrap();
+            a.status = format!("Approval required: {} · a/s/d", request.tool);
+            a.pending_approval = Some(request);
+        }
         // Refresh context budget + elapsed + spinner from shared state.
-        {
-            let st = state.lock().unwrap();
+        // Do not block rendering while the worker owns AgentState for a turn.
+        if let Ok(st) = state.try_lock() {
             let mut a = app.lock().unwrap();
             a.tokens = st.session.estimated_tokens();
         }
@@ -542,6 +677,29 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
         match rx.recv_timeout(Duration::from_millis(80)) {
             Ok(Event::Key(key)) => {
                 let mut guard = app.lock().unwrap();
+                // The approval modal owns input until the user decides.
+                if guard.pending_approval.is_some() {
+                    let decision = match key.code {
+                        KeyCode::Char('a') => Some(ApprovalDecision::AllowOnce),
+                        KeyCode::Char('s') => Some(ApprovalDecision::AllowSession),
+                        KeyCode::Char('d') | KeyCode::Esc => Some(ApprovalDecision::Deny),
+                        _ => None,
+                    };
+                    if let Some(decision) = decision {
+                        let request = guard.pending_approval.take();
+                        let label = match decision {
+                            ApprovalDecision::AllowOnce => "allowed once",
+                            ApprovalDecision::AllowSession => "allowed for session",
+                            ApprovalDecision::Deny => "denied",
+                        };
+                        if let Some(request) = request {
+                            guard.add_message("Approval", &format!("{} — {label}", request.tool));
+                        }
+                        guard.status = "Working… (Esc to interrupt)".into();
+                        let _ = decision_tx.send(decision);
+                    }
+                    continue;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
                     guard.messages.clear();
                     guard.status = "Chat cleared (session memory is preserved).".into();
@@ -576,7 +734,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                         KeyCode::Enter => {
                             if guard.command_menu {
-                                let sel = guard.command_selected.min(guard.command_items.len().saturating_sub(1));
+                                let sel = guard
+                                    .command_selected
+                                    .min(guard.command_items.len().saturating_sub(1));
                                 let text = guard
                                     .command_items
                                     .get(sel)
@@ -584,7 +744,17 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     .unwrap_or_else(|| guard.input.trim().to_string());
                                 guard.command_menu = false;
                                 if !guard.loading {
-                                    run_input(&mut guard, &state, &client, &interrupt, &agent_tx, &mut start, &text);
+                                    run_input(
+                                        &mut guard,
+                                        &state,
+                                        &client,
+                                        &interrupt,
+                                        &agent_tx,
+                                        &approval_tx,
+                                        &decision_rx,
+                                        &mut start,
+                                        &text,
+                                    );
                                 }
                             } else if guard.model_selector {
                                 let name = guard
@@ -627,7 +797,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::PageDown => {
                         guard.scroll_offset = guard.scroll_offset.saturating_sub(10);
-                        if guard.scroll_offset == 0 { guard.follow = true; }
+                        if guard.scroll_offset == 0 {
+                            guard.follow = true;
+                        }
                     }
                     KeyCode::Home => {
                         guard.scroll_offset = 0;
@@ -637,33 +809,65 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         guard.follow = true;
                     }
                     KeyCode::Tab => {
-                        guard.focus = match guard.focus {
-                            Focus::Sidebar => Focus::Messages,
-                            Focus::Messages => Focus::Input,
-                            Focus::Input => Focus::Sidebar,
-                            Focus::Editor => Focus::Input,
+                        guard.agent_mode = match guard.agent_mode {
+                            AgentMode::Agent => AgentMode::Plan,
+                            AgentMode::Plan => AgentMode::Agent,
                         };
+                        let mode_str = match guard.agent_mode {
+                            AgentMode::Agent => "agent (tool-use)",
+                            AgentMode::Plan => "plan (planner-first)",
+                        };
+                        guard.add_message("System", &format!("Mode switched to {}", mode_str));
+                        guard.status = format!(
+                            "Ready · mode: {} · Esc quit",
+                            match guard.agent_mode {
+                                AgentMode::Agent => "agent",
+                                AgentMode::Plan => "plan",
+                            }
+                        );
                     }
                     KeyCode::Up => {
                         if let Focus::Sidebar = guard.focus {
-                            if guard.sidebar_selected > 0 { guard.sidebar_selected -= 1; }
+                            if guard.sidebar_selected > 0 {
+                                guard.sidebar_selected -= 1;
+                            }
                         } else if guard.focus == Focus::Editor {
-                            if guard.editor_row > 0 { guard.editor_row -= 1; }
-                            let line_len = guard.editor_lines.get(guard.editor_row).map(|l| l.len()).unwrap_or(0);
-                            if guard.editor_col > line_len { guard.editor_col = line_len; }
+                            if guard.editor_row > 0 {
+                                guard.editor_row -= 1;
+                            }
+                            let line_len = guard
+                                .editor_lines
+                                .get(guard.editor_row)
+                                .map(|l| l.len())
+                                .unwrap_or(0);
+                            if guard.editor_col > line_len {
+                                guard.editor_col = line_len;
+                            }
                             // adjust scroll
-                            if guard.editor_row < guard.editor_scroll { guard.editor_scroll = guard.editor_row; }
+                            if guard.editor_row < guard.editor_scroll {
+                                guard.editor_scroll = guard.editor_row;
+                            }
                         } else if guard.focus == Focus::Input && !guard.loading {
                             guard.previous_input();
                         }
                     }
                     KeyCode::Down => {
                         if let Focus::Sidebar = guard.focus {
-                            if guard.sidebar_selected + 1 < guard.sidebar_items.len() { guard.sidebar_selected += 1; }
+                            if guard.sidebar_selected + 1 < guard.sidebar_items.len() {
+                                guard.sidebar_selected += 1;
+                            }
                         } else if guard.focus == Focus::Editor {
-                            if guard.editor_row + 1 < guard.editor_lines.len() { guard.editor_row += 1; }
-                            let line_len = guard.editor_lines.get(guard.editor_row).map(|l| l.len()).unwrap_or(0);
-                            if guard.editor_col > line_len { guard.editor_col = line_len; }
+                            if guard.editor_row + 1 < guard.editor_lines.len() {
+                                guard.editor_row += 1;
+                            }
+                            let line_len = guard
+                                .editor_lines
+                                .get(guard.editor_row)
+                                .map(|l| l.len())
+                                .unwrap_or(0);
+                            if guard.editor_col > line_len {
+                                guard.editor_col = line_len;
+                            }
                         } else if guard.focus == Focus::Input && !guard.loading {
                             guard.next_input();
                         }
@@ -671,21 +875,37 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     KeyCode::Enter => {
                         match guard.focus {
                             Focus::Input => {
-                                if guard.loading { continue; }
+                                if guard.loading {
+                                    continue;
+                                }
                                 let input = guard.input.trim().to_string();
                                 if !input.is_empty() {
                                     guard.command_menu = false;
-                                    run_input(&mut guard, &state, &client, &interrupt, &agent_tx, &mut start, &input);
+                                    run_input(
+                                        &mut guard,
+                                        &state,
+                                        &client,
+                                        &interrupt,
+                                        &agent_tx,
+                                        &approval_tx,
+                                        &decision_rx,
+                                        &mut start,
+                                        &input,
+                                    );
                                 }
                             }
                             Focus::Sidebar => {
-                                if let Some(fname) = guard.sidebar_items.get(guard.sidebar_selected) {
+                                if let Some(fname) = guard.sidebar_items.get(guard.sidebar_selected)
+                                {
                                     let st = state.lock().unwrap();
                                     if let Some(data) = st.files.read_file(fname) {
                                         // open editor with file contents
                                         guard.editor_file = Some(fname.clone());
-                                        guard.editor_lines = data.lines().map(|s| s.to_string()).collect();
-                                        if guard.editor_lines.is_empty() { guard.editor_lines.push(String::new()); }
+                                        guard.editor_lines =
+                                            data.lines().map(|s| s.to_string()).collect();
+                                        if guard.editor_lines.is_empty() {
+                                            guard.editor_lines.push(String::new());
+                                        }
                                         guard.editor_row = 0;
                                         guard.editor_col = guard.editor_lines[0].len();
                                         guard.editor_dirty = false;
@@ -703,7 +923,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     } else {
                                         String::new()
                                     };
-                                    let (left, right) = line.split_at(guard.editor_col.min(line.len()));
+                                    let (left, right) =
+                                        line.split_at(guard.editor_col.min(line.len()));
                                     let row = guard.editor_row;
                                     if row < guard.editor_lines.len() {
                                         guard.editor_lines[row] = left.to_string();
@@ -721,7 +942,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Char(c) => {
-                        if guard.loading { continue; }
+                        if guard.loading {
+                            continue;
+                        }
                         if guard.focus == Focus::Editor {
                             // insert char into editor at cursor
                             if guard.editor_row >= guard.editor_lines.len() {
@@ -745,7 +968,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Backspace => {
-                        if guard.loading { continue; }
+                        if guard.loading {
+                            continue;
+                        }
                         if guard.focus == Focus::Editor {
                             let row = guard.editor_row;
                             let col = guard.editor_col;
@@ -774,8 +999,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Left => {
                         if guard.focus == Focus::Editor {
-                            if guard.editor_col > 0 { guard.editor_col -= 1; }
-                            else if guard.editor_row > 0 {
+                            if guard.editor_col > 0 {
+                                guard.editor_col -= 1;
+                            } else if guard.editor_row > 0 {
                                 guard.editor_row -= 1;
                                 let row = guard.editor_row;
                                 guard.editor_col = guard.editor_lines[row].len();
@@ -789,8 +1015,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             let row = guard.editor_row;
                             if row < guard.editor_lines.len() {
                                 let len = guard.editor_lines[row].len();
-                                if guard.editor_col < len { guard.editor_col += 1; }
-                                else if row + 1 < guard.editor_lines.len() {
+                                if guard.editor_col < len {
+                                    guard.editor_col += 1;
+                                } else if row + 1 < guard.editor_lines.len() {
                                     guard.editor_row += 1;
                                     guard.editor_col = 0;
                                 }
@@ -820,13 +1047,28 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         if guard.focus == Focus::Editor {
                             if let Some(fname) = &guard.editor_file {
                                 let content = guard.editor_lines.join("\n");
-                                let st = state.lock().unwrap();
-                                match st.files.write_file(fname, &content) {
-                                    Ok(_) => {
-                                        guard.add_message("Info", "File saved");
-                                        guard.editor_dirty = false;
+                                let mut st = state.lock().unwrap();
+                                match st.config.write_tool_policy {
+                                    ApprovalPolicy::Deny => {
+                                        guard.add_message(
+                                            "Error",
+                                            "Save denied: write policy is set to deny",
+                                        );
                                     }
-                                    Err(e) => { guard.add_message("Error", &format!("Save failed: {}", e)); }
+                                    _ => match st.files.write_file(fname, &content) {
+                                        Ok(_) => {
+                                            let path = fname.clone();
+                                            st.mark_changed(path);
+                                            guard.add_message("Info", "File saved");
+                                            guard.editor_dirty = false;
+                                        }
+                                        Err(e) => {
+                                            guard.add_message(
+                                                "Error",
+                                                &format!("Save failed: {}", e),
+                                            );
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -851,28 +1093,49 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<(), Box<dyn Error>> {
+fn draw<B: ratatui::backend::Backend>(
+    f: &mut Terminal<B>,
+    app: &App,
+) -> Result<(), Box<dyn Error>> {
     f.draw(|f| {
         let size = f.area();
         let page = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ]
+                .as_ref(),
+            )
             .split(size);
         // Compact single-line header (modern harness style): title badge + context,
         // token counter right-aligned. No box — full-bleed like Claude Code/Codex.
         let header_w = size.width.saturating_sub(2) as usize;
         let left_txt = format!(
-            "  {}  ·  {}  ·  {}  ·  {}",
+            "  {}  ·  {}  ·  {}  ·  {}  ·  {}",
             truncate_str(&app.model, 22),
             app.caveman,
             truncate_str(&app.provider, 12),
             app.git_branch,
+            match app.agent_mode {
+                AgentMode::Agent => "agent",
+                AgentMode::Plan => "plan",
+            },
         );
         let right_txt = format!("ctx: {} tok ", app.tokens);
         let pad = header_w.saturating_sub(left_txt.chars().count() + right_txt.chars().count());
         let header = Paragraph::new(Line::from(vec![
-            Span::styled(" ANAMNESIC ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ANAMNESIC ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(left_txt, Style::default().fg(Color::DarkGray)),
             Span::styled(" ".repeat(pad), Style::default()),
             Span::styled(right_txt, Style::default().fg(Color::DarkGray)),
@@ -882,15 +1145,34 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
         // spinner + elapsed on the right while a turn is running.
         let status_left = format!(" {} · {}", truncate_str(&app.dir, 48), app.git_branch);
         let status_right = if app.loading {
-            format!(" {} {:<5}  (Esc interrupt) ", SPINNER[app.spinner_frame], format_elapsed(app.elapsed))
+            format!(
+                " {} {:<5}  (Esc interrupt) ",
+                SPINNER[app.spinner_frame],
+                format_elapsed(app.elapsed)
+            )
         } else {
             " Esc quit ".into()
         };
-        let status_pad = (size.width as usize).saturating_sub(status_left.chars().count() + status_right.chars().count());
+        let status_pad = (size.width as usize)
+            .saturating_sub(status_left.chars().count() + status_right.chars().count());
         let status = Paragraph::new(Line::from(vec![
-            Span::styled(status_left, Style::default().fg(if app.loading { Color::Yellow } else { Color::DarkGray })),
+            Span::styled(
+                status_left,
+                Style::default().fg(if app.loading {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            ),
             Span::styled(" ".repeat(status_pad), Style::default()),
-            Span::styled(status_right, Style::default().fg(if app.loading { Color::Yellow } else { Color::DarkGray })),
+            Span::styled(
+                status_right,
+                Style::default().fg(if app.loading {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            ),
         ]));
         f.render_widget(status, page[3]);
 
@@ -906,7 +1188,11 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
             .map(|s| ListItem::new(Span::raw(s.clone())))
             .collect();
         let sidebar = List::new(sidebar_items)
-            .block(Block::default().title(" Workspace files ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Workspace files ")
+                    .borders(Borders::ALL),
+            )
             .highlight_style(Style::default().bg(Color::DarkGray))
             .highlight_symbol("▶ ");
         let mut list_state = ratatui::widgets::ListState::default();
@@ -917,18 +1203,27 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
 
         // Right column: messages or editor (full height — input lives at the bottom bar).
         if app.editor_file.is_some() {
-            let title = format!("Editor - {}{}", app.editor_file.as_ref().unwrap(), if app.editor_dirty { " *" } else { "" });
+            let title = format!(
+                "Editor - {}{}",
+                app.editor_file.as_ref().unwrap(),
+                if app.editor_dirty { " *" } else { "" }
+            );
             // compute visible lines based on scroll and area height
             let area_height = cols[1].height as usize - 2; // leave room for borders
             let total_lines = app.editor_lines.len();
             let scroll = if app.editor_scroll + area_height > total_lines {
-                if total_lines > area_height { total_lines - area_height } else { 0 }
+                if total_lines > area_height {
+                    total_lines - area_height
+                } else {
+                    0
+                }
             } else {
                 app.editor_scroll
             };
             let end = std::cmp::min(scroll + area_height, total_lines);
             let visible = app.editor_lines[scroll..end].join("\n");
-            let editor = Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
+            let editor =
+                Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(editor, cols[1]);
             // set cursor in editor area relative to scroll
             let r = (app.editor_row.saturating_sub(scroll)) as u16;
@@ -955,8 +1250,24 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
         // Input bar: bare prompt at the bottom (modern harness style, no box).
         let prompt = if app.loading { "▍" } else { "❯" };
         let input_line = Line::from(vec![
-            Span::styled(format!("{prompt} "), Style::default().fg(if app.loading { Color::DarkGray } else { Color::Green }).add_modifier(Modifier::BOLD)),
-            Span::styled(app.input.clone(), Style::default().fg(if app.loading { Color::Gray } else { Color::White })),
+            Span::styled(
+                format!("{prompt} "),
+                Style::default()
+                    .fg(if app.loading {
+                        Color::DarkGray
+                    } else {
+                        Color::Green
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.input.clone(),
+                Style::default().fg(if app.loading {
+                    Color::Gray
+                } else {
+                    Color::White
+                }),
+            ),
         ]);
         let input = Paragraph::new(input_line).wrap(Wrap { trim: true });
         f.render_widget(input, page[2]);
@@ -973,7 +1284,12 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
                     .iter()
                     .map(|(cmd, desc)| {
                         ListItem::new(Line::from(vec![
-                            Span::styled(cmd.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                cmd.clone(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                             Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
                         ]))
                     })
@@ -984,24 +1300,44 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
                 let items = app
                     .model_items
                     .iter()
-                    .map(|m| ListItem::new(Span::styled(m.clone(), Style::default().fg(Color::Cyan))))
+                    .map(|m| {
+                        ListItem::new(Span::styled(m.clone(), Style::default().fg(Color::Cyan)))
+                    })
                     .collect::<Vec<_>>();
                 let selected = app.model_selected.min(items.len().saturating_sub(1));
-                (items, " Select model — ↑/↓ · Enter set · Esc cancel ".to_string(), selected)
+                (
+                    items,
+                    " Select model — ↑/↓ · Enter set · Esc cancel ".to_string(),
+                    selected,
+                )
             } else {
                 let items = app
                     .provider_items
                     .iter()
-                    .map(|p| ListItem::new(Span::styled(p.clone(), Style::default().fg(Color::LightBlue))))
+                    .map(|p| {
+                        ListItem::new(Span::styled(
+                            p.clone(),
+                            Style::default().fg(Color::LightBlue),
+                        ))
+                    })
                     .collect::<Vec<_>>();
                 let selected = app.provider_selected.min(items.len().saturating_sub(1));
-                (items, " Select provider — ↑/↓ · Enter set · Esc cancel ".to_string(), selected)
+                (
+                    items,
+                    " Select provider — ↑/↓ · Enter set · Esc cancel ".to_string(),
+                    selected,
+                )
             };
             let popup_w = 64.min(size.width.saturating_sub(4));
             let popup_h = (items.len() as u16 + 2).min(size.height.saturating_sub(4));
             let x = size.x + (size.width.saturating_sub(popup_w)) / 2;
             let y = size.y + (size.height.saturating_sub(popup_h)) / 3;
-            let area = Rect { x, y, width: popup_w, height: popup_h };
+            let area = Rect {
+                x,
+                y,
+                width: popup_w,
+                height: popup_h,
+            };
             let mut list_state = ratatui::widgets::ListState::default();
             list_state.select(Some(selected));
             let list = List::new(items)
@@ -1009,6 +1345,43 @@ fn draw<B: ratatui::backend::Backend>(f: &mut Terminal<B>, app: &App) -> Result<
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
+        }
+
+        // Approval modal (write/command policy set to `ask`).
+        if let Some(request) = &app.pending_approval {
+            let popup_w = 72.min(size.width.saturating_sub(4));
+            let popup_h = 8.min(size.height.saturating_sub(4));
+            let area = Rect {
+                x: size.x + (size.width.saturating_sub(popup_w)) / 2,
+                y: size.y + (size.height.saturating_sub(popup_h)) / 3,
+                width: popup_w,
+                height: popup_h,
+            };
+            let body = vec![
+                Line::from(Span::styled(
+                    request.tool.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::raw(request.summary.clone())),
+                Line::from(Span::styled(
+                    request.risk.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "a: allow once   s: allow for session   d/Esc: deny",
+                    Style::default().fg(Color::Cyan),
+                )),
+            ];
+            let paragraph = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .title(" Approval required ")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(paragraph, area);
         }
     })?;
     Ok(())
@@ -1081,13 +1454,11 @@ fn format_elapsed(d: Duration) -> String {
 
 fn enable_raw_mode() -> Result<(), Box<dyn Error>> {
     crossterm::terminal::enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     Ok(())
 }
 
 fn disable_raw_mode() -> Result<(), Box<dyn Error>> {
     crossterm::terminal::disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
@@ -1147,9 +1518,13 @@ mod tests {
         let base = std::env::temp_dir().join(format!("anamnesic-ui-{}", std::process::id()));
         cfg.workspace_dir = base.join("workspace");
         cfg.memory_dir = base.join("memory");
-        let state = Arc::new(Mutex::new(crate::agent::state::AgentState::new(cfg).unwrap()));
+        let state = Arc::new(Mutex::new(
+            crate::agent::state::AgentState::new(cfg).unwrap(),
+        ));
         let app = App::new(&state.lock().unwrap().config.coder_model, "off");
-        let router = LlmRouter::new(crate::llm::client::LlmClient::ollama("http://localhost:11434"));
+        let router = LlmRouter::new(crate::llm::client::LlmClient::ollama(
+            "http://localhost:11434",
+        ));
         (app, state, router)
     }
 

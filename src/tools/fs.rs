@@ -1,6 +1,25 @@
-use std::path::PathBuf;
-use std::path::Component;
 use std::fs;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Lexically normalize a path: collapse `.` and resolve `..` without touching the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
 
 pub struct FileTools {
     workspace: PathBuf,
@@ -37,6 +56,34 @@ mod tests {
         assert!(tools.write_file("/etc/passwd", "nope").is_err());
         assert!(tools.append_file("/etc/hosts", "nope").is_err());
         assert!(tools.read_file("/etc/hosts").is_none());
+    }
+
+    #[test]
+    fn allows_absolute_paths_within_workspace() {
+        let workspace = temp_workspace();
+        let tools = FileTools::new(workspace.clone());
+        let abs = workspace.join("sub/abs.txt");
+        tools
+            .write_file(abs.to_str().unwrap(), "via absolute\n")
+            .unwrap();
+        assert_eq!(tools.read_file("sub/abs.txt").unwrap(), "via absolute\n");
+        assert_eq!(
+            tools.read_file(abs.to_str().unwrap()).unwrap(),
+            "via absolute\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_outside_workspace() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("link")).ok();
+        let target = workspace.join("link").join("evil");
+        std::os::unix::fs::symlink(std::path::Path::new("/etc"), &target).unwrap();
+        let tools = FileTools::new(workspace.clone());
+        assert!(tools.read_file("link/evil/passwd").is_none());
+        assert!(tools.write_file("link/evil/newfile", "x").is_err());
+        assert!(!std::path::Path::new("/etc/newfile").exists());
     }
 
     #[test]
@@ -85,11 +132,41 @@ impl FileTools {
     }
 
     fn resolve(&self, path: &str) -> Option<PathBuf> {
-        let p = PathBuf::from(path);
-        if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+        let raw = PathBuf::from(path);
+        if raw.components().any(|c| matches!(c, Component::Prefix(_))) {
             return None;
         }
-        Some(self.workspace.join(p))
+        let joined = if raw.is_absolute() {
+            raw
+        } else {
+            self.workspace.join(raw)
+        };
+        let normalized = normalize(&joined);
+        let ws = self
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| normalize(&self.workspace));
+
+        let mut current = normalized.clone();
+        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+        while !current.exists() {
+            match current.parent() {
+                Some(parent) => {
+                    suffix.push(current.file_name()?.to_os_string());
+                    current = parent.to_path_buf();
+                }
+                None => return None,
+            }
+        }
+        let mut real = current.canonicalize().ok()?;
+        for part in suffix.iter().rev() {
+            real.push(part);
+        }
+        if real.starts_with(&ws) {
+            Some(real)
+        } else {
+            None
+        }
     }
 
     pub fn read_file(&self, path: &str) -> Option<String> {
@@ -98,16 +175,16 @@ impl FileTools {
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> anyhow::Result<()> {
-        let p = self.resolve(path).ok_or_else(|| anyhow::anyhow!("path must be relative to the workspace"))?;
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&p, content)?;
-        Ok(())
+        let p = self
+            .resolve(path)
+            .ok_or_else(|| anyhow::anyhow!("path must be inside the workspace"))?;
+        self.atomic_write(&p, content)
     }
 
     pub fn append_file(&self, path: &str, content: &str) -> anyhow::Result<()> {
-        let p = self.resolve(path).ok_or_else(|| anyhow::anyhow!("path must be relative to the workspace"))?;
+        let p = self
+            .resolve(path)
+            .ok_or_else(|| anyhow::anyhow!("path must be relative to the workspace"))?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -119,7 +196,11 @@ impl FileTools {
 
     pub fn list_files(&self, path: &str) -> Vec<String> {
         let mut files = Vec::new();
-        let Some(p) = (if path.is_empty() { Some(self.workspace.clone()) } else { self.resolve(path) }) else {
+        let Some(p) = (if path.is_empty() {
+            Some(self.workspace.clone())
+        } else {
+            self.resolve(path)
+        }) else {
             return files;
         };
         if let Ok(entries) = fs::read_dir(&p) {
@@ -131,6 +212,173 @@ impl FileTools {
                 }
             }
         }
+        files.sort();
         files
+    }
+
+    pub fn read_file_range(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> anyhow::Result<String> {
+        if start_line == 0 || end_line < start_line {
+            anyhow::bail!("line range must be 1-based and end_line >= start_line");
+        }
+        let content = self
+            .read_file(path)
+            .ok_or_else(|| anyhow::anyhow!("file not found or path is outside workspace"))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let selected = lines
+            .iter()
+            .enumerate()
+            .skip(start_line - 1)
+            .take(end_line - start_line + 1)
+            .map(|(index, line)| format!("{:>6}  {}", index + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(format!(
+            "[lines {}-{} of {}]\n{}",
+            start_line,
+            end_line.min(lines.len()),
+            lines.len(),
+            selected
+        ))
+    }
+
+    pub fn list_tree(
+        &self,
+        path: &str,
+        max_depth: usize,
+        max_entries: usize,
+    ) -> anyhow::Result<String> {
+        let root = if path.is_empty() {
+            self.workspace.clone()
+        } else {
+            self.resolve(path)
+                .ok_or_else(|| anyhow::anyhow!("path is outside workspace"))?
+        };
+        if !root.is_dir() {
+            anyhow::bail!("tree path is not a directory");
+        }
+        let mut pending = vec![(root, 0usize)];
+        let mut output = Vec::new();
+        while let Some((directory, depth)) = pending.pop() {
+            if depth > max_depth || output.len() >= max_entries {
+                continue;
+            }
+            let mut entries = fs::read_dir(&directory)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries.into_iter().rev() {
+                if output.len() >= max_entries {
+                    break;
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(&self.workspace)
+                    .unwrap_or(&entry.path())
+                    .to_string_lossy()
+                    .to_string();
+                if file_type.is_dir() {
+                    output.push(format!("{relative}/"));
+                    if depth < max_depth {
+                        pending.push((entry.path(), depth + 1));
+                    }
+                } else if file_type.is_file() {
+                    output.push(relative);
+                }
+            }
+        }
+        output.sort();
+        if output.len() >= max_entries {
+            output.push(format!("...[truncated at {max_entries} entries]"));
+        }
+        Ok(output.join("\n"))
+    }
+
+    pub fn replace_exact(&self, path: &str, old: &str, new: &str) -> anyhow::Result<()> {
+        if old.is_empty() {
+            anyhow::bail!("old text must not be empty");
+        }
+        let target = self
+            .resolve(path)
+            .ok_or_else(|| anyhow::anyhow!("path is outside workspace"))?;
+        let content = fs::read_to_string(&target)?;
+        let matches = content.match_indices(old).count();
+        if matches != 1 {
+            anyhow::bail!("expected exactly one match, found {matches}; file was not changed");
+        }
+        self.atomic_write(&target, &content.replacen(old, new, 1))
+    }
+
+    fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("file has no parent directory"))?;
+        fs::create_dir_all(parent)?;
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".anamnesic-{}-{counter}.tmp", std::process::id()));
+        fs::write(&temporary, content)?;
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transactional_tests {
+    use super::FileTools;
+    use std::fs;
+
+    fn workspace(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "anamnesic-fs-transaction-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn replace_exact_changes_one_match() {
+        let root = workspace("one");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("a.txt", "before unique after").unwrap();
+        tools.replace_exact("a.txt", "unique", "changed").unwrap();
+        assert_eq!(tools.read_file("a.txt").unwrap(), "before changed after");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replace_exact_leaves_stale_or_ambiguous_files_untouched() {
+        let root = workspace("conflict");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("a.txt", "same same").unwrap();
+        assert!(tools.replace_exact("a.txt", "missing", "x").is_err());
+        assert!(tools.replace_exact("a.txt", "same", "x").is_err());
+        assert_eq!(tools.read_file("a.txt").unwrap(), "same same");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ranged_read_and_tree_are_bounded() {
+        let root = workspace("discovery");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("src/lib.rs", "one\ntwo\nthree\n").unwrap();
+        let range = tools.read_file_range("src/lib.rs", 2, 3).unwrap();
+        assert!(range.contains("2  two"));
+        assert!(!range.contains("one"));
+        let tree = tools.list_tree("", 2, 20).unwrap();
+        assert!(tree.contains("src/lib.rs"));
+        let _ = fs::remove_dir_all(root);
     }
 }

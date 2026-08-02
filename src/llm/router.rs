@@ -1,11 +1,11 @@
+use crate::llm::client::{ChatCompletion, LlmClient, ResponseFormat, ToolChoice, ToolDef};
+use crate::models_dev::{base_id, ModelsDevClient};
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use anyhow::{Context, Result};
-use crate::llm::client::{LlmClient, ResponseFormat, ToolDef};
-use crate::models_dev::{ModelsDevClient, base_id};
 
 /// Default cloud provider id used when none is explicitly selected.
-pub const DEFAULT_PROVIDER: &str = "ollama-cloud";
+pub const DEFAULT_PROVIDER: &str = "nvidia";
 
 /// Runtime router between the local backend (Ollama / GGUF) and a lazily-built
 /// OpenAI-compatible cloud backend (NVIDIA NIM, Ollama Cloud, …).
@@ -33,6 +33,7 @@ pub struct LlmRouter {
     provider: Arc<Mutex<String>>,
     cloud_models: Arc<Mutex<HashSet<String>>>,
     catalog: Arc<ModelsDevClient>,
+    fallback_model: Arc<Mutex<Option<String>>>,
 }
 
 impl LlmRouter {
@@ -48,6 +49,7 @@ impl LlmRouter {
             provider: Arc::new(Mutex::new(DEFAULT_PROVIDER.to_string())),
             cloud_models: Arc::new(Mutex::new(HashSet::new())),
             catalog: Arc::new(catalog),
+            fallback_model: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -68,6 +70,13 @@ impl LlmRouter {
         .with_context(|| format!("configuring cloud provider '{provider}'"))?;
         *self.cloud.lock().unwrap() = Some(LlmClient::cloud(&base, &key));
         *self.provider.lock().unwrap() = provider.to_string();
+        self.fallback_model
+            .lock()
+            .unwrap()
+            .clone_from(&match provider {
+                "nvidia" => Some("deepseek-ai/deepseek-v4-flash".to_string()),
+                _ => None,
+            });
         Ok(base)
     }
 
@@ -89,6 +98,18 @@ impl LlmRouter {
     /// Clear all cloud model markings (e.g. after switching provider).
     pub fn clear_cloud_marks(&self) {
         self.cloud_models.lock().unwrap().clear();
+    }
+
+    /// Set a fallback model used when the primary model fails for any
+    /// reason (HTTP error, timeout, parse failure).  Pass `None` to
+    /// disable fallback.
+    pub fn set_fallback_model(&self, model: Option<String>) {
+        *self.fallback_model.lock().unwrap() = model;
+    }
+
+    /// Return the configured fallback model, if any.
+    pub fn fallback_model(&self) -> Option<String> {
+        self.fallback_model.lock().unwrap().clone()
     }
 
     /// Resolve a model id against the active provider: `(is_cloud, api_id)`.
@@ -140,7 +161,9 @@ impl LlmRouter {
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
         let (_, api_id) = self.resolve(model);
-        self.client_for(model)?.generate(&api_id, prompt, tools, response_format).await
+        self.client_for(model)?
+            .generate(&api_id, prompt, tools, response_format)
+            .await
     }
 
     pub async fn generate_with_retry(
@@ -156,6 +179,39 @@ impl LlmRouter {
             .await
     }
 
+    /// Try the primary model with retries; on any error, fall back to
+    /// the configured fallback model (if set) and retry once.
+    pub async fn generate_with_retry_with_fallback(
+        &self,
+        model: &str,
+        prompt: &str,
+        tools: Option<&Vec<ToolDef>>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<String> {
+        match self
+            .generate_with_retry(model, prompt, tools, response_format)
+            .await
+        {
+            Ok(text) => Ok(text),
+            Err(primary_err) => {
+                let fallback = self.fallback_model.lock().unwrap().clone();
+                let Some(fb_model) = fallback else {
+                    return Err(primary_err);
+                };
+                if fb_model == model {
+                    return Err(primary_err);
+                }
+                self.generate_with_retry(&fb_model, prompt, tools, response_format)
+                    .await
+                    .map_err(|fb_err| {
+                        anyhow::anyhow!(
+                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
+                        )
+                    })
+            }
+        }
+    }
+
     pub async fn chat(
         &self,
         model: &str,
@@ -163,8 +219,96 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
+        self.chat_meta(model, messages, tools, response_format)
+            .await
+            .map(|c| c.content)
+    }
+
+    pub async fn chat_meta(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<ChatCompletion> {
+        self.chat_meta_with_choice(model, messages, tools, None, response_format)
+            .await
+    }
+
+    /// Whether the catalog reports native tool calling for `model` under the
+    /// active provider. Unknown models are assumed capable so local/off-catalog
+    /// models keep working; the loop still validates the response.
+    pub fn supports_tool_calls(&self, model: &str) -> bool {
+        let provider = self.provider.lock().unwrap().clone();
+        let base = base_id(model);
+        if let Some(catalog_provider) = self.catalog.catalog.get(&provider) {
+            for (id, info) in catalog_provider.models.iter() {
+                if id == model || base_id(id) == base {
+                    return info.tool_call;
+                }
+            }
+        }
+        true
+    }
+
+    /// Chat with explicit `tool_choice`. Tools are dropped when the resolved
+    /// model has no tool-calling capability, so an incapable model never
+    /// receives a tool schema it cannot honor.
+    pub async fn chat_meta_with_choice(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<ChatCompletion> {
         let (_, api_id) = self.resolve(model);
-        self.client_for(model)?.chat(&api_id, messages, tools, response_format).await
+        let capable = self.supports_tool_calls(model);
+        let tools = if capable { tools } else { None };
+        let tool_choice = if capable && tools.is_some() {
+            tool_choice
+        } else {
+            None
+        };
+        self.client_for(model)?
+            .chat_meta(&api_id, messages, tools, tool_choice, response_format)
+            .await
+    }
+
+    /// Try the primary model; on any error, automatically fall back to
+    /// the configured fallback model (if set) and retry once.
+    pub async fn chat_meta_with_fallback(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<ChatCompletion> {
+        match self
+            .chat_meta_with_choice(model, messages.clone(), tools, tool_choice, response_format)
+            .await
+        {
+            Ok(completion) => Ok(completion),
+            Err(primary_err) => {
+                let fallback = self.fallback_model.lock().unwrap().clone();
+                let Some(fb_model) = fallback else {
+                    return Err(primary_err);
+                };
+                if fb_model == model {
+                    return Err(primary_err);
+                }
+                // The fallback model may not support tools; capability
+                // filtering is re-applied for its own id.
+                self.chat_meta_with_choice(&fb_model, messages, tools, tool_choice, response_format)
+                    .await
+                    .map_err(|fb_err| {
+                        anyhow::anyhow!(
+                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
+                        )
+                    })
+            }
+        }
     }
 
     pub async fn stream(
@@ -176,14 +320,16 @@ impl LlmRouter {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let (_, api_id) = self.resolve(model);
-        self.client_for(model)?.stream(&api_id, prompt, tools, response_format, on_token).await
+        self.client_for(model)?
+            .stream(&api_id, prompt, tools, response_format, on_token)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models_dev::types::{Catalog, Cost, Limits, ModelInfo, Modalities, Provider};
+    use crate::models_dev::types::{Catalog, Cost, Limits, Modalities, ModelInfo, Provider};
 
     fn model(id: &str, tool: bool) -> ModelInfo {
         ModelInfo {
@@ -195,9 +341,20 @@ mod tests {
             temperature: false,
             open_weights: true,
             attachment: false,
-            limit: Limits { context: 131_072, output: 4096 },
-            cost: Cost { input: 0.0, output: 0.0, cache_read: None, cache_write: None },
-            modalities: Modalities { input: vec!["text".into()], output: vec!["text".into()] },
+            limit: Limits {
+                context: 131_072,
+                output: 4096,
+            },
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: None,
+                cache_write: None,
+            },
+            modalities: Modalities {
+                input: vec!["text".into()],
+                output: vec!["text".into()],
+            },
             knowledge: None,
             release_date: None,
         }
@@ -217,27 +374,49 @@ mod tests {
 
     fn test_catalog() -> Catalog {
         let mut catalog = Catalog::new();
-        catalog.insert("ollama-cloud".into(), provider("ollama-cloud", vec![
-            model("glm-5.2", true),
-            model("nemotron-3-nano:30b", true),
-        ]));
-        catalog.insert("nvidia".into(), provider("nvidia", vec![
-            model("z-ai/glm-5.2", true),
-        ]));
+        catalog.insert(
+            "ollama-cloud".into(),
+            provider(
+                "ollama-cloud",
+                vec![model("glm-5.2", true), model("nemotron-3-nano:30b", true)],
+            ),
+        );
+        catalog.insert(
+            "nvidia".into(),
+            provider(
+                "nvidia",
+                vec![
+                    model("z-ai/glm-5.2", true),
+                    model("legacy/no-tools-7b", false),
+                ],
+            ),
+        );
         catalog
     }
 
     fn router() -> LlmRouter {
         LlmRouter::with_catalog(
             LlmClient::ollama("http://localhost:11434"),
-            ModelsDevClient { catalog: test_catalog() },
+            ModelsDevClient {
+                catalog: test_catalog(),
+            },
         )
     }
 
     #[test]
-    fn defaults_to_ollama_cloud_provider() {
-        assert_eq!(router().provider(), "ollama-cloud");
+    fn defaults_to_nvidia_provider() {
+        assert_eq!(router().provider(), "nvidia");
         assert!(!router().cloud_configured());
+    }
+
+    #[test]
+    fn capability_lookup_reflects_the_active_provider_catalog() {
+        let router = router();
+        assert!(router.supports_tool_calls("z-ai/glm-5.2"));
+        assert!(router.supports_tool_calls("glm-5.2"));
+        assert!(!router.supports_tool_calls("legacy/no-tools-7b"));
+        // Unknown/local models stay usable; the loop validates their replies.
+        assert!(router.supports_tool_calls("qwen3:1.7b"));
     }
 
     #[test]
@@ -251,12 +430,12 @@ mod tests {
     #[test]
     fn single_model_resolves_per_active_provider() {
         let r = router();
-        // Default provider is ollama-cloud, which serves glm-5.2 as "glm-5.2".
-        assert_eq!(r.resolve("glm-5.2"), (true, "glm-5.2".to_string()));
-        // Switch to NVIDIA NIM: same base model, provider-specific id.
-        *r.provider.lock().unwrap() = "nvidia".to_string();
+        // Default provider is nvidia, which serves glm-5.2 as "z-ai/glm-5.2".
         assert_eq!(r.resolve("glm-5.2"), (true, "z-ai/glm-5.2".to_string()));
-        assert_eq!(r.resolve("z-ai/glm-5.2"), (true, "z-ai/glm-5.2".to_string()));
+        // Switch to Ollama Cloud: same base model, provider-specific id.
+        *r.provider.lock().unwrap() = "ollama-cloud".to_string();
+        assert_eq!(r.resolve("glm-5.2"), (true, "glm-5.2".to_string()));
+        assert_eq!(r.resolve("z-ai/glm-5.2"), (true, "glm-5.2".to_string()));
         // A model the provider does not serve stays local.
         assert_eq!(r.resolve("qwen3:1.7b"), (false, "qwen3:1.7b".to_string()));
     }
