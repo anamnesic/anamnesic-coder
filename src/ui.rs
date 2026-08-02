@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -121,7 +121,7 @@ impl App {
             editor_scroll: 0,
             input_history: Vec::new(),
             history_index: None,
-            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · Esc quit"
+            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit"
                 .into(),
             scroll_offset: 0,
             follow: true,
@@ -234,14 +234,14 @@ fn handle_slash_command(
                 }
                 app.add_message("System", &out);
             }
-            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
+            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
             true
         }
         "/reset" => {
             state.lock().unwrap().reset();
             app.messages.clear();
             app.add_message("System", "Session reset.");
-            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
+            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
             true
         }
         "/status" => {
@@ -326,7 +326,7 @@ fn handle_slash_command(
                         &format!("No models found in {}. models.dev catalog also empty (offline?). Use /model <name> to set one anyway.", dir.display()),
                     );
                     app.status =
-                        "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit".into();
+                        "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
                 } else {
                     app.model_items = items;
                     app.model_selected = app
@@ -346,7 +346,7 @@ fn handle_slash_command(
             app.add_message(
                 "System",
                 &format!(
-                    "Commands: {}\nKeys: PgUp/PgDn scroll chat · Ctrl+L clear · Esc interrupt/quit",
+                    "Commands: {}\nKeys: PgUp/PgDn scroll · ↑/↓ 3-line scroll · mouse wheel · Ctrl+L clear · Esc interrupt/quit",
                     cmds.join(" · ")
                 ),
             );
@@ -395,6 +395,7 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
         st.config.summarizer_model = clean.clone();
     }
     app.model = clean.clone();
+    router.set_model(&clean);
     app.add_message(
         "System",
         &format!(
@@ -631,7 +632,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.add_message("Assistant", &message);
                         a.loading = false;
                         a.status =
-                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · Esc quit"
+                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit"
                                 .into();
                     }
                     AgentEvent::Transaction { action, summary } => {
@@ -792,14 +793,11 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 }
                 match key.code {
                     KeyCode::PageUp => {
-                        guard.scroll_offset += 10;
+                        guard.scroll_offset = guard.scroll_offset.saturating_sub(10);
                         guard.follow = false;
                     }
                     KeyCode::PageDown => {
-                        guard.scroll_offset = guard.scroll_offset.saturating_sub(10);
-                        if guard.scroll_offset == 0 {
-                            guard.follow = true;
-                        }
+                        guard.scroll_offset += 10;
                     }
                     KeyCode::Home => {
                         guard.scroll_offset = 0;
@@ -849,6 +847,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             }
                         } else if guard.focus == Focus::Input && !guard.loading {
                             guard.previous_input();
+                        } else if !guard.loading {
+                            guard.scroll_offset = guard.scroll_offset.saturating_sub(3);
+                            guard.follow = false;
                         }
                     }
                     KeyCode::Down => {
@@ -870,6 +871,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             }
                         } else if guard.focus == Focus::Input && !guard.loading {
                             guard.next_input();
+                        } else if !guard.loading {
+                            guard.scroll_offset += 3;
                         }
                     }
                     KeyCode::Enter => {
@@ -1075,6 +1078,24 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                 }
             }
+            Ok(Event::Mouse(mouse)) => {
+                let mut guard = app.lock().unwrap();
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if !guard.loading {
+                        guard.focus = Focus::Messages;
+                    }
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        guard.scroll_offset = guard.scroll_offset.saturating_sub(5);
+                        guard.follow = false;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        guard.scroll_offset += 5;
+                    }
+                    _ => {}
+                }
+            }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1243,7 +1264,7 @@ fn draw<B: ratatui::backend::Backend>(
             let messages_block = Block::default().title(" Chat ").borders(Borders::ALL);
             let messages_widget = Paragraph::new(messages_lines)
                 .block(messages_block)
-                .scroll((scroll_offset, 0));
+                .scroll((0, scroll_offset));
             f.render_widget(messages_widget, cols[1]);
         }
 

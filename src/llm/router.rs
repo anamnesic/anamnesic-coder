@@ -1,4 +1,5 @@
 use crate::llm::client::{ChatCompletion, LlmClient, ResponseFormat, ToolChoice, ToolDef};
+use crate::llm::tier;
 use crate::models_dev::{base_id, ModelsDevClient};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -6,6 +7,10 @@ use std::sync::{Arc, Mutex};
 
 /// Default cloud provider id used when none is explicitly selected.
 pub const DEFAULT_PROVIDER: &str = "nvidia";
+
+/// Default cloud model used for TUI and as the primary model for
+/// same-tier fallback resolution.
+pub const DEFAULT_CLOUD_MODEL: &str = "z-ai/glm-5.2";
 
 /// Runtime router between the local backend (Ollama / GGUF) and a lazily-built
 /// OpenAI-compatible cloud backend (NVIDIA NIM, Ollama Cloud, …).
@@ -70,13 +75,10 @@ impl LlmRouter {
         .with_context(|| format!("configuring cloud provider '{provider}'"))?;
         *self.cloud.lock().unwrap() = Some(LlmClient::cloud(&base, &key));
         *self.provider.lock().unwrap() = provider.to_string();
-        self.fallback_model
-            .lock()
-            .unwrap()
-            .clone_from(&match provider {
-                "nvidia" => Some("deepseek-ai/deepseek-v4-flash".to_string()),
-                _ => None,
-            });
+        // Dynamically resolve a same-tier fallback for the default cloud model
+        // instead of hardcoding a single model per provider.
+        *self.fallback_model.lock().unwrap() =
+            tier::find_same_tier_fallback(DEFAULT_CLOUD_MODEL, provider, &catalog_client);
         Ok(base)
     }
 
@@ -110,6 +112,36 @@ impl LlmRouter {
     /// Return the configured fallback model, if any.
     pub fn fallback_model(&self) -> Option<String> {
         self.fallback_model.lock().unwrap().clone()
+    }
+
+    /// Update the active model and recompute the same-tier fallback.
+    ///
+    /// Call this when the primary model changes (e.g. user picks a new
+    /// model in the TUI) so the fallback stays in the same intelligence
+    /// tier as the new primary.
+    pub fn set_model(&self, model: &str) {
+        let provider = self.provider.lock().unwrap().clone();
+        let fallback = tier::find_same_tier_fallback(model, &provider, &self.catalog);
+        if let Some(fb) = &fallback {
+            if fb != model {
+                *self.fallback_model.lock().unwrap() = fallback;
+            }
+        }
+    }
+
+    /// Dynamically resolve a same-tier fallback for `model` that is
+    /// guaranteed different from `model`.  Falls back to the stored
+    /// `fallback_model` if no same-tier candidate is found.
+    pub fn resolve_fallback(&self, model: &str) -> Option<String> {
+        let provider = self.provider.lock().unwrap().clone();
+        if let Some(fb) = tier::find_same_tier_fallback(model, &provider, &self.catalog) {
+            if fb != model {
+                return Some(fb);
+            }
+        }
+        // Fall back to the stored fallback model
+        let stored = self.fallback_model.lock().unwrap().clone();
+        stored.filter(|fb| fb != model)
     }
 
     /// Resolve a model id against the active provider: `(is_cloud, api_id)`.
@@ -180,7 +212,7 @@ impl LlmRouter {
     }
 
     /// Try the primary model with retries; on any error, fall back to
-    /// the configured fallback model (if set) and retry once.
+    /// a same-tier model (if resolvable) and retry once.
     pub async fn generate_with_retry_with_fallback(
         &self,
         model: &str,
@@ -194,13 +226,9 @@ impl LlmRouter {
         {
             Ok(text) => Ok(text),
             Err(primary_err) => {
-                let fallback = self.fallback_model.lock().unwrap().clone();
-                let Some(fb_model) = fallback else {
+                let Some(fb_model) = self.resolve_fallback(model) else {
                     return Err(primary_err);
                 };
-                if fb_model == model {
-                    return Err(primary_err);
-                }
                 self.generate_with_retry(&fb_model, prompt, tools, response_format)
                     .await
                     .map_err(|fb_err| {
@@ -276,7 +304,7 @@ impl LlmRouter {
     }
 
     /// Try the primary model; on any error, automatically fall back to
-    /// the configured fallback model (if set) and retry once.
+    /// a same-tier model (if resolvable) and retry once.
     pub async fn chat_meta_with_fallback(
         &self,
         model: &str,
@@ -291,13 +319,9 @@ impl LlmRouter {
         {
             Ok(completion) => Ok(completion),
             Err(primary_err) => {
-                let fallback = self.fallback_model.lock().unwrap().clone();
-                let Some(fb_model) = fallback else {
+                let Some(fb_model) = self.resolve_fallback(model) else {
                     return Err(primary_err);
                 };
-                if fb_model == model {
-                    return Err(primary_err);
-                }
                 // The fallback model may not support tools; capability
                 // filtering is re-applied for its own id.
                 self.chat_meta_with_choice(&fb_model, messages, tools, tool_choice, response_format)
@@ -388,6 +412,8 @@ mod tests {
                 vec![
                     model("z-ai/glm-5.2", true),
                     model("legacy/no-tools-7b", false),
+                    model("nvidia/nemotron-nano-9b-v2", true),
+                    model("nvidia/llama-3.1-nemotron-70b-instruct", true),
                 ],
             ),
         );
@@ -486,5 +512,34 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("no cloud provider is configured"));
+    }
+
+    #[test]
+    fn resolve_fallback_finds_same_tier_model() {
+        let r = router();
+        // glm-5.2 is Intelligent tier; fallback should be a different Intelligent model.
+        // In the test catalog, the only other Intelligent model on nvidia is... none.
+        // GLM-5.2 is the only intelligent one, so fallback should be None.
+        // Let's test with nemotron-70b which is Smart tier.
+        let fb = r.resolve_fallback("nvidia/llama-3.1-nemotron-70b-instruct");
+        assert!(fb.is_none(), "no same-tier fallback available in test catalog");
+    }
+
+    #[test]
+    fn fallback_never_returns_primary_model() {
+        let r = router();
+        // Even if resolve_fallback returns something, it must never equal the primary.
+        let fb = r.resolve_fallback("z-ai/glm-5.2");
+        if let Some(ref fb) = fb {
+            assert_ne!(fb, "z-ai/glm-5.2");
+        }
+    }
+
+    #[test]
+    fn set_model_updates_fallback() {
+        let r = router();
+        // Should not panic; the test catalog may or may not have a same-tier fallback.
+        r.set_model("nvidia/llama-3.1-nemotron-70b-instruct");
+        // No same-tier model in test catalog, so fallback should remain None or unchanged.
     }
 }

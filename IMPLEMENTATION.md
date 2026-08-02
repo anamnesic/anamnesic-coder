@@ -73,7 +73,7 @@ Este documento reúne o mapeamento das funcionalidades do OpenCode que precisamo
 cargo build
 
 # Rodar TUI apontando para workspace
-cargo run -- --dir workspace Tui
+    cargo run -- --dir . Tui
 ```
 
 ## 7. Referências rápidas dentro do repositório

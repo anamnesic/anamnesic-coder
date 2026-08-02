@@ -69,7 +69,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            workspace_dir: PathBuf::from("workspace"),
+            workspace_dir: PathBuf::from("."),
             memory_dir: PathBuf::from("memory_data"),
             ollama_host: std::env::var("OLLAMA_HOST").unwrap_or("http://localhost:11434".into()),
             planner_model: std::env::var("PLANNER_MODEL").unwrap_or("granite3.3:2b".into()),

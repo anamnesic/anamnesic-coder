@@ -26,7 +26,7 @@ use llm::infer::gguf::GgufReader;
 use llm::infer::model::Model;
 use llm::infer::tokenizer::Tokenizer;
 use llm::model_resolver;
-use llm::router::{LlmRouter, DEFAULT_PROVIDER};
+use llm::router::{LlmRouter, DEFAULT_CLOUD_MODEL, DEFAULT_PROVIDER};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -47,7 +47,7 @@ struct Cli {
     /// Model name (e.g. gemma3:1b) or path to a .gguf file
     #[arg(long)]
     model: Option<String>,
-    #[arg(short, long, default_value = "workspace")]
+    #[arg(short, long, default_value = ".")]
     dir: String,
     #[arg(long, default_value = "off")]
     caveman: String,
@@ -132,7 +132,6 @@ enum ProvidersAction {
 
 /// Default model for cloud inference.  Plain-name providers (Ollama Cloud)
 /// use their own default; provider-qualified ids like NVIDIA's use `nvidia/…`.
-const DEFAULT_CLOUD_MODEL: &str = "z-ai/glm-5.2";
 const OLLAMA_CLOUD_DEFAULT_MODEL: &str = "nemotron-3-nano:30b";
 
 /// Build the LLM router: a local backend (Ollama or local GGUF) plus, when
