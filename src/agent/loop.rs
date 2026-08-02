@@ -527,7 +527,7 @@ fn tool_effect(name: &str) -> ToolEffect {
         "read_file" | "list_tree" | "search_code" | "git_status" | "git_diff" => {
             ToolEffect::ReadOnly
         }
-        "write_file" | "replace_exact" => ToolEffect::Mutation,
+        "write_file" | "replace_exact" | "edit_file" => ToolEffect::Mutation,
         _ => ToolEffect::Command,
     }
 }
@@ -698,7 +698,7 @@ fn execute_tool(
     let cap = state.config.max_tool_output_bytes;
 
     match tc.function.name.as_str() {
-        "write_file" | "replace_exact" => {
+        "write_file" | "replace_exact" | "edit_file" => {
             let Some(path) = string_arg("path") else {
                 return ToolExecutionResult::output("missing required argument: path");
             };
@@ -711,10 +711,23 @@ fn execute_tool(
                 state.record_blocked_action(format!("{} {path}: {message}", tc.function.name));
                 return ToolExecutionResult::output(message);
             }
+            let usize_arg = |name: &str| {
+                args.get(name)
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| usize::try_from(value).ok())
+            };
             let result = if tc.function.name == "write_file" {
                 string_arg("content")
                     .ok_or_else(|| anyhow::anyhow!("missing required argument: content"))
                     .and_then(|content| state.files.write_file(path, content))
+            } else if tc.function.name == "edit_file" {
+                let start = usize_arg("start_line");
+                let end = usize_arg("end_line");
+                let old = string_arg("old_content");
+                match string_arg("new_content") {
+                    Some(new_content) => state.files.edit_file(path, start, end, old, new_content),
+                    None => Err(anyhow::anyhow!("missing required argument: new_content")),
+                }
             } else {
                 match (string_arg("old"), string_arg("new")) {
                     (Some(old), Some(new)) => state.files.replace_exact(path, old, new),
@@ -1027,6 +1040,20 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
                     "end_line":{"type":"integer","minimum":1}
                 }),
                 serde_json::json!(["path"]),
+            ),
+        ),
+        tool(
+            "edit_file",
+            "Surgically edit a line range in a file. Prefers 1-based start_line and end_line for precise anchoring.",
+            object(
+                serde_json::json!({
+                    "path":{"type":"string"},
+                    "start_line":{"type":"integer","minimum":1},
+                    "end_line":{"type":"integer","minimum":1},
+                    "old_content":{"type":"string"},
+                    "new_content":{"type":"string"}
+                }),
+                serde_json::json!(["path", "new_content"]),
             ),
         ),
         tool(

@@ -322,6 +322,67 @@ impl FileTools {
         self.atomic_write(&target, &content.replacen(old, new, 1))
     }
 
+    pub fn edit_file(
+        &self,
+        path: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        old_content: Option<&str>,
+        new_content: &str,
+    ) -> anyhow::Result<()> {
+        let target = self
+            .resolve(path)
+            .ok_or_else(|| anyhow::anyhow!("path is outside workspace"))?;
+        let content = fs::read_to_string(&target)?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        match (start_line, end_line) {
+            (Some(start), Some(end)) => {
+                if start == 0 || start > lines.len() + 1 {
+                    anyhow::bail!("start_line {start} is out of bounds (file has {} lines)", lines.len());
+                }
+                if end < start {
+                    anyhow::bail!("end_line {end} must be >= start_line {start}");
+                }
+                let end_idx = end.min(lines.len());
+                let start_idx = start - 1;
+
+                if let Some(old) = old_content {
+                    let actual_slice = lines[start_idx..end_idx].join("\n");
+                    if actual_slice.trim() != old.trim() {
+                        anyhow::bail!(
+                            "content mismatch at lines {start}-{end}:\nExpected:\n{}\n\nActual:\n{}",
+                            old.trim(),
+                            actual_slice.trim()
+                        );
+                    }
+                }
+
+                let mut new_lines: Vec<String> = Vec::new();
+                for line in &lines[..start_idx] {
+                    new_lines.push((*line).to_string());
+                }
+                for line in new_content.lines() {
+                    new_lines.push(line.to_string());
+                }
+                if end_idx < lines.len() {
+                    for line in &lines[end_idx..] {
+                        new_lines.push((*line).to_string());
+                    }
+                }
+                let mut joined = new_lines.join("\n");
+                if content.ends_with('\n') && !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                self.atomic_write(&target, &joined)
+            }
+            _ => {
+                let old = old_content.ok_or_else(|| anyhow::anyhow!("start_line/end_line or old_content must be provided"))?;
+                self.replace_exact(path, old, new_content)
+            }
+        }
+    }
+
     fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         let parent = path
             .parent()
@@ -384,6 +445,16 @@ mod transactional_tests {
         assert!(!range.contains("one"));
         let tree = tools.list_tree("", 2, 20).unwrap();
         assert!(tree.contains("src/lib.rs"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_file_replaces_line_range_surgically() {
+        let root = workspace("edit_range");
+        let tools = FileTools::new(root.clone());
+        tools.write_file("test.py", "line 1\nline 2\nline 3\nline 4\n").unwrap();
+        tools.edit_file("test.py", Some(2), Some(3), Some("line 2\nline 3"), "NEW LINE 2AND3").unwrap();
+        assert_eq!(tools.read_file("test.py").unwrap(), "line 1\nNEW LINE 2AND3\nline 4\n");
         let _ = fs::remove_dir_all(root);
     }
 }

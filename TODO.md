@@ -307,12 +307,12 @@
 | `list_files` includes directories (G10) | ✅ Done | 0004 |
 | Token usage & cost tracking per turn (G6) | ✅ Done | 0005 |
 | Windows cross-platform path resolution fixes | ✅ Done | 0005 |
+| Line-range surgical code editing (`edit_file`) (G1) | ✅ Done | 0006 |
 
 ### All Open Demands
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| G1 | **P0** | Line-range code editing (`edit_file` / `multi_edit_file`) | Harness | Médio |
 | G2 | **P0** | Wire approval broker to tool dispatch | Harness/Safety | Baixo |
 | G3 | **P0** | Context compaction / conversation summarization | Harness | Alto |
 | G4 | **P0** | Token counting | Harness | Médio |
