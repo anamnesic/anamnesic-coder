@@ -318,6 +318,7 @@
 | GGUF safe parsing & bounds-checked dequantization | ✅ Done | 0007 |
 | Floating point safety & complete key masking | ✅ Done | 0008 |
 | Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
+| Git branch & stash operations (G16) | ✅ Done | 0009 |
 
 ### All Open Demands
 
@@ -332,7 +333,6 @@
 | G13 | P2 | Web search tool | Harness | Médio |
 | G14 | P2 | Session persistence | Harness | Médio |
 | G15 | P2 | Background task execution | Harness | Alto |
-| G16 | P2 | Git branch/stash operations | Harness | Baixo |
 | 17 | P2 | Remove `#![allow(dead_code)]` | Code Quality | Baixo |
 | 18 | P2 | Fix `truncate_str` (head vs tail) | Code Quality | Baixo |
 | 19 | P2 | Fix conversation clone per iteration | Performance | Médio |

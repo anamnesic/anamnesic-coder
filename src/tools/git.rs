@@ -31,6 +31,16 @@ impl GitTools {
     pub fn restore(&self, path: &str) -> String { self.git(&["restore", path]) }
     pub fn status(&self) -> String { self.git(&["status"]) }
     pub fn log(&self, count: usize) -> String { self.git(&["log", &format!("--oneline"), &format!("-{}", count)]) }
+    pub fn stash(&self, msg: &str) -> String {
+        if msg.is_empty() {
+            self.git(&["stash"])
+        } else {
+            self.git(&["stash", "push", "-m", msg])
+        }
+    }
+    pub fn stash_pop(&self) -> String { self.git(&["stash", "pop"]) }
+    pub fn checkout_branch(&self, name: &str) -> String { self.git(&["checkout", name]) }
+    pub fn list_branches(&self) -> String { self.git(&["branch", "-a"]) }
 }
 
 #[cfg(test)]
@@ -107,5 +117,27 @@ mod tests {
         fs::write(std::path::Path::new(&dir).join("a.txt"), "two").unwrap();
         let d = g.diff("HEAD");
         assert!(d.contains("one"), "diff was: {d}");
+    }
+
+    #[test]
+    fn stash_and_pop_restores_working_tree() {
+        let dir = temp_repo_dir("stash");
+        let g = GitTools::new(dir.clone());
+        g.init();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"]).current_dir(&dir).output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"]).current_dir(&dir).output();
+        fs::write(std::path::Path::new(&dir).join("a.txt"), "base").unwrap();
+        g.add("a.txt");
+        g.commit("base");
+
+        fs::write(std::path::Path::new(&dir).join("a.txt"), "work in progress").unwrap();
+        let stash_res = g.stash("save wip");
+        assert!(!stash_res.contains("error"));
+
+        let popped = g.stash_pop();
+        assert!(popped.contains("Dropped") || popped.contains("Applied") || popped.contains("On branch"));
+        assert_eq!(fs::read_to_string(std::path::Path::new(&dir).join("a.txt")).unwrap(), "work in progress");
     }
 }
