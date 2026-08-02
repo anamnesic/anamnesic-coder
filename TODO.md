@@ -287,6 +287,7 @@
 | 22 | `.env` value parser with quotes & inline comments | ADR 0008 |
 | 23 | Short API key masking safety | ADR 0008 |
 | 28 | Multi-word blocked commands support | ADR 0008 |
+| 29 | `extract_path` dot/slash extension requirement | ADR 0008 |
 
 ### Implemented Features
 
