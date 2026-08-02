@@ -1,24 +1,18 @@
-# TODO — P0 Safety & Reliability Fixes (August 2026)
+# TODO — Anamnesic Coder (August 2026)
 
 ## P0 — Safety and Reliability (CRITICAL)
 
-### 1. Command Injection via Prefix-Based Allowlist
+### ~~1. Command Injection via Prefix-Based Allowlist~~ ✅ FIXED
 - **File:** `src/tools/shell.rs`
-- **Lines:** 54–66 (original)
-- **Issue:** `is_allowed()` checks whether the command string *starts with* an allowed command, then checks whether it *contains* a blocked substring. Trivially bypassed by appending shell metacharacters after a safe prefix (e.g., `echo hello; rm -rf /`).
-- **Fix:** Replace prefix-based allowlist with parsed executable + args. Reject shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `{`, `}`, `<`, `>`, `\n`, `\\`) by default.
+- **Fix applied:** `parse_command()` rejects all shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `{`, `}`, `<`, `>`, `\n`, `\\`) before execution. `is_allowed()` validates the parsed executable against the allowlist, not a prefix match. `run_command_raw` also validates through `is_allowed()`.
 
-### 2. No Timeout or Process-Group Kill on `run_command`
+### ~~2. No Timeout or Process-Group Kill on `run_command`~~ ✅ FIXED
 - **File:** `src/tools/shell.rs`
-- **Lines:** 69–105 (original)
-- **Issue:** Both `run_command` and `run_command_raw` use `Command::output()` with no timeout. A hung or malicious subprocess blocks the agent loop indefinitely.
-- **Fix:** Add `command_timeout_secs` timeout using `child.wait_with_timeout()`. Kill the process group on timeout.
+- **Fix applied:** `run_command_inner` uses `child.try_wait()` polling with configurable `command_timeout_secs` (default 600s). On timeout, kills the process group (Unix) or child process (Windows). Pipe readers run on separate threads to prevent deadlock.
 
-### 3. `run_command_raw` Bypasses the Allowlist Entirely
+### ~~3. `run_command_raw` Bypasses the Allowlist Entirely~~ ✅ FIXED
 - **File:** `src/tools/shell.rs`
-- **Lines:** 92–105 (original)
-- **Issue:** `run_command_raw` does **not** call `is_allowed()` before executing. Used by `verify_cargo` in `src/agent/executor.rs:78`. If the allowlist is a security boundary, bypassing it here is a gap.
-- **Fix:** Add `is_allowed()` check to `run_command_raw`.
+- **Fix applied:** `run_command_raw` now validates through `is_allowed()` first and returns an error `CommandOutput` if rejected.
 
 ### 4. `unsafe` `transmute` on Untrusted GGUF Data
 - **File:** `src/llm/infer/gguf.rs`
@@ -28,7 +22,7 @@
 
 ### 5. GGUF Parsing Panics on Truncated/Corrupt Files
 - **File:** `src/llm/infer/gguf.rs`
-- **Lines:** 159–168
+- **Lines:** 161–168
 - **Issue:** All `read_u8`, `read_u16`, `read_u32`, `read_u64`, `read_f32`, `read_f64` methods use `try_into().unwrap()` and slice indexing without bounds checks. A truncated GGUF will panic rather than return an error.
 - **Fix:** Replace `unwrap()` with proper error propagation. Add bounds checks before slicing.
 
@@ -50,55 +44,115 @@
 - **Issue:** Between the `canonicalize()` check and the actual `fs::read_to_string`/`fs::write` call, an attacker with concurrent access could replace a file with a symlink.
 - **Fix:** Re-validate the path after canonicalization, or use `O_NOFOLLOW` where available.
 
+## P0 — Harness Gaps (from gap analysis vs. Claude Code / Codex / Antigravity)
+
+> See full report: `docs/gap-analysis-2026-08.md`
+
+### G1. Line-Range Code Editing (edit_file / multi_edit_file)
+- **Gap:** `replace_exact` exige match exato de string e não suporta edições multi-site. Todos os líderes (Claude Code, Antigravity, Cursor) usam edição por line-range.
+- **Impact:** Crítico para SWE-bench — modelos erram whitespace/indentation frequentemente, causando falha de match.
+- **Files:** `src/tools/fs.rs`, `src/agent/executor.rs`
+- **Fix:** Implementar `edit_file(path, start_line, end_line, old_content, new_content)` com line-range anchoring. Adicionar `multi_edit_file(path, edits[])` para edições não-contíguas no mesmo arquivo. Manter `replace_exact` como fallback.
+- **Ref:** Antigravity `replace_file_content` / `multi_replace_file_content`; Claude Code `Edit` tool.
+
+### G2. Approval Broker Not Wired (security gap)
+- **Gap:** Os tipos `ApprovalRequest`, `ApprovalDecision` e `AgentHooks.on_approval` existem em `src/agent/loop.rs:50-71`, mas `execute_tool_call()` nunca chama `on_approval()`. Writes e commands executam sem gate, mesmo com `write_tool_policy: Ask`.
+- **Impact:** Segurança — o modelo pode escrever/executar qualquer coisa sem aprovação.
+- **Files:** `src/agent/loop.rs`, `src/agent/executor.rs`
+- **Fix:** No dispatch de tools mutadores/commands, verificar a policy (`write_tool_policy`/`command_tool_policy`) e chamar `hooks.on_approval()` antes de executar. Se `Deny` ou sem callback, retornar erro.
+
+### G3. Context Compaction / Conversation Summarization
+- **Gap:** O histórico de conversa cresce indefinidamente. Quando excede o contexto do modelo, o loop falha. Nenhuma sumarização ou compactação de mensagens antigas.
+- **Impact:** Tarefas longas (multi-step refactoring) falham por context overflow.
+- **Files:** `src/agent/loop.rs`, `src/compressor/`
+- **Fix:** Quando `estimated_tokens > 0.8 * max_context_tokens`, sumarizar mensagens antigas (exceto as últimas N) usando o modelo summarizer. O compressor já existe em `src/compressor/` mas não está integrado no agent loop.
+
+### G4. Token Counting
+- **Gap:** Não há contagem de tokens. Não sabe quanto contexto resta por turno.
+- **Impact:** Pré-requisito para G3 (compaction) e G6 (cost tracking).
+- **Files:** `src/llm/client.rs`, `src/agent/loop.rs`
+- **Fix:** Adicionar estimativa de tokens (chars/4 como baseline, ou tiktoken-rs). Rastrear tokens in/out em cada chamada LLM. Expor `remaining_context()` para o agent loop.
+
 ## P1 — Error Handling & Robustness
 
 ### 9. `unwrap()` in Production Paths
-- **Files:** `src/llm/client.rs:472`, `src/main.rs:401`, `src/agent/executor.rs:200`, `src/ui.rs:442`, `src/agent/state.rs:61,74,83`, `src/llm/router.rs` (multiple)
+- **Files:** `src/main.rs:401`, `src/agent/state.rs:61,74,83`, `src/llm/router.rs` (Mutex locks)
 - **Issue:** `unwrap()` calls that can panic in production.
 - **Fix:** Replace with proper error handling or `expect()` with descriptive messages.
+- **Note:** Several `unwrap()` sites in `src/llm/client.rs` have been addressed by the retry+backoff refactor. Mutex lock unwraps in the router are considered acceptable (poisoned mutex = unrecoverable).
 
 ### 10. `partial_cmp().unwrap()` on Costs (NaN Panic)
 - **File:** `src/models_dev/client.rs`
 - **Lines:** 81, 100, 149
 - **Issue:** Will panic if any cost is NaN.
 - **Fix:** Use `.unwrap_or(Equal)`.
+- **Note:** `bench/model_bench.rs`, `hw_recommend/recommender.rs`, `llm/infer/engine.rs:325` already use `.unwrap_or(Equal)`. One remaining bare `.unwrap()` at `engine.rs:333`.
 
 ### 11. `partial_cmp().unwrap()` in Top-K Sampling
 - **File:** `src/llm/infer/engine.rs`
 - **Line:** 333
-- **Issue:** Will panic on NaN logits.
+- **Issue:** Will panic on NaN logits in `select_nth_unstable_by`.
 - **Fix:** Use `.unwrap_or(Equal)`.
 
 ### 12. `unwrap_or_default` Silently Swallows HTTP Read Errors
 - **File:** `src/llm/client.rs`
-- **Lines:** 412, 517, 568, 622
-- **Issue:** `resp.text().await.unwrap_or_default()` silently discards errors.
+- **Lines:** 570, 711, 808, 868 (and others)
+- **Issue:** `resp.text().await.unwrap_or_default()` silently discards errors in non-retry paths.
 - **Fix:** Propagate errors properly or log them.
+- **Note:** The retry paths (429/5xx) now log and retry correctly. The `unwrap_or_default` on response body reading is a separate concern for non-retried paths.
+
+## P1 — Harness Gaps (competitive parity)
+
+### G5. Sub-Agent Support (Task tool)
+- **Gap:** O Anamnesic tem apenas um loop sequencial. Claude Code, Antigravity e Cursor suportam sub-agentes para delegação de tarefas e pesquisa paralela.
+- **Impact:** Tarefas complexas (multi-arquivo, refatoração) são lentas e gastam mais tokens.
+- **Files:** `src/agent/loop.rs` (novo módulo `src/agent/subagent.rs`)
+- **Fix:** Implementar tool `task` que spawna um segundo agent loop com contexto isolado. O sub-agente recebe um prompt, executa tools, e retorna o resultado ao agente pai. Limitar depth=1 inicialmente.
+
+### G6. Cost Tracking Per Turn
+- **Gap:** Não sabe quanto gastou em tokens/dinheiro por turno ou sessão. Claude Code e Aider mostram isso.
+- **Impact:** Ops — sem visibilidade de custos; impossível otimizar.
+- **Files:** `src/llm/client.rs`, `src/agent/loop.rs`, `src/ui.rs`
+- **Fix:** Em `ChatCompletion`, adicionar `usage: Option<Usage>` (prompt_tokens, completion_tokens). Acumular por turno. Mostrar no status bar do TUI.
+
+### G7. MCP Client (Model Context Protocol)
+- **Gap:** Não conecta a tool servers MCP externos. Todos os líderes (Claude Code, Antigravity, Cursor, Codex) suportam MCP.
+- **Impact:** Extensibilidade — não pode usar tools de terceiros (GitHub, DB, Jira, etc.).
+- **Files:** Novo módulo `src/mcp/`
+- **Fix:** Implementar MCP client com stdio transport. Registrar tools MCP dinamicamente no tool registry do executor. Começar com o protocolo mínimo: `initialize`, `tools/list`, `tools/call`.
+
+### G8. Auto-Read Project Context (AGENTS.md)
+- **Gap:** O agente não lê nenhum arquivo de contexto de projeto automaticamente. O próprio projeto tem um `AGENTS.md` mas o agente ignora.
+- **Impact:** O modelo não tem contexto sobre arquitetura, convenções, e regras do projeto.
+- **Files:** `src/agent/loop.rs`, `src/llm/prompt.rs`
+- **Fix:** Na construção do system prompt, procurar e ler `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, ou `CONTEXT.md` na raiz do workspace. Injetar o conteúdo no system prompt.
+
+### G9. Streaming Tool Call Deltas
+- **Gap:** Tool calls são parseados apenas de respostas completas. Não há streaming incremental de tool call deltas durante SSE.
+- **Impact:** UX — o usuário não vê o que o modelo está decidindo até a resposta completa chegar.
+- **Files:** `src/llm/client.rs`
+- **Fix:** No streaming SSE, parsear `tool_calls` incrementalmente (acumular `function.arguments` chunk-by-chunk). Emitir eventos parciais via `AgentHooks`.
+
+### G10. `list_files` Should Include Directories
+- **Gap:** `list_files` só retorna arquivos (`is_file()`), não diretórios. Antigravity e Claude Code retornam ambos.
+- **Impact:** O modelo não vê a estrutura de diretórios do projeto.
+- **Files:** `src/tools/fs.rs`
+- **Fix:** Incluir diretórios no output com um sufixo `/` para distinguir. Ou implementar tool separado `list_dir`.
 
 ## P2 — Code Quality & Design
 
-### 13. Dead Code: `maybe_compact_chain`
-- **File:** `src/agent/loop.rs`
-- **Lines:** 89–105
-- **Issue:** Defined but never called.
-- **Fix:** Remove or integrate into the primary loop.
+### ~~13. Dead Code: `maybe_compact_chain`~~ ✅ REMOVED
+- Removed as part of ADR 0002 (unified orchestration).
 
-### 14. Dead Code: `run_agent_loop_with_fallback`
-- **File:** `src/agent/loop.rs`
-- **Lines:** 408–470
-- **Issue:** Defined but never called. TODO.md flags this.
-- **Fix:** Remove or integrate into the primary loop.
+### ~~14. Dead Code: `run_agent_loop_with_fallback`~~ ✅ REMOVED
+- Removed as part of ADR 0002 (unified orchestration).
 
-### 15. Dead Code: `execute_step_inner_chain`
-- **File:** `src/agent/executor.rs`
-- **Lines:** 301–324
-- **Issue:** Only handles `"answer"` step type; all others fall through to a `println!` fallback.
-- **Fix:** Remove or implement properly.
+### ~~15. Dead Code: `execute_step_inner_chain`~~ ✅ REMOVED
+- Removed as part of ADR 0002 (unified orchestration).
 
 ### 16. Unused `r#loop` Raw Identifier
-- **File:** `src/main.rs`
-- **Line:** 21
-- **Issue:** Module name `loop` fights the Rust keyword.
+- **File:** `src/main.rs:18`, `src/agent/mod.rs:4`, `src/agent/executor.rs:1`, `src/ui.rs:24,520`
+- **Issue:** Module name `loop` fights the Rust keyword, requiring `r#loop` everywhere.
 - **Fix:** Rename to `agent_loop` or `cycle`.
 
 ### 17. `#![allow(dead_code)]` at Crate Root
@@ -109,15 +163,14 @@
 
 ### 18. `truncate_str` Keeps Tail Instead of Head
 - **File:** `src/ui.rs`
-- **Lines:** 1086–1094
+- **Lines:** 1455–1463
 - **Issue:** Keeps the last `max` characters and prepends ellipsis. For model names and paths, the beginning is usually more informative.
 - **Fix:** Change to keep the head (first `max` characters) with trailing ellipsis.
 
 ### 19. Conversation Cloned on Every Tool-Use Iteration
 - **File:** `src/agent/loop.rs`
-- **Line:** 127
 - **Issue:** `conversation.clone()` clones the entire message history on every iteration.
-- **Fix:** Use `Arc<Vec<...>>` or incremental updates.
+- **Fix:** Use `Arc<Vec<…>>` or incremental updates. Related to G3 (context compaction).
 
 ### 20. Embedding Lookup Allocates a New Vec Per Token
 - **File:** `src/llm/infer/engine.rs`
@@ -133,85 +186,195 @@
 
 ### 22. `.env` Parser Doesn't Handle Values Containing `=`
 - **File:** `src/providers/store.rs`
-- **Line:** 199
 - **Issue:** Edge case with values containing `=`.
 - **Fix:** Use `split_once('=')` which already handles this correctly.
 
 ### 23. `mask_key` Reveals Too Much for Short Keys
 - **File:** `src/providers/store.rs`
 - **Lines:** 278–281
-- **Issue:** `mask_key("ab")` returns `"ab****"`, revealing the entire key.
-- **Fix:** Always mask at least 4 characters.
+- **Issue:** `mask_key("ab")` returns `"ab****"`, revealing the entire key. Keys shorter than 4 chars have no masking.
+- **Fix:** Always mask at least 4 characters; show at most `min(4, len/2)` visible chars.
+
+## P2 — Harness Gaps (nice-to-have)
+
+### G11. Repo Map (Aider-style)
+- **Gap:** O agente não tem uma visão estrutural do repositório. Aider e Cursor geram um mapa de definições (classes, funções) para guiar file selection.
+- **Impact:** Context efficiency — o agente gasta iterações buscando arquivos relevantes.
+- **Fix:** Gerar um repo map na inicialização usando regex ou tree-sitter para extrair definições. Injetar no system prompt como contexto compacto.
+
+### G12. Lint Integration
+- **Gap:** Não integra com linters. Claude Code, Cursor e Aider usam lint feedback para self-correction.
+- **Impact:** O agente não detecta erros de estilo/tipo sem rodar o test command completo.
+- **Fix:** Após edições, rodar `cargo clippy` / `eslint` e alimentar o output como feedback ao modelo.
+
+### G13. Web Search Tool
+- **Gap:** Não tem capacidade de buscar na web. Antigravity tem `search_web`, Aider tem web integration.
+- **Impact:** O agente não pode pesquisar documentação, APIs, ou soluções para erros desconhecidos.
+- **Fix:** Implementar tool `web_search(query)` usando uma search API (SearXNG, Brave, etc.).
+
+### G14. Session Persistence
+- **Gap:** Sessões não persistem entre execuções. Claude Code, Cursor e Codex salvam sessões.
+- **Impact:** UX — o usuário perde todo o contexto ao reiniciar.
+- **Fix:** Serializar `AgentState` + conversation history para disco. Restaurar com `/session load`.
+
+### G15. Background Task Execution
+- **Gap:** Não suporta execução em background. Antigravity e Cursor permitem rodar tarefas enquanto o usuário faz outra coisa.
+- **Impact:** UX — builds longos bloqueiam o agent loop.
+- **Fix:** Executar commands longos em thread separada com polling de status. Emitir eventos via `AgentHooks`.
+
+### G16. Git Branch/Stash Operations
+- **Gap:** Git tools são básicos (status, diff, log, stage, commit). Sem branch, stash, blame.
+- **Impact:** Workflow — não pode criar feature branches ou stash work-in-progress.
+- **Fix:** Adicionar `git_branch`, `git_stash`, `git_blame` em `src/tools/git.rs`.
 
 ## P3 — Logic Bugs & Edge Cases
 
-### 24. `needs_fix` Has False-Positive Logic
-- **File:** `src/agent/loop.rs`
-- **Lines:** 472–479
-- **Issue:** Returns `true` if output contains `"error"` (lowercased). Catches legitimate error messages inside passing test output.
-- **Fix:** Refine heuristic to only match failure indicators, not general error messages.
+### ~~24. `needs_fix` Has False-Positive Logic~~ ✅ REMOVED
+- The `needs_fix` heuristic was removed as part of the unified orchestration refactor (ADR 0002). Verification now uses `VerificationResult` with `VerificationStatus::Passed/Failed/Unavailable`.
 
 ### 25. `list_files` Skips Directories
-- **File:** `src/tools/fs.rs`
-- **Lines:** 187–197
-- **Issue:** Only includes files (`is_file()`), not directories.
-- **Fix:** Document behavior or add directory listing option.
+- Subsumed by G10.
 
 ### 26. `read_file` Step Falls Back to `search_code`
 - **File:** `src/agent/executor.rs`
-- **Lines:** 221–238
 - **Issue:** If a `read_file` step has no `filename`, it silently falls back to `search_code`.
 - **Fix:** Return an error or skip the step instead of silently changing operation.
 
 ### 27. Retry Logic Can Exceed `max_retries`
 - **File:** `src/agent/loop.rs`
-- **Lines:** 390–400
 - **Issue:** The recursive call can trigger another retry, exceeding `max_retries`.
 - **Fix:** Decrement retry count properly or use a loop instead of recursion.
 
 ### 28. `allowed_commands` Contains Multi-Word Commands
 - **File:** `src/config/settings.rs`
-- **Lines:** 36–41
-- **Issue:** `"npm test"` is a single allowed command, but `"npm"` alone is rejected. Inconsistent with single-word commands.
-- **Fix:** Allow both exact match and prefix match for multi-word commands.
+- **Lines:** 94–120
+- **Issue:** The blocked commands list contains multi-word entries (`"rm -rf"`, `"del /f"`, `"rd /s"`) but `is_allowed()` now validates by executable name only. Multi-word blocked commands are misleading.
+- **Fix:** Remove multi-word entries from `blocked_commands`. Document that `blocked_commands` is executable-name-only.
 
 ### 29. `extract_path` Heuristic Can Return Invalid Paths
 - **File:** `src/agent/executor.rs`
-- **Lines:** 144–163
+- **Lines:** 249+
 - **Issue:** Can return things like `"a.b.c"` as a path when the step description mentions a version number.
 - **Fix:** Add more heuristics to filter out non-path tokens.
 
 ### 30. Hardcoded Cloud Model List
 - **File:** `src/main.rs`
-- **Lines:** 359–369
+- **Lines:** 420+
 - **Issue:** `get_cloud_models` returns a hardcoded list.
 - **Fix:** Make data-driven from the models.dev catalog.
 
 ### 31. `Bench` Command Overwrites Local Results with Cloud
 - **File:** `src/main.rs`
-- **Lines:** 211–218
 - **Issue:** Both local and cloud benchmark results saved to the same file.
 - **Fix:** Use separate files for local and cloud results.
 
-## Missing Features (from TODO.md)
+---
 
-| Priority | TODO Item | Status |
-|----------|-----------|--------|
-| P0 | Timeout + process-group kill for `run_command` | **FIXED** |
-| P0 | Parsed executable+args allowlist; reject shell operators | **FIXED** |
-| P0 | Per-tool approval policy (ask/allow/deny) | **MISSING** |
-| P0 | Workspace diff summary + commit/rollback workflow | **MISSING** |
-| P0 | Handle malformed provider-specific arguments gracefully | **PARTIAL** |
-| P0 | Configurable max iterations, output caps, timeouts | **PARTIAL** |
-| P0 | Tests for path traversal, symlink escape, command injection | **MISSING** |
-| P1 | Concurrent independent tool calls | **MISSING** |
-| P1 | `tool_choice` + capability filtering per model | **MISSING** |
-| P1 | Patch/edit tools (unified diff, targeted replacement) | **MISSING** |
-| P1 | Repo discovery tools (list tree, git diff/status) | **MISSING** |
-| P1 | Prompts in `prompts/` files, versioned/tested | **MISSING** |
-| P1 | Structured planner output with JSON schema | **MISSING** |
-| P1 | `FallbackChain` in primary tool loop | **MISSING** (dead code exists) |
-| P1 | Provider health checks, retry classification, circuit breaking | **MISSING** |
-| P2 | Split local/cloud benchmark result files | **MISSING** |
-| P2 | MCP client | **MISSING** |
-| P2 | Integration tests with mock provider | **MISSING** |
+## Status Summary (as of 2026-08-02)
+
+### Fixed (from previous TODOs)
+
+| # | Item | Fixed In |
+|---|------|----------|
+| 1 | Command injection via prefix-based allowlist | ADR 0002 |
+| 2 | Timeout + process-group kill for `run_command` | ADR 0002 |
+| 3 | `run_command_raw` bypasses allowlist | ADR 0002 |
+| 13 | Dead code: `maybe_compact_chain` | ADR 0002 |
+| 14 | Dead code: `run_agent_loop_with_fallback` | ADR 0002 |
+| 15 | Dead code: `execute_step_inner_chain` | ADR 0002 |
+| 24 | `needs_fix` false-positive logic | ADR 0002 |
+
+### Implemented Features
+
+| Feature | Status | ADR |
+|---------|--------|-----|
+| Workspace transactions (snapshot/diff/rollback) | ✅ Done | 0002 |
+| Interactive approval broker (types) | ⚠️ Types only — not wired | 0002 |
+| Parallel read-only tool execution | ✅ Done | 0002 |
+| `tool_choice` + capability filtering | ✅ Done | 0002 |
+| Unified orchestration (no more FallbackChain) | ✅ Done | 0002 |
+| Limits calibrated to GLM-5.2 via NIM | ✅ Done | 0002 |
+| Protocol normalization (typed tool_calls) | ✅ Done | 0002 |
+| Prompt contract for GLM-5.2 | ✅ Done | 0002 |
+| LLM Router (local/cloud routing) | ✅ Done | 0001 |
+| Provider switching at runtime (`/provider`) | ✅ Done | 0001 |
+| Same-tier model fallback via `ModelTier` | ✅ Done | 0003 |
+| Exponential backoff on 429/5xx | ✅ Done | 0003 |
+| LLM error surfacing in TUI chat | ✅ Done | 0003 |
+| Mouse wheel scrolling in TUI | ✅ Done | 0003 |
+| Workspace defaults to current directory | ✅ Done | 0003 |
+
+### All Open Demands
+
+| # | Priority | Item | Category | Effort |
+|---|----------|------|----------|--------|
+| G1 | **P0** | Line-range code editing (`edit_file` / `multi_edit_file`) | Harness | Médio |
+| G2 | **P0** | Wire approval broker to tool dispatch | Harness/Safety | Baixo |
+| G3 | **P0** | Context compaction / conversation summarization | Harness | Alto |
+| G4 | **P0** | Token counting | Harness | Médio |
+| 4 | P0 | Fix `unsafe transmute` on GGUF data | Safety | Baixo |
+| 5 | P0 | Bounds-check GGUF parsing (panics) | Safety | Médio |
+| 6 | P0 | Bounds-check dequantization (Q4_0/Q8_0) | Safety | Baixo |
+| 7 | P0 | Bounds-check `tensor_data` slice | Safety | Baixo |
+| 8 | P0 | TOCTOU race in `FileTools::resolve` | Safety | Médio |
+| — | P0 | Tests for path traversal, symlink escape, injection | Safety | Médio |
+| G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
+| G6 | P1 | Cost tracking per turn | Harness | Baixo |
+| G7 | P1 | MCP client (stdio transport) | Harness | Alto |
+| G8 | P1 | Auto-read project context (AGENTS.md) | Harness | Baixo |
+| G9 | P1 | Streaming tool call deltas | Harness | Médio |
+| G10 | P1 | `list_files` include directories | Harness | Baixo |
+| 9 | P1 | Fix `unwrap()` in production paths | Robustness | Baixo |
+| 10 | P1 | Fix `partial_cmp().unwrap()` NaN panic (3 sites) | Robustness | Baixo |
+| 11 | P1 | Fix `partial_cmp().unwrap()` in top-K sampling | Robustness | Baixo |
+| 12 | P1 | Fix `unwrap_or_default` HTTP error swallowing | Robustness | Baixo |
+| — | P1 | Provider health checks, circuit breaking | Robustness | Médio |
+| — | P1 | Prompts versioned/tested | Quality | Médio |
+| G11 | P2 | Repo map (Aider-style) | Harness | Alto |
+| G12 | P2 | Lint integration | Harness | Médio |
+| G13 | P2 | Web search tool | Harness | Médio |
+| G14 | P2 | Session persistence | Harness | Médio |
+| G15 | P2 | Background task execution | Harness | Alto |
+| G16 | P2 | Git branch/stash operations | Harness | Baixo |
+| 16 | P2 | Rename `r#loop` → `agent_loop` | Code Quality | Baixo |
+| 17 | P2 | Remove `#![allow(dead_code)]` | Code Quality | Baixo |
+| 18 | P2 | Fix `truncate_str` (head vs tail) | Code Quality | Baixo |
+| 19 | P2 | Fix conversation clone per iteration | Performance | Médio |
+| 20 | P2 | Fix embedding alloc per token | Performance | Baixo |
+| 21 | P2 | Fix GPU detection double-read | Code Quality | Baixo |
+| 22 | P2 | Fix `.env` parser `=` handling | Code Quality | Baixo |
+| 23 | P2 | Fix `mask_key` for short keys | Code Quality | Baixo |
+| 28 | P2 | Clean up multi-word blocked commands | Code Quality | Baixo |
+| 29 | P3 | Fix `extract_path` heuristic | Logic Bug | Baixo |
+| 30 | P2 | Make `get_cloud_models` data-driven | Code Quality | Baixo |
+| 31 | P2 | Split local/cloud benchmark files | Code Quality | Baixo |
+| — | P2 | Integration tests with mock provider | Testing | Médio |
+| — | P2 | CI pipeline | Infra | Médio |
+
+### Recommended Sprint Order
+
+| Sprint | Focus | Items | Timeline |
+|--------|-------|-------|----------|
+| **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
+| **2** | Edição | G1 (edit_file + multi_edit_file) | 3-5 dias |
+| **3** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
+| **4** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+
+### Test Coverage
+
+~160 unit tests across all modules. Key areas:
+
+| Module | Tests |
+|--------|-------|
+| `llm/tier.rs` | 10 (tier classification, fallback resolution, ordering) |
+| `llm/router.rs` | 12 (routing, resolution, provider switching, capability, fallback) |
+| `tools/shell.rs` | 8 (allowlist, metacharacters, timeout, combined output) |
+| `tools/fs.rs` | 6+ (path traversal, workspace containment, transactions) |
+| `tools/transaction.rs` | 3 (snapshot, diff, rollback) |
+| `config/settings.rs` | 6 (defaults, env overrides, policies) |
+| `agent/loop.rs` | 11 (tool dispatch, parallel execution, output formatting) |
+| `compressor/` | 20+ (caveman, layer1, layer2) |
+| `memory/` | 6+ (short-term, search) |
+| `providers/store.rs` | 6+ (env loading, catalog resolution, masking) |
+| `models_dev/` | 10+ (catalog queries, provider models) |
+| `ui.rs` | 6+ (truncation, formatting, elapsed time) |

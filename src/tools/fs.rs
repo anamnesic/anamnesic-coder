@@ -115,12 +115,14 @@ mod tests {
     }
 
     #[test]
-    fn list_files_returns_files_within_workspace() {
+    fn list_files_returns_files_and_dirs_within_workspace() {
         let workspace = temp_workspace();
         let tools = FileTools::new(workspace.clone());
         tools.write_file("a.txt", "a").unwrap();
         tools.write_file("sub/b.txt", "b").unwrap();
-        assert_eq!(tools.list_files(""), vec!["a.txt"]);
+        let root = tools.list_files("");
+        assert!(root.contains(&"a.txt".to_string()));
+        assert!(root.contains(&"sub/".to_string()), "directories should appear with trailing /");
         assert_eq!(tools.list_files("sub"), vec!["sub/b.txt"]);
     }
 }
@@ -195,25 +197,28 @@ impl FileTools {
     }
 
     pub fn list_files(&self, path: &str) -> Vec<String> {
-        let mut files = Vec::new();
+        let mut entries_out = Vec::new();
         let Some(p) = (if path.is_empty() {
             Some(self.workspace.clone())
         } else {
             self.resolve(path)
         }) else {
-            return files;
+            return entries_out;
         };
         if let Ok(entries) = fs::read_dir(&p) {
             for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    if let Ok(rel) = entry.path().strip_prefix(&self.workspace) {
-                        files.push(rel.to_string_lossy().to_string());
+                if let Ok(rel) = entry.path().strip_prefix(&self.workspace) {
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let mut name = rel.to_string_lossy().to_string();
+                    if is_dir {
+                        name.push('/');
                     }
+                    entries_out.push(name);
                 }
             }
         }
-        files.sort();
-        files
+        entries_out.sort();
+        entries_out
     }
 
     pub fn read_file_range(

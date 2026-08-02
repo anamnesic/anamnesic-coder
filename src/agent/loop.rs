@@ -285,8 +285,10 @@ async fn run_tool_use_iteration(
     tools: &[crate::llm::client::ToolDef],
     hooks: &AgentHooks,
 ) -> Result<ToolLoopOutcome> {
+    let project_ctx = CoderPrompt::load_project_context(&state.config.workspace_dir);
+    let system_prompt = CoderPrompt::with_context(&state.caveman, &project_ctx);
     let mut conversation: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "system", "content": CoderPrompt::with_caveman(&state.caveman)}),
+        serde_json::json!({"role": "system", "content": system_prompt}),
         serde_json::json!({"role": "user", "content": prompt}),
     ];
     let mut used_tools = false;

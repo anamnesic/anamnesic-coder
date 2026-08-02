@@ -51,13 +51,62 @@ impl CoderPrompt {
         include_str!("../../prompts/coder.txt").trim()
     }
 
-    pub fn with_caveman(level: &CavemanLevel) -> String {
+    pub fn load_project_context(workspace: &std::path::Path) -> String {
+        let candidates = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "CONTEXT.md"];
+        let mut loaded = Vec::new();
+        for name in candidates {
+            let path = workspace.join(name);
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        let capped: String = trimmed.chars().take(4000).collect();
+                        loaded.push(format!("### Project Instructions ({name})\n{capped}"));
+                    }
+                }
+            }
+        }
+        loaded.join("\n\n")
+    }
+
+    pub fn with_context(level: &CavemanLevel, project_context: &str) -> String {
         let base = Self::system();
         let suffix = level.system_prompt_suffix();
-        if suffix.is_empty() {
+        let mut prompt = if suffix.is_empty() {
             base.to_string()
         } else {
             format!("{}{}", base, suffix)
+        };
+        if !project_context.trim().is_empty() {
+            prompt.push_str("\n\nProject Instructions:\n");
+            prompt.push_str(project_context.trim());
         }
+        prompt
+    }
+
+    pub fn with_caveman(level: &CavemanLevel) -> String {
+        Self::with_context(level, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_project_context_from_workspace() {
+        let temp = std::env::temp_dir().join(format!("test_agents_md_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("AGENTS.md"), "# Rules\nRule 1: Always check tests").unwrap();
+
+        let ctx = CoderPrompt::load_project_context(&temp);
+        assert!(ctx.contains("AGENTS.md"));
+        assert!(ctx.contains("Rule 1"));
+
+        let full_prompt = CoderPrompt::with_context(&CavemanLevel::Off, &ctx);
+        assert!(full_prompt.contains("Project Instructions:"));
+        assert!(full_prompt.contains("Rule 1"));
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }
