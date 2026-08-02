@@ -48,23 +48,25 @@
 - **Ref:** Antigravity `replace_file_content` / `multi_replace_file_content`; Claude Code `Edit` tool.
 - **ADR:** 0006
 
-### G2. Approval Broker Not Wired (security gap)
-- **Gap:** Os tipos `ApprovalRequest`, `ApprovalDecision` e `AgentHooks.on_approval` existem em `src/agent/loop.rs:50-71`, mas `execute_tool_call()` nunca chama `on_approval()`. Writes e commands executam sem gate, mesmo com `write_tool_policy: Ask`.
+### ~~G2. Approval Broker Not Wired (security gap)~~ ✅ FIXED
+- **Gap:** Os tipos `ApprovalRequest`, `ApprovalDecision` e `AgentHooks.on_approval` existem em `src/agent/agent_loop.rs:50-71`, mas `execute_tool_call()` nunca chama `on_approval()`. Writes e commands executam sem gate, mesmo com `write_tool_policy: Ask`.
 - **Impact:** Segurança — o modelo pode escrever/executar qualquer coisa sem aprovação.
-- **Files:** `src/agent/loop.rs`, `src/agent/executor.rs`
-- **Fix:** No dispatch de tools mutadores/commands, verificar a policy (`write_tool_policy`/`command_tool_policy`) e chamar `hooks.on_approval()` antes de executar. Se `Deny` ou sem callback, retornar erro.
+- **Files:** `src/agent/agent_loop.rs`, `src/agent/executor.rs`
+- **Fix:** No dispatch de tools mutadores/commands, verificar a policy (`write_tool_policy`/`command_tool_policy`) e chamar `hooks.on_approval()` antes de executar. Se `Deny` ou sem callback, retornar erro. Todos os mutation tools (write_file, replace_exact, edit_file, multi_edit_file) e command tools (run_command, run_tests) passam pelo gate. O TUI (`src/ui.rs`) implementa o fluxo interativo de aprovação via canal mpsc.
 
-### G3. Context Compaction / Conversation Summarization
+### ~~G3. Context Compaction / Conversation Summarization~~ ✅ DONE
 - **Gap:** O histórico de conversa cresce indefinidamente. Quando excede o contexto do modelo, o loop falha. Nenhuma sumarização ou compactação de mensagens antigas.
 - **Impact:** Tarefas longas (multi-step refactoring) falham por context overflow.
 - **Files:** `src/agent/loop.rs`, `src/compressor/`
-- **Fix:** Quando `estimated_tokens > 0.8 * max_context_tokens`, sumarizar mensagens antigas (exceto as últimas N) usando o modelo summarizer. O compressor já existe em `src/compressor/` mas não está integrado no agent loop.
+- **Fix:** Quando `estimated_tokens > 0.8 * max_context_tokens`, sumarizar mensagens antigas (exceto as últimas N) usando o modelo summarizer. Implementado em `maybe_compact()` em `src/agent/agent_loop.rs:226` com threshold de 80% do contexto. `Session::compact()` em `src/memory/short_term.rs` injeta o resumo. Disparado no início de cada turno.
+- **Ref:** ADR 0009
 
-### G4. Token Counting
+### ~~G4. Token Counting~~ ✅ DONE
 - **Gap:** Não há contagem de tokens. Não sabe quanto contexto resta por turno.
 - **Impact:** Pré-requisito para G3 (compaction) e G6 (cost tracking).
 - **Files:** `src/llm/client.rs`, `src/agent/loop.rs`
-- **Fix:** Adicionar estimativa de tokens (chars/4 como baseline, ou tiktoken-rs). Rastrear tokens in/out em cada chamada LLM. Expor `remaining_context()` para o agent loop.
+- **Fix:** Adicionar estimativa de tokens usando subword length division, punctuation weighting, e multibyte UTF-8 handling em `src/memory/short_term.rs`. Rastrear tokens in/out em cada chamada LLM. Expor `estimated_tokens()` e `remaining_context()` para o agent loop. Usado por `maybe_compact()` para decidir quando sumarizar.
+- **Ref:** ADR 0009
 
 ## P1 — Error Handling & Robustness
 
@@ -342,9 +344,7 @@
 
 | Sprint | Focus | Items | Timeline |
 |--------|-------|-------|----------|
-| **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
-| **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **3** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+| **1** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
 
 ### Test Coverage
 
