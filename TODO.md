@@ -296,7 +296,7 @@
 | Feature | Status | ADR |
 |---------|--------|-----|
 | Workspace transactions (snapshot/diff/rollback) | ✅ Done | 0002 |
-| Interactive approval broker (types) | ⚠️ Types only — not wired | 0002 |
+| Interactive approval broker (G2) | ✅ Done | 0002 |
 | Parallel read-only tool execution | ✅ Done | 0002 |
 | `tool_choice` + capability filtering | ✅ Done | 0002 |
 | Unified orchestration (no more FallbackChain) | ✅ Done | 0002 |
@@ -323,7 +323,6 @@
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| G2 | **P0** | Wire approval broker to tool dispatch | Harness/Safety | Baixo |
 | G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
 | G7 | P1 | MCP client (stdio transport) | Harness | Alto |
 | G9 | P1 | Streaming tool call deltas | Harness | Médio |
