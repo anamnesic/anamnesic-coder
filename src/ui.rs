@@ -605,7 +605,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
             let mut a = app.lock().unwrap();
             for ev in agent_events {
                 match ev {
-                    AgentEvent::Status(text) => a.add_message("System", &text),
+                    AgentEvent::Status(text) => a.status = text,
                     AgentEvent::ToolCall { name, summary } => {
                         let s: String = summary.chars().take(120).collect();
                         a.add_message("Tool", &format!("{name} — {s}"));
