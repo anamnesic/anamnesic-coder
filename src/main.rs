@@ -8,6 +8,7 @@ mod compressor;
 mod config;
 mod hw_recommend;
 mod llm;
+mod mcp;
 mod memory;
 mod models_dev;
 mod providers;

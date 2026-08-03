@@ -65,6 +65,7 @@ pub struct Config {
     pub require_diff_summary: bool,
     pub write_tool_policy: ApprovalPolicy,
     pub command_tool_policy: ApprovalPolicy,
+    pub mcp_servers: Vec<crate::mcp::McpServerConfig>,
 }
 
 impl Default for Config {
@@ -151,6 +152,7 @@ impl Default for Config {
                 "COMMAND_TOOL_POLICY",
                 ApprovalPolicy::Allow,
             ),
+            mcp_servers: Vec::new(),
         }
     }
 }

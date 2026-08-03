@@ -26,6 +26,7 @@ pub struct AgentState {
     pub files: FileTools,
     pub git: GitTools,
     pub caveman: CavemanLevel,
+    pub mcp_clients: Vec<crate::mcp::McpClient>,
 }
 
 impl AgentState {
@@ -47,6 +48,7 @@ impl AgentState {
             git: GitTools::new(config.workspace_dir.to_string_lossy().to_string()),
             config,
             caveman: CavemanLevel::Off,
+            mcp_clients: Vec::new(),
         })
     }
 
@@ -148,11 +150,12 @@ impl Clone for AgentState {
             transaction: None,
             dirty: false,
             config: self.config.clone(),
-            session: self.session.clone(),
+            session: ShortTermMemory::new(self.config.max_context_tokens),
             long_memory: self.long_memory.clone(),
             files: self.files.clone(),
             git: self.git.clone(),
             caveman: self.caveman,
+            mcp_clients: Vec::new(),
         }
     }
 }

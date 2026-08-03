@@ -534,6 +534,37 @@ fn tool_effect(name: &str) -> ToolEffect {
     }
 }
 
+fn connect_mcp_clients(state: &mut AgentState) {
+    let configs = state.config.mcp_servers.clone();
+    for config in configs {
+        match crate::mcp::McpClient::connect(&config) {
+            Ok(client) => state.mcp_clients.push(client),
+            Err(err) => eprintln!("[mcp] failed to connect to {}: {err}", config.command),
+        }
+    }
+}
+
+fn try_mcp_tool(
+    state: &mut AgentState,
+    tc: &crate::llm::client::ToolCall,
+) -> Option<ToolExecutionResult> {
+    let args = tool_arguments(tc).ok()?;
+    let name = &tc.function.name;
+    for client in &mut state.mcp_clients {
+        if let Ok(result) = client.call_tool(name, &args) {
+            return Some(ToolExecutionResult {
+                output: truncate_tool_output(&result, state.config.max_tool_output_bytes),
+                mutated: false,
+                changed_file: None,
+                verification: None,
+                exit_code: None,
+                timed_out: false,
+            });
+        }
+    }
+    None
+}
+
 /// Owned, `Send + Sync` view of the workspace used to run read-only tools
 /// concurrently without sharing `AgentState` (which holds a SQLite handle).
 struct ReadContext {
@@ -905,7 +936,13 @@ fn execute_tool(
                     Err(_) => ToolExecutionResult::output(format!("[task:{model}] timed out")),
                 }
             }
-        _ => ToolExecutionResult::output(format!("Unknown tool: {}", tc.function.name)),
+        _ => {
+            if let Some(result) = try_mcp_tool(state, tc) {
+                result
+            } else {
+                ToolExecutionResult::output(format!("Unknown tool: {}", tc.function.name))
+            }
+        }
     }
 }
 
@@ -1097,7 +1134,7 @@ fn search_workspace_without_rg(root: &std::path::Path, pattern: &str) -> String 
     }
 }
 
-fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
+fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
     use crate::llm::client::{ToolDef, ToolFunction};
     let object = |properties, required| {
         serde_json::json!({
@@ -1115,7 +1152,7 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
             parameters,
         },
     };
-    vec![
+    let mut tools = vec![
         tool(
             "list_tree",
             "List a bounded workspace tree. Use before reading unfamiliar repositories.",
@@ -1247,7 +1284,13 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
                 serde_json::json!(["task"]),
             ),
         ),
-    ]
+    ];
+    for client in &mut state.mcp_clients {
+        if let Ok(mcp_tools) = client.list_tools() {
+            tools.extend(mcp_tools);
+        }
+    }
+    tools
 }
 
 pub async fn run_agent_loop(client: &LlmRouter, state: &mut AgentState, task: &str) {
@@ -1280,6 +1323,7 @@ pub async fn run_agent_loop_with_hooks(
     hooks.note(&format!("[Planning] {task}"));
     state.session.add_message("user", task);
 
+    connect_mcp_clients(state);
     maybe_compact(client, state).await;
 
     if hooks.interrupted() {
@@ -1301,7 +1345,7 @@ async fn run_agent_mode(
     task: &str,
     hooks: &AgentHooks,
 ) {
-    let tools = coding_tools();
+            let tools = coding_tools(state);
     let model = state.config.coder_model.clone();
     match run_tool_use_iteration(client, state, &model, task, &tools, hooks).await {
         Ok(ToolLoopOutcome::Completed(final_text)) => {
@@ -1438,7 +1482,7 @@ async fn run_planner_fallback(
             let fix_task = format!(
                 "Fix the failed verification for the original task: {task}\n\nVerification output:\n{feedback}"
             );
-            let tools = coding_tools();
+    let tools = coding_tools(state);
             let model = state.config.coder_model.clone();
             match run_tool_use_iteration(client, state, &model, &fix_task, &tools, hooks).await {
                 Ok(ToolLoopOutcome::Completed(message)) => {
@@ -1794,6 +1838,15 @@ mod tests {
         let denied = automatic_verification(&state);
         assert_eq!(denied.status, VerificationStatus::Unavailable);
         assert!(denied.output.contains("denied by policy"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn try_mcp_tool_returns_none_when_no_mcp_clients() {
+        let (mut state, root) = test_state("mcp-none");
+        let call = tool_call("some_mcp_tool", serde_json::json!({"arg": "value"}));
+        let result = try_mcp_tool(&mut state, &call);
+        assert!(result.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }

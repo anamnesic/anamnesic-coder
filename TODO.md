@@ -111,11 +111,12 @@
 - **Files:** `src/llm/client.rs`, `src/agent/loop.rs`, `src/ui.rs`
 - **Fix:** Em `ChatCompletion`, adicionar `usage: Option<Usage>` (prompt_tokens, completion_tokens). Acumular por turno. Mostrar no status bar do TUI.
 
-### G7. MCP Client (Model Context Protocol)
+### ~~G7. MCP Client (Model Context Protocol)~~ ✅ DONE
 - **Gap:** Não conecta a tool servers MCP externos. Todos os líderes (Claude Code, Antigravity, Cursor, Codex) suportam MCP.
 - **Impact:** Extensibilidade — não pode usar tools de terceiros (GitHub, DB, Jira, etc.).
-- **Files:** Novo módulo `src/mcp/`
-- **Fix:** Implementar MCP client com stdio transport. Registrar tools MCP dinamicamente no tool registry do executor. Começar com o protocolo mínimo: `initialize`, `tools/list`, `tools/call`.
+- **Files:** `src/mcp/mod.rs`, `src/agent/agent_loop.rs`, `src/config/settings.rs`, `src/agent/state.rs`
+- **Fix:** Implementado MCP client com stdio transport em `src/mcp/mod.rs`. `McpClient::connect()` spawns processo filho, envia `initialize` JSON-RPC, e mantém stdin/stdout pipes. `list_tools()` converte tools MCP para `ToolDef`. `call_tool()` envia `tools/call` e extrai conteúdo textual. Registrado em `coding_tools(state)` que agora aceita `&mut AgentState` e mescla tools MCP com tools built-in. `execute_tool()` tem fallback `try_mcp_tool()` para tool names não reconhecidos. `connect_mcp_clients()` é chamado no início de `run_agent_loop_with_hooks`. Config: `Config.mcp_servers: Vec<McpServerConfig>`. State: `AgentState.mcp_clients: Vec<McpClient>`.
+- **Ref:** ADR 0012
 
 ### G8. Auto-Read Project Context (AGENTS.md)
 - **Gap:** O agente não lê nenhum arquivo de contexto de projeto automaticamente. O próprio projeto tem um `AGENTS.md` mas o agente ignora.
@@ -375,7 +376,7 @@
 |--------|-------|-------|----------|
 | **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
 | **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **3** | Architecture | G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+| **3** | Architecture | G9 (streaming deltas) | 1-2 semanas |
 
 ### Test Coverage
 
