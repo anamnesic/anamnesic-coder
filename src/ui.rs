@@ -1446,21 +1446,24 @@ fn draw<B: ratatui::backend::Backend>(
             let c = app.editor_col as u16;
             f.set_cursor_position((cols[1].x + c + 1, cols[1].y + r + 1));
         } else {
-            let messages_lines = flatten_messages(app);
-            let view_height = (cols[1].height as usize).saturating_sub(2); // borders
-            let total = messages_lines.len();
-            let offset = if app.follow {
-                total.saturating_sub(view_height)
-            } else {
-                let max = total.saturating_sub(1);
-                app.scroll_offset.min(max)
-            };
-            let scroll_offset = offset.min(u16::MAX as usize) as u16;
-            let messages_block = Block::default().title(" Chat ").borders(Borders::ALL);
-            let messages_widget = Paragraph::new(messages_lines)
-                .block(messages_block)
-                .scroll((0, scroll_offset));
-            f.render_widget(messages_widget, cols[1]);
+        let messages_lines = flatten_messages(app);
+        let view_height = (cols[1].height as usize).saturating_sub(2); // borders
+        let total = messages_lines.len();
+        let offset = if app.follow {
+            total.saturating_sub(view_height)
+        } else {
+            let max = total.saturating_sub(1);
+            app.scroll_offset.min(max)
+        };
+        let visible = if total <= view_height {
+            messages_lines
+        } else {
+            let start = offset.min(total - view_height);
+            messages_lines[start..start + view_height].to_vec()
+        };
+        let messages_block = Block::default().title(" Chat ").borders(Borders::ALL);
+        let messages_widget = Paragraph::new(visible).block(messages_block);
+        f.render_widget(messages_widget, cols[1]);
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
@@ -1598,24 +1601,124 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
             _ => Style::default().fg(Color::Gray),
         };
         let label = format!("{role}: ");
-        let mut first = true;
-        for content_line in content.lines() {
-            if first {
-                lines.push(Line::from(vec![
-                    Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(content_line.to_string(), style),
-                ]));
-                first = false;
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled("       ", style),
-                    Span::styled(content_line.to_string(), style),
-                ]));
+        let md_rendered = render_markdown_lines(content);
+        if let Some(md_lines) = md_rendered {
+            if !md_lines.is_empty() {
+                let mut md_iter = md_lines.into_iter();
+                if let Some(first_line) = md_iter.next() {
+                    lines.push(Line::from(vec![
+                        Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                        first_line,
+                    ]));
+                }
+                for line in md_iter {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ".repeat(label.len()), Style::default().fg(Color::DarkGray)),
+                        line,
+                    ]));
+                }
+            }
+        } else {
+            let mut first = true;
+            for content_line in content.lines() {
+                if first {
+                    lines.push(Line::from(vec![
+                        Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(content_line.to_string(), style),
+                    ]));
+                    first = false;
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ", style),
+                        Span::styled(content_line.to_string(), style),
+                    ]));
+                }
             }
         }
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd, Options};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(text, opts);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut in_code = false;
+    let mut in_bold = false;
+    let mut in_italic = false;
+    let mut in_strike = false;
+    let mut code_text = String::new();
+    for event in parser {
+        match event {
+            Event::Text(t) => {
+                if in_code {
+                    code_text.push_str(t.as_ref());
+                } else if in_bold || in_italic || in_strike {
+                    spans.push(Span::styled(
+                        t.as_ref().to_string(),
+                        Style::default()
+                            .add_modifier(if in_bold { Modifier::BOLD } else { Modifier::empty() })
+                            .add_modifier(if in_italic { Modifier::ITALIC } else { Modifier::empty() })
+                            .add_modifier(if in_strike { Modifier::DIM } else { Modifier::empty() }),
+                    ));
+                } else {
+                    spans.push(Span::raw(t.as_ref().to_string()));
+                }
+            }
+            Event::Code(t) => {
+                spans.push(Span::styled(
+                    format!(" {} ", t.as_ref()),
+                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                ));
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if in_code {
+                    code_text.push('\n');
+                } else {
+                    spans.push(Span::raw(" ".to_string()));
+                }
+            }
+            Event::Start(tag) => match tag {
+                Tag::CodeBlock(_) => {
+                    in_code = true;
+                    code_text.clear();
+                }
+                Tag::Strong => in_bold = true,
+                Tag::Emphasis => in_italic = true,
+                Tag::Strikethrough => in_strike = true,
+                Tag::Link { .. } => {}
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::CodeBlock => {
+                    spans.push(Span::styled(
+                        code_text.clone(),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+                    in_code = false;
+                    code_text.clear();
+                }
+                TagEnd::Strong => in_bold = false,
+                TagEnd::Emphasis => in_italic = false,
+                TagEnd::Strikethrough => in_strike = false,
+                _ => {}
+            },
+            Event::Rule => {
+                spans.push(Span::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
+            }
+            _ => {}
+        }
+    }
+    if !spans.is_empty() {
+        Some(spans)
+    } else {
+        None
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
