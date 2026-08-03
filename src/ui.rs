@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -100,6 +100,7 @@ pub struct App {
     /// Pending approval prompt (`ask` policy): the worker blocks until the
     /// user answers, but rendering and input keep running.
     pub pending_approval: Option<ApprovalRequest>,
+    pub quit_pending: bool,
 }
 
 impl App {
@@ -121,7 +122,7 @@ impl App {
             editor_scroll: 0,
             input_history: Vec::new(),
             history_index: None,
-            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit"
+            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
                 .into(),
             scroll_offset: 0,
             follow: true,
@@ -143,6 +144,7 @@ impl App {
             provider_items: Vec::new(),
             provider_selected: 0,
             pending_approval: None,
+            quit_pending: false,
         }
     }
 
@@ -234,14 +236,14 @@ fn handle_slash_command(
                 }
                 app.add_message("System", &out);
             }
-            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
+            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt".into();
             true
         }
         "/reset" => {
             state.lock().unwrap().reset();
             app.messages.clear();
             app.add_message("System", "Session reset.");
-            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
+            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt".into();
             true
         }
         "/status" => {
@@ -326,7 +328,7 @@ fn handle_slash_command(
                         &format!("No models found in {}. models.dev catalog also empty (offline?). Use /model <name> to set one anyway.", dir.display()),
                     );
                     app.status =
-                        "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit".into();
+                        "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt".into();
                 } else {
                     app.model_items = items;
                     app.model_selected = app
@@ -403,7 +405,7 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
             if is_cloud { " (cloud)" } else { "" }
         ),
     );
-    app.status = format!("Ready · model: {clean} · Esc quit");
+    app.status = format!("Ready · model: {clean} · Esc interrupt");
 }
 
 /// Set the active cloud provider: rebuilds the router's cloud backend using
@@ -632,7 +634,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.add_message("Assistant", &message);
                         a.loading = false;
                         a.status =
-                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc quit"
+                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
                                 .into();
                     }
                     AgentEvent::Transaction { action, summary } => {
@@ -641,12 +643,12 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     AgentEvent::Failed { message } => {
                         a.add_message("Error", &message);
                         a.loading = false;
-                        a.status = "Failed · Enter to retry · Esc quit".into();
+                        a.status = "Failed · Enter to retry · Esc interrupt".into();
                     }
                     AgentEvent::Interrupted => {
                         a.add_message("System", "Turn interrupted by user.");
                         a.loading = false;
-                        a.status = "Interrupted · Enter to send · Esc quit".into();
+                        a.status = "Interrupted · Enter to send · Esc interrupt".into();
                     }
                 }
             }
@@ -677,8 +679,13 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
 
         match rx.recv_timeout(Duration::from_millis(80)) {
             Ok(Event::Key(key)) => {
+                // On Windows, crossterm emits both Press and Release events.
+                // Only handle Press (and Repeat for held keys) to avoid double input.
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
                 let mut guard = app.lock().unwrap();
-                // The approval modal owns input until the user decides.
+                // The approval modal only captures explicit decisions.
                 if guard.pending_approval.is_some() {
                     let decision = match key.code {
                         KeyCode::Char('a') => Some(ApprovalDecision::AllowOnce),
@@ -696,14 +703,26 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         if let Some(request) = request {
                             guard.add_message("Approval", &format!("{} — {label}", request.tool));
                         }
-                        guard.status = "Working… (Esc to interrupt)".into();
+                        guard.status = "Working…".into();
                         let _ = decision_tx.send(decision);
+                        continue;
                     }
-                    continue;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
                     guard.messages.clear();
                     guard.status = "Chat cleared (session memory is preserved).".into();
+                    continue;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    if guard.loading {
+                        interrupt.store(true, Ordering::Relaxed);
+                        guard.status = "Interrupting…".into();
+                    } else if guard.quit_pending {
+                        break;
+                    } else {
+                        guard.quit_pending = true;
+                        guard.status = "Ctrl+C again to quit".into();
+                    }
                     continue;
                 }
                 // Modal pickers (slash-command menu / model selector) take over
@@ -817,7 +836,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         };
                         guard.add_message("System", &format!("Mode switched to {}", mode_str));
                         guard.status = format!(
-                            "Ready · mode: {} · Esc quit",
+                            "Ready · mode: {} · Esc interrupt",
                             match guard.agent_mode {
                                 AgentMode::Agent => "agent",
                                 AgentMode::Plan => "plan",
@@ -1030,17 +1049,16 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Esc => {
-                        // If editing, close editor; else interrupt running turn or exit
+                        // If editing, close editor; else interrupt running turn
                         if guard.focus == Focus::Editor {
                             guard.editor_file = None;
                             guard.editor_lines.clear();
                             guard.focus = Focus::Input;
                         } else if guard.loading {
                             interrupt.store(true, Ordering::Relaxed);
-                            guard.status = "Interrupting… (Esc again to force quit)".into();
-                        } else {
-                            break;
+                            guard.status = "Interrupting…".into();
                         }
+                        guard.quit_pending = false;
                     }
                     _ => {}
                 }
@@ -1172,7 +1190,7 @@ fn draw<B: ratatui::backend::Backend>(
                 format_elapsed(app.elapsed)
             )
         } else {
-            " Esc quit ".into()
+            " Esc interrupt ".into()
         };
         let status_pad = (size.width as usize)
             .saturating_sub(status_left.chars().count() + status_right.chars().count());
