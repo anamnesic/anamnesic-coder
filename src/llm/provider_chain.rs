@@ -73,6 +73,71 @@ impl ProviderError {
     }
 }
 
+// ---------- Circuit breaker ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+pub struct CircuitBreaker {
+    state: tokio::sync::Mutex<CircuitState>,
+    failures: tokio::sync::Mutex<u32>,
+    opened_at: tokio::sync::Mutex<Option<Instant>>,
+    threshold: u32,
+    cooldown: Duration,
+}
+
+impl CircuitBreaker {
+    pub fn new(threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(CircuitState::Closed),
+            failures: tokio::sync::Mutex::new(0),
+            opened_at: tokio::sync::Mutex::new(None),
+            threshold,
+            cooldown,
+        }
+    }
+
+    pub async fn allow(&self) -> bool {
+        let mut state = self.state.lock().await;
+        match *state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                let mut opened = self.opened_at.lock().await;
+                if opened.map(|t| t.elapsed() > self.cooldown).unwrap_or(false) {
+                    *state = CircuitState::HalfOpen;
+                    *opened = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            CircuitState::HalfOpen => true,
+        }
+    }
+
+    pub async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        let mut failures = self.failures.lock().await;
+        *failures = 0;
+        *state = CircuitState::Closed;
+    }
+
+    pub async fn record_failure(&self) {
+        let mut failures = self.failures.lock().await;
+        *failures += 1;
+        if *failures >= self.threshold {
+            let mut state = self.state.lock().await;
+            let mut opened = self.opened_at.lock().await;
+            *state = CircuitState::Open;
+            *opened = Some(Instant::now());
+        }
+    }
+}
+
 // ---------- Trait comum pra qualquer backend (NIM, local, etc) ----------
 
 #[async_trait::async_trait]
@@ -194,6 +259,58 @@ impl CompletionProvider for LocalProvider {
     }
 }
 
+pub struct CircuitBreakerProvider {
+    inner: Arc<dyn CompletionProvider>,
+    breaker: CircuitBreaker,
+}
+
+impl CircuitBreakerProvider {
+    pub fn new(inner: Arc<dyn CompletionProvider>, threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            inner,
+            breaker: CircuitBreaker::new(threshold, cooldown),
+        }
+    }
+
+    pub async fn try_acquire(&self) -> bool {
+        self.breaker.allow().await
+    }
+
+    pub async fn record_success(&self) {
+        self.breaker.record_success().await;
+    }
+
+    pub async fn record_failure(&self) {
+        self.breaker.record_failure().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl CompletionProvider for CircuitBreakerProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn complete(&self, prompt: &str) -> Result<String, ProviderError> {
+        if !self.breaker.allow().await {
+            return Err(ProviderError::Transient(format!(
+                "circuit breaker open for {}",
+                self.name()
+            )));
+        }
+        match self.inner.complete(prompt).await {
+            Ok(text) => {
+                self.breaker.record_success().await;
+                Ok(text)
+            }
+            Err(err) => {
+                self.breaker.record_failure().await;
+                Err(err)
+            }
+        }
+    }
+}
+
 // ---------- Fallback chain com retry + backoff exponencial + jitter ----------
 
 pub struct FallbackChain {
@@ -203,7 +320,11 @@ pub struct FallbackChain {
 
 impl FallbackChain {
     pub fn new(providers: Vec<Arc<dyn CompletionProvider>>) -> Self {
-        Self { providers, max_retries_per_provider: 3 }
+        let wrapped: Vec<Arc<dyn CompletionProvider>> = providers
+            .into_iter()
+            .map(|p| Arc::new(CircuitBreakerProvider::new(p, 3, Duration::from_secs(30))) as Arc<dyn CompletionProvider>)
+            .collect();
+        Self { providers: wrapped, max_retries_per_provider: 3 }
     }
 
     pub async fn complete(&self, prompt: &str) -> Result<String, String> {
@@ -357,5 +478,29 @@ mod tests {
         let chain = FallbackChain::new(vec![a, b]);
         let err = run(chain.complete("x")).unwrap_err();
         assert!(err.contains("falharam"), "got: {err}");
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold_failures() {
+        let breaker = CircuitBreaker::new(3, Duration::from_secs(60));
+        run(async move {
+            assert!(breaker.allow().await);
+            breaker.record_failure().await;
+            breaker.record_failure().await;
+            assert!(breaker.allow().await);
+            breaker.record_failure().await;
+            assert!(!breaker.allow().await);
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_records_success() {
+        let breaker = CircuitBreaker::new(2, Duration::from_secs(60));
+        run(async move {
+            assert!(breaker.allow().await);
+            breaker.record_failure().await;
+            breaker.record_success().await;
+            assert!(breaker.allow().await);
+        });
     }
 }

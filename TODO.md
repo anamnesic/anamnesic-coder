@@ -131,6 +131,13 @@
 - **Fix:** Implementado streaming incremental de tool call deltas. `CloudClient::stream_chat` agora aceita `on_tool_call_delta` callback e emite `(index, name, args_delta)` para cada delta SSE. `LlmClient::stream` e `LlmRouter::stream` propagam o callback. `AgentEvent::ToolCallDelta` adicionado para eventos parciais. `AgentHooks::on_tool_call_delta` adicionado. UI handle `ToolCallDelta` exibindo `name[index] Δ args_delta`. `executor.rs` atualizado para passar no-op delta callback. 174 tests pass.
 - **Ref:** ADR 0013
 
+### ~~Provider health checks, circuit breaking~~ ✅ DONE
+- **Gap:** Sem proteção contra providers instáveis. Se um provider cai, o loop retry forever sem circuit breaker.
+- **Impact:** Robustez — latência alta e custo com retries infinitos.
+- **Files:** `src/llm/provider_chain.rs`
+- **Fix:** Implementado `CircuitBreaker` com estados Closed/Open/HalfOpen. `CircuitBreakerProvider` wrapper around any `CompletionProvider`. `FallbackChain::new` agora wraps todos os providers com `CircuitBreakerProvider` (threshold=3, cooldown=30s). Após 3 falhas consecutivas, circuito abre por 30s. Após cooldown, tenta novamente (half-open). Sucesso reseta o contador. 2 testes: `circuit_breaker_opens_after_threshold_failures` e `circuit_breaker_records_success`.
+- **Ref:** ADR 0014
+
 ### G10. `list_files` Should Include Directories
 - **Gap:** `list_files` só retorna arquivos (`is_file()`), não diretórios. Antigravity e Claude Code retornam ambos.
 - **Impact:** O modelo não vê a estrutura de diretórios do projeto.
