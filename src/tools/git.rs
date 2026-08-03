@@ -1,5 +1,6 @@
 use std::process::Command;
 
+#[derive(Debug, Clone)]
 pub struct GitTools {
     repo: String,
 }

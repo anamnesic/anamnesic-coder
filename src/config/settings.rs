@@ -39,6 +39,7 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub workspace_dir: PathBuf,
     pub memory_dir: PathBuf,

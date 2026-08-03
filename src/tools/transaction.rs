@@ -48,7 +48,7 @@ impl WorkspaceDiff {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceTransaction {
     root: PathBuf,
     baseline: BTreeMap<PathBuf, Vec<u8>>,

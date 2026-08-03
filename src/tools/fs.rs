@@ -21,6 +21,7 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+#[derive(Debug, Clone)]
 pub struct FileTools {
     workspace: PathBuf,
 }

@@ -9,7 +9,9 @@ use crate::tools::test::{self, VerificationResult, VerificationStatus};
 use crate::ui::AgentMode;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Progress events emitted by the agent loop, consumed by the TUI to show
 /// live tool calls, plan steps and final results (mirrors exec-cell streaming
@@ -358,7 +360,7 @@ async fn run_tool_use_iteration(
                 "content": if response.trim().is_empty() { serde_json::Value::Null } else { serde_json::Value::String(response.clone()) },
                 "tool_calls": &tool_calls,
             }));
-            let results = execute_tool_calls(state, &tool_calls, hooks);
+            let results = execute_tool_calls(client, state, &tool_calls, hooks);
             for (tc, result) in tool_calls.iter().zip(results) {
                 let mut summary =
                     truncate_tool_output(&result.output, state.config.max_tool_output_bytes);
@@ -556,6 +558,7 @@ fn read_context(state: &AgentState) -> ReadContext {
 /// (bounded fan-out), while mutations and commands stay strictly sequential.
 /// Results are always returned in the model's original call order.
 fn execute_tool_calls(
+    client: &LlmRouter,
     state: &mut AgentState,
     tool_calls: &[crate::llm::client::ToolCall],
     hooks: &AgentHooks,
@@ -567,7 +570,7 @@ fn execute_tool_calls(
 
     while index < tool_calls.len() {
         if tool_effect(&tool_calls[index].function.name) != ToolEffect::ReadOnly {
-            results[index] = Some(execute_tool(state, &tool_calls[index], hooks));
+            results[index] = Some(execute_tool(client, state, &tool_calls[index], hooks));
             index += 1;
             continue;
         }
@@ -683,6 +686,7 @@ fn execute_read_only(
 }
 
 fn execute_tool(
+    client: &LlmRouter,
     state: &mut AgentState,
     tc: &crate::llm::client::ToolCall,
     hooks: &AgentHooks,
@@ -845,6 +849,62 @@ fn execute_tool(
                 verification: Some(verification),
             }
         }
+        "task" => {
+                let Some(task) = string_arg("task") else {
+                    return ToolExecutionResult::output("missing required argument: task");
+                };
+                let model = string_arg("model").unwrap_or(&state.config.coder_model);
+                let (tx, rx) = mpsc::channel::<(String, bool)>();
+                let tx = Arc::new(Mutex::new(Some(tx)));
+                let client = client.clone();
+                let mut sub_state = state.clone();
+                let task = task.to_string();
+                let model = model.to_string();
+                thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async move {
+                        let _ = sub_state.start_turn();
+                        sub_state.session.add_message("user", &task);
+                        let sub_hooks = AgentHooks {
+                            on_event: Some(Arc::new({
+                                let tx = tx.clone();
+                                move |event| {
+                                    if let AgentEvent::Done { message } = event {
+                                        if let Some(tx) = tx.lock().unwrap().take() {
+                                            let _ = tx.send((message.clone(), true));
+                                        }
+                                    } else if let AgentEvent::Failed { message } = event {
+                                        if let Some(tx) = tx.lock().unwrap().take() {
+                                            let _ = tx.send((message.clone(), false));
+                                        }
+                                    }
+                                }
+                            })),
+                            on_approval: None,
+                            interrupt: None,
+                        };
+                        let _ = run_agent_loop_with_hooks(
+                            &client,
+                            &mut sub_state,
+                            &task,
+                            &sub_hooks,
+                            AgentMode::Agent,
+                        )
+                        .await;
+                    });
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+                    Ok((msg, ok)) => ToolExecutionResult {
+                        output: format!("[task:{model}] {msg}"),
+                        mutated: false,
+                        changed_file: None,
+                        verification: None,
+                        exit_code: None,
+                        timed_out: !ok,
+                    },
+                    Err(_) => ToolExecutionResult::output(format!("[task:{model}] timed out")),
+                }
+            }
         _ => ToolExecutionResult::output(format!("Unknown tool: {}", tc.function.name)),
     }
 }
@@ -1176,6 +1236,17 @@ fn coding_tools() -> Vec<crate::llm::client::ToolDef> {
                 serde_json::json!(["command"]),
             ),
         ),
+        tool(
+            "task",
+            "Spawn a sub-agent to execute a self-contained task in isolation. Use for complex multi-step work that should not pollute the current session.",
+            object(
+                serde_json::json!({
+                    "task": {"type": "string"},
+                    "model": {"type": "string"}
+                }),
+                serde_json::json!(["task"]),
+            ),
+        ),
     ]
 }
 
@@ -1430,7 +1501,12 @@ async fn run_planner_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::client::LlmClient;
     use std::sync::Mutex;
+
+    fn dummy_router() -> LlmRouter {
+        LlmRouter::new(LlmClient::ollama("http://localhost:11434"))
+    }
 
     #[test]
     fn typed_progress_is_emitted_once_without_duplicate_status_events() {
@@ -1506,7 +1582,7 @@ mod tests {
             tool_call("read_file", serde_json::json!({"path": "c.txt"})),
         ];
 
-        let results = execute_tool_calls(&mut state, &calls, &AgentHooks::default());
+        let results = execute_tool_calls(&dummy_router(), &mut state, &calls, &AgentHooks::default());
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].output, "alpha");
@@ -1525,7 +1601,7 @@ mod tests {
             serde_json::json!({"path": "new.txt", "content": "x"}),
         );
 
-        let result = execute_tool(&mut state, &call, &AgentHooks::default());
+        let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
 
         assert!(!result.mutated, "got: {}", result.output);
         assert!(state.files.read_file("new.txt").is_none());
@@ -1552,7 +1628,7 @@ mod tests {
             serde_json::json!({"path": "new.txt", "content": "approved"}),
         );
 
-        let result = execute_tool(&mut state, &call, &hooks);
+        let result = execute_tool(&dummy_router(), &mut state, &call, &hooks);
 
         assert!(result.mutated, "got: {}", result.output);
         assert_eq!(
@@ -1645,13 +1721,28 @@ mod tests {
             }),
         );
 
-        let result = execute_tool(&mut state, &call, &AgentHooks::default());
+        let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
 
         assert!(result.mutated, "got: {}", result.output);
         assert_eq!(
             state.files.read_file("src.rs").as_deref(),
             Some("A\nb\nC\nD2\n")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_tool_spawns_sub_agent() {
+        let (mut state, root) = test_state("task-tool");
+        let call = tool_call(
+            "task",
+            serde_json::json!({"task": "Say hello from sub-agent"}),
+        );
+
+        let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
+
+        assert!(result.output.contains("[task:"), "got: {}", result.output);
+        assert!(result.output.contains("hello") || result.output.contains("timed out"), "got: {}", result.output);
         let _ = std::fs::remove_dir_all(root);
     }
 

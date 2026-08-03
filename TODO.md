@@ -98,11 +98,12 @@
 
 ## P1 — Harness Gaps (competitive parity)
 
-### G5. Sub-Agent Support (Task tool)
+### ~~G5. Sub-Agent Support (Task tool)~~ ✅ DONE
 - **Gap:** O Anamnesic tem apenas um loop sequencial. Claude Code, Antigravity e Cursor suportam sub-agentes para delegação de tarefas e pesquisa paralela.
 - **Impact:** Tarefas complexas (multi-arquivo, refatoração) são lentas e gastam mais tokens.
-- **Files:** `src/agent/loop.rs` (novo módulo `src/agent/subagent.rs`)
-- **Fix:** Implementar tool `task` que spawna um segundo agent loop com contexto isolado. O sub-agente recebe um prompt, executa tools, e retorna o resultado ao agente pai. Limitar depth=1 inicialmente.
+- **Files:** `src/agent/agent_loop.rs`, `src/agent/state.rs`
+- **Fix:** Implementado tool `task` que spawna um sub-agente em thread separada com `tokio::runtime::Runtime::new()`. O sub-agente usa `AgentState::clone()` (com `Clone` manual resetando retries/transaction/dirty), roda `run_agent_loop_with_hooks` em modo `Agent`, e retorna o resultado via `mpsc::channel` com timeout de 300s. `execute_tool` e `execute_tool_calls` atualizados para receber `&LlmRouter`. Registrado em `coding_tools()` com parâmetros `task` (required) e `model` (optional).
+- **Ref:** ADR 0011
 
 ### G6. Cost Tracking Per Turn
 - **Gap:** Não sabe quanto gastou em tokens/dinheiro por turno ou sessão. Claude Code e Aider mostram isso.
@@ -346,12 +347,12 @@
 | ESC handling: interrupt + approval deny + Ctrl+C twice quit | ✅ Done | UI |
 | Windows duplicate character input fix (KeyEventKind filter) | ✅ Done | UI |
 | Fixed TUI layout: dedicated status line, no overlap during retries | ✅ Done | UI |
+| Collapsible workspace info panel (Context, Token Usage, Models, Todo, etc.) | ✅ Done | UI |
 
 ### All Open Demands
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| G5 | **P1** | Sub-agent support (Task tool) | Harness | Alto |
 | G7 | P1 | MCP client (stdio transport) | Harness | Alto |
 | G9 | P1 | Streaming tool call deltas | Harness | Médio |
 | — | P1 | Provider health checks, circuit breaking | Robustness | Médio |
@@ -374,7 +375,7 @@
 |--------|-------|-------|----------|
 | **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
 | **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **3** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+| **3** | Architecture | G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
 
 ### Test Coverage
 

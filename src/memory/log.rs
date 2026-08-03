@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use chrono::Local;
 
 pub struct LongTermMemory {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl LongTermMemory {
@@ -26,7 +27,11 @@ impl LongTermMemory {
                 reason TEXT
             );"
         )?;
-        Ok(LongTermMemory { conn })
+        Ok(LongTermMemory { conn, path: db_path })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
     }
 
     pub fn save_session(&self, summary: &str, context: &str) -> anyhow::Result<()> {
@@ -55,5 +60,11 @@ impl LongTermMemory {
         let mut result = Vec::new();
         for row in rows { result.push(row?); }
         Ok(result)
+    }
+}
+
+impl Clone for LongTermMemory {
+    fn clone(&self) -> Self {
+        Self::new(self.path.clone()).expect("failed to clone long-term memory connection")
     }
 }

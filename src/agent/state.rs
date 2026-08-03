@@ -135,6 +135,28 @@ impl AgentState {
     }
 }
 
+impl Clone for AgentState {
+    fn clone(&self) -> Self {
+        Self {
+            retries: 0,
+            repair_attempt: 0,
+            last_test_output: String::new(),
+            verification: None,
+            changed_files: BTreeSet::new(),
+            blocked_actions: Vec::new(),
+            last_diff: WorkspaceDiff::default(),
+            transaction: None,
+            dirty: false,
+            config: self.config.clone(),
+            session: self.session.clone(),
+            long_memory: self.long_memory.clone(),
+            files: self.files.clone(),
+            git: self.git.clone(),
+            caveman: self.caveman,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

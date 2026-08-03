@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone)]
 pub struct ShortTermMemory {
     messages: VecDeque<(String, String)>,
     actions: Vec<String>,
