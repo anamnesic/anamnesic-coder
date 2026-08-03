@@ -352,6 +352,10 @@
 | Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
 | Git branch & stash operations (G16) | ✅ Done | 0009 |
 | Bench module split (local.rs / cloud.rs) (Item 31) | ✅ Done | 0010 |
+| Sub-agent support (Task tool) (G5) | ✅ Done | 0011 |
+| MCP client with stdio transport (G7) | ✅ Done | 0012 |
+| Streaming tool call deltas (G9) | ✅ Done | 0013 |
+| Provider health checks & circuit breaking | ✅ Done | 0014 |
 | Status/WARN messages to fixed status bar (no chat leak) | ✅ Done | UI |
 | ESC handling: interrupt + approval deny + Ctrl+C twice quit | ✅ Done | UI |
 | Windows duplicate character input fix (KeyEventKind filter) | ✅ Done | UI |
@@ -362,9 +366,6 @@
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| G7 | P1 | MCP client (stdio transport) | Harness | Alto |
-| G9 | P1 | Streaming tool call deltas | Harness | Médio |
-| — | P1 | Provider health checks, circuit breaking | Robustness | Médio |
 | — | P1 | Prompts versioned/tested | Quality | Médio |
 | G12 | P2 | Lint integration | Harness | Médio |
 | G13 | P2 | Web search tool | Harness | Médio |
@@ -384,11 +385,11 @@
 |--------|-------|-------|----------|
 | **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
 | **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **3** | Architecture | G9 (streaming deltas) | 1-2 semanas |
+| **3** | Architecture | G5, G7, G9, circuit breaker | 1-2 semanas |
 
 ### Test Coverage
 
-~160 unit tests across all modules. Key areas:
+~174 unit tests across all modules. Key areas:
 
 | Module | Tests |
 |--------|-------|
