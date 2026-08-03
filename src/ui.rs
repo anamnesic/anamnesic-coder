@@ -1147,6 +1147,7 @@ fn draw<B: ratatui::backend::Backend>(
                     Constraint::Min(0),
                     Constraint::Length(1),
                     Constraint::Length(1),
+                    Constraint::Length(1),
                 ]
                 .as_ref(),
             )
@@ -1180,10 +1181,46 @@ fn draw<B: ratatui::backend::Backend>(
             Span::styled(right_txt, Style::default().fg(Color::DarkGray)),
         ]));
         f.render_widget(header, page[0]);
-        // Thin status bar at the very bottom: dir · branch on the left,
-        // spinner + elapsed on the right while a turn is running.
-        let status_left = format!(" {} · {}", truncate_str(&app.dir, 48), app.git_branch);
-        let status_right = if app.loading {
+        // Fixed status line: shows current status text (warnings, planning, retries)
+        // truncated to terminal width. Never wraps — keeps layout stable.
+        let status_w = size.width as usize;
+        let status_text = truncate_str(&app.status, status_w.saturating_sub(2));
+        let status_line = Paragraph::new(Line::from(vec![Span::styled(
+            format!(" {} ", status_text),
+            Style::default().fg(Color::Yellow),
+        )]));
+        f.render_widget(status_line, page[2]);
+        // Input bar: bare prompt at the bottom (modern harness style, no box).
+        let prompt = if app.loading { "▍" } else { "❯" };
+        let input_line = Line::from(vec![
+            Span::styled(
+                format!("{prompt} "),
+                Style::default()
+                    .fg(if app.loading {
+                        Color::DarkGray
+                    } else {
+                        Color::Green
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.input.clone(),
+                Style::default().fg(if app.loading {
+                    Color::Gray
+                } else {
+                    Color::White
+                }),
+            ),
+        ]);
+        let input = Paragraph::new(input_line).wrap(Wrap { trim: true });
+        f.render_widget(input, page[3]);
+        // Set cursor position next to the typed text.
+        if !app.loading {
+            f.set_cursor_position((page[3].x + 2 + app.cursor_position as u16, page[3].y));
+        }
+        // Thin bottom bar: dir · branch on the left, spinner + elapsed on the right.
+        let bottom_left = format!(" {} · {}", truncate_str(&app.dir, 48), app.git_branch);
+        let bottom_right = if app.loading {
             format!(
                 " {} {:<5}  (Esc interrupt) ",
                 SPINNER[app.spinner_frame],
@@ -1192,28 +1229,20 @@ fn draw<B: ratatui::backend::Backend>(
         } else {
             " Esc interrupt ".into()
         };
-        let status_pad = (size.width as usize)
-            .saturating_sub(status_left.chars().count() + status_right.chars().count());
-        let status = Paragraph::new(Line::from(vec![
+        let bottom_pad = (size.width as usize)
+            .saturating_sub(bottom_left.chars().count() + bottom_right.chars().count());
+        let bottom = Paragraph::new(Line::from(vec![
             Span::styled(
-                status_left,
-                Style::default().fg(if app.loading {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                }),
+                bottom_left,
+                Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(" ".repeat(status_pad), Style::default()),
+            Span::styled(" ".repeat(bottom_pad), Style::default()),
             Span::styled(
-                status_right,
-                Style::default().fg(if app.loading {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                }),
+                bottom_right,
+                Style::default().fg(Color::DarkGray),
             ),
         ]));
-        f.render_widget(status, page[3]);
+        f.render_widget(bottom, page[4]);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -1284,35 +1313,6 @@ fn draw<B: ratatui::backend::Backend>(
                 .block(messages_block)
                 .scroll((0, scroll_offset));
             f.render_widget(messages_widget, cols[1]);
-        }
-
-        // Input bar: bare prompt at the bottom (modern harness style, no box).
-        let prompt = if app.loading { "▍" } else { "❯" };
-        let input_line = Line::from(vec![
-            Span::styled(
-                format!("{prompt} "),
-                Style::default()
-                    .fg(if app.loading {
-                        Color::DarkGray
-                    } else {
-                        Color::Green
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                app.input.clone(),
-                Style::default().fg(if app.loading {
-                    Color::Gray
-                } else {
-                    Color::White
-                }),
-            ),
-        ]);
-        let input = Paragraph::new(input_line).wrap(Wrap { trim: true });
-        f.render_widget(input, page[2]);
-        // Set cursor position next to the typed text.
-        if !app.loading {
-            f.set_cursor_position((page[2].x + 2 + app.cursor_position as u16, page[2].y));
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
