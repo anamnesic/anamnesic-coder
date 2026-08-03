@@ -60,6 +60,54 @@ pub enum AgentMode {
     Plan,
 }
 
+#[derive(Debug, Clone)]
+pub struct TokenBreakdown {
+    pub input: usize,
+    pub output: usize,
+    pub reasoning: usize,
+    pub cache_read: usize,
+    pub cache_write: usize,
+    pub cache_rate: f64,
+    pub generation_speed: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelEntry {
+    pub provider: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub text: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InfoPanelSection {
+    pub title: &'static str,
+    pub open: bool,
+    pub lines: Vec<String>,
+}
+
+impl InfoPanelSection {
+    pub fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            open: false,
+            lines: Vec::new(),
+        }
+    }
+
+    pub fn closed(title: &'static str) -> Self {
+        Self::new(title)
+    }
+
+    pub fn open(title: &'static str, lines: Vec<String>) -> Self {
+        Self { title, open: true, lines }
+    }
+}
+
 pub struct App {
     pub messages: Vec<(String, String)>, // (role, content)
     pub input: String,
@@ -101,6 +149,16 @@ pub struct App {
     /// user answers, but rendering and input keep running.
     pub pending_approval: Option<ApprovalRequest>,
     pub quit_pending: bool,
+    pub token_breakdown: TokenBreakdown,
+    pub max_context_tokens: usize,
+    pub context_cost: f64,
+    pub models: Vec<ModelEntry>,
+    pub todo_items: Vec<TodoItem>,
+    pub modified_files: Vec<String>,
+    pub memory_enabled: bool,
+    pub indexing_enabled: bool,
+    pub info_sections: Vec<InfoPanelSection>,
+    pub info_selected: usize,
 }
 
 impl App {
@@ -145,6 +203,32 @@ impl App {
             provider_selected: 0,
             pending_approval: None,
             quit_pending: false,
+            token_breakdown: TokenBreakdown {
+                input: 0,
+                output: 0,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cache_rate: 0.0,
+                generation_speed: 0.0,
+            },
+            max_context_tokens: 0,
+            context_cost: 0.0,
+            models: Vec::new(),
+            todo_items: Vec::new(),
+            modified_files: Vec::new(),
+            memory_enabled: false,
+            indexing_enabled: false,
+            info_sections: vec![
+                InfoPanelSection::open("Context", vec!["Loading…".into()]),
+                InfoPanelSection::closed("Token Usage"),
+                InfoPanelSection::closed("Models"),
+                InfoPanelSection::closed("Code Indexing"),
+                InfoPanelSection::closed("Todo"),
+                InfoPanelSection::closed("Modified Files"),
+                InfoPanelSection::closed("Memory"),
+            ],
+            info_selected: 0,
         }
     }
 
@@ -571,6 +655,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
         let files = state.lock().unwrap().files.list_files("");
         let mut a = app.lock().unwrap();
         a.sidebar_items = files;
+        let st = state.lock().unwrap();
+        update_info_sections(&mut a, &st);
     }
     let (tx, rx) = mpsc::channel();
     // Agent progress stream + interrupt flag (Esc while loading cancels the turn).
@@ -845,8 +931,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Up => {
                         if let Focus::Sidebar = guard.focus {
-                            if guard.sidebar_selected > 0 {
-                                guard.sidebar_selected -= 1;
+                            if guard.info_selected > 0 {
+                                guard.info_selected -= 1;
                             }
                         } else if guard.focus == Focus::Editor {
                             if guard.editor_row > 0 {
@@ -873,8 +959,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Down => {
                         if let Focus::Sidebar = guard.focus {
-                            if guard.sidebar_selected + 1 < guard.sidebar_items.len() {
-                                guard.sidebar_selected += 1;
+                            if guard.info_selected + 1 < guard.info_sections.len() {
+                                guard.info_selected += 1;
                             }
                         } else if guard.focus == Focus::Editor {
                             if guard.editor_row + 1 < guard.editor_lines.len() {
@@ -917,24 +1003,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                 }
                             }
                             Focus::Sidebar => {
-                                if let Some(fname) = guard.sidebar_items.get(guard.sidebar_selected)
-                                {
-                                    let st = state.lock().unwrap();
-                                    if let Some(data) = st.files.read_file(fname) {
-                                        // open editor with file contents
-                                        guard.editor_file = Some(fname.clone());
-                                        guard.editor_lines =
-                                            data.lines().map(|s| s.to_string()).collect();
-                                        if guard.editor_lines.is_empty() {
-                                            guard.editor_lines.push(String::new());
-                                        }
-                                        guard.editor_row = 0;
-                                        guard.editor_col = guard.editor_lines[0].len();
-                                        guard.editor_dirty = false;
-                                        guard.focus = Focus::Editor;
-                                    } else {
-                                        guard.add_message("Error", "Failed to read file");
-                                    }
+                                let idx = guard.info_selected;
+                                if let Some(section) = guard.info_sections.get_mut(idx) {
+                                    section.open = !section.open;
                                 }
                             }
                             Focus::Editor => {
@@ -1132,6 +1203,76 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+fn update_info_sections(app: &mut App, _state: &AgentState) {
+    let used = app.tokens;
+    let max = app.max_context_tokens;
+    let pct = if max > 0 { (used as f64 / max as f64) * 100.0 } else { 0.0 };
+    let cost = app.context_cost;
+
+    app.info_sections[0] = InfoPanelSection::open("Context", vec![
+        format!("{} tokens", used),
+        format!("{:.0}% used", pct),
+        format!("${:.4} spent", cost),
+    ]);
+
+    let tb = &app.token_breakdown;
+    app.info_sections[1] = InfoPanelSection::open("Token Usage", vec![
+        format!("Input: {}", tb.input),
+        format!("Output: {}", tb.output),
+        format!("Reasoning: {}", tb.reasoning),
+        format!("Cache read: {}", tb.cache_read),
+        format!("Cache write: {}", tb.cache_write),
+        format!("Cache rate: {:.1}%", tb.cache_rate),
+        format!("Speed: {:.1} tok/s", tb.generation_speed),
+        format!("Cost: ${:.4}", cost),
+    ]);
+
+    app.info_sections[2] = InfoPanelSection::open("Models", {
+        let mut lines = app
+            .models
+            .iter()
+            .map(|m| format!("{} — {}", m.provider, m.name))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push("No models loaded".into());
+        }
+        lines
+    });
+
+    app.info_sections[3] = InfoPanelSection::open("Code Indexing", vec![if app.indexing_enabled {
+        "Enabled".into()
+    } else {
+        "Disabled".into()
+    }]);
+
+    app.info_sections[4] = InfoPanelSection::open("Todo", {
+        let mut lines = Vec::new();
+        if app.todo_items.is_empty() {
+            lines.push("No active tasks".into());
+        } else {
+            for item in &app.todo_items {
+                let mark = if item.done { "[x]" } else { "[ ]" };
+                lines.push(format!("{} {}", mark, item.text));
+            }
+        }
+        lines
+    });
+
+    app.info_sections[5] = InfoPanelSection::open("Modified Files", {
+        if app.modified_files.is_empty() {
+            vec!["No changes".into()]
+        } else {
+            app.modified_files.clone()
+        }
+    });
+
+    app.info_sections[6] = InfoPanelSection::open("Memory", vec![if app.memory_enabled {
+        "Enabled".into()
+    } else {
+        "Disabled".into()
+    }]);
+}
+
 fn draw<B: ratatui::backend::Backend>(
     f: &mut Terminal<B>,
     app: &App,
@@ -1249,25 +1390,32 @@ fn draw<B: ratatui::backend::Backend>(
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)].as_ref())
             .split(page[1]);
 
-        // Sidebar (files)
-        let sidebar_items: Vec<ListItem> = app
-            .sidebar_items
-            .iter()
-            .map(|s| ListItem::new(Span::raw(s.clone())))
-            .collect();
-        let sidebar = List::new(sidebar_items)
-            .block(
-                Block::default()
-                    .title(" Workspace files ")
-                    .borders(Borders::ALL),
-            )
-            .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▶ ");
-        let mut list_state = ratatui::widgets::ListState::default();
-        if !app.sidebar_items.is_empty() {
-            list_state.select(Some(app.sidebar_selected));
+        // Left panel: collapsible info sections
+        let mut panel_lines: Vec<Line> = Vec::new();
+        for (idx, section) in app.info_sections.iter().enumerate() {
+            let arrow = if section.open { "▼" } else { "▶" };
+            let selected = idx == app.info_selected && app.focus == Focus::Sidebar;
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            panel_lines.push(Line::from(vec![
+                Span::styled(format!("{} {}", arrow, section.title), style),
+            ]));
+            if section.open {
+                for line in &section.lines {
+                    panel_lines.push(Line::from(vec![
+                        Span::styled(format!("  {}", line), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+            }
         }
-        f.render_stateful_widget(sidebar, cols[0], &mut list_state);
+        let panel_block = Block::default()
+            .title(" Workspace ")
+            .borders(Borders::ALL);
+        let panel = Paragraph::new(panel_lines).block(panel_block);
+        f.render_widget(panel, cols[0]);
 
         // Right column: messages or editor (full height — input lives at the bottom bar).
         if app.editor_file.is_some() {
