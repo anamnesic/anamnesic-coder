@@ -29,8 +29,54 @@ use llm::infer::model::Model;
 use llm::infer::tokenizer::Tokenizer;
 use llm::model_resolver;
 use llm::router::{LlmRouter, DEFAULT_CLOUD_MODEL, DEFAULT_PROVIDER};
-use std::io::IsTerminal;
+use std::fs::{File, OpenOptions};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Minimal logger that writes structured lines to `anamnesic.log` instead of
+/// stdout. Used by the TUI so `log::warn!` retry storms from the LLM client
+/// never interleave with the alternate screen and corrupt the UI.
+struct FileLogger {
+    file: Arc<Mutex<File>>,
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(
+                f,
+                "{} [{}] {} - {}",
+                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_file_logger() -> anyhow::Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("anamnesic.log")?;
+    let logger = FileLogger {
+        file: Arc::new(Mutex::new(file)),
+    };
+    log::set_boxed_logger(Box::new(logger)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    log::set_max_level(log::LevelFilter::Info);
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(
@@ -196,10 +242,22 @@ async fn build_router(cli: &Cli, cfg: &mut Config) -> Result<LlmRouter> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    simple_logger::init_with_level(log::Level::Info).ok();
+    let cli = Cli::parse();
+    // The TUI owns the alternate screen, so route all log output to a file
+    // instead of stdout. Otherwise retry warnings (HTTP 429/5xx backoff) from
+    // the LLM client interleave with the rendered frames and corrupt the UI.
+    let tui_mode = matches!(cli.command, Some(Commands::Tui))
+        || (cli.command.is_none()
+            && cli.task.is_none()
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal());
+    if tui_mode {
+        init_file_logger()?;
+    } else {
+        simple_logger::init_with_level(log::Level::Info).ok();
+    }
     providers::load_dotenv();
     llm::infer::ops::init_thread_pool();
-    let cli = Cli::parse();
     let mut cfg = Config {
         workspace_dir: crate::tools::fs::normalize_workspace_path(&PathBuf::from(&cli.dir)),
         use_local: cli.local,

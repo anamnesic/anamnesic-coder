@@ -1018,13 +1018,14 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     KeyCode::Enter => {
                         match guard.focus {
-                            Focus::Input => {
+                            Focus::Input | Focus::Messages => {
                                 if guard.loading {
                                     continue;
                                 }
                                 let input = guard.input.trim().to_string();
                                 if !input.is_empty() {
                                     guard.command_menu = false;
+                                    guard.focus = Focus::Input;
                                     run_input(
                                         &mut guard,
                                         &state,
@@ -1163,6 +1164,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         } else if guard.loading {
                             interrupt.store(true, Ordering::Relaxed);
                             guard.status = "Interrupting…".into();
+                        } else if guard.focus != Focus::Input {
+                            guard.focus = Focus::Input;
                         }
                         guard.quit_pending = false;
                     }
