@@ -257,6 +257,26 @@
 - **Issue:** Both local and cloud benchmark results were saved to the same file from a single combined module.
 - **Fix:** Split `model_bench.rs` into `local.rs` and `cloud.rs` modules. Exported both from `mod.rs`. Made shared helpers (`BenchResult`, `names_match`, `estimate_tps_from_catalog`) `pub(crate)` in `model_bench.rs` for cross-module use. `main.rs` can now route local and cloud results to separate output files.
 
+### ~~32. Status/WARN Messages Leaked to Chat~~ ✅ FIXED
+- **File:** `src/ui.rs`
+- **Issue:** `AgentEvent::Status` events (warnings, rate limits, planning messages) were added to chat as `[System]` messages instead of the status bar.
+- **Fix:** Route `AgentEvent::Status` to `a.status` instead of `a.add_message("System", ...)`.
+
+### ~~33. ESC Blocked During Approval Modal~~ ✅ FIXED
+- **File:** `src/ui.rs`
+- **Issue:** During approval prompts, ESC was captured by the modal and could not interrupt the running turn or quit.
+- **Fix:** ESC in approval modal now denies the approval (unblocking the worker). ESC during loading interrupts the turn. Ctrl+C twice quits.
+
+### ~~34. Duplicate Character Input on Windows~~ ✅ FIXED
+- **File:** `src/ui.rs`
+- **Issue:** Each keystroke appeared twice ("iiss dduupplliccaattee") because crossterm emits both Press and Release key events on Windows.
+- **Fix:** Filter `KeyEventKind::Release` events in the key handler.
+
+### ~~35. TUI Layout Breaks During Retries~~ ✅ FIXED
+- **File:** `src/ui.rs`
+- **Issue:** Status messages during retries (planning, warnings, rate limits) were either leaking to chat or breaking the terminal layout because `app.status` was never rendered in a fixed position.
+- **Fix:** Added a dedicated fixed status line (`page[2]`) between the main content and input bar. Status text is truncated to terminal width to prevent wrapping. Layout is now 5 rows: header, content, status, input, bottom bar.
+
 ---
 
 ## Status Summary (as of 2026-08-02)
@@ -288,6 +308,10 @@
 | 28 | Multi-word blocked commands support | ADR 0008 |
 | 29 | `extract_path` dot/slash extension requirement | ADR 0008 |
 | 31 | Bench module split (local.rs / cloud.rs) | ADR 0010 |
+| 32 | Status/WARN messages routed to status bar (not chat) | UI fix |
+| 33 | ESC handling: interrupt + approval deny + Ctrl+C twice quit | UI fix |
+| 34 | Windows duplicate character input (KeyEventKind filter) | UI fix |
+| 35 | Fixed TUI layout: dedicated status line, no overlap during retries | UI fix |
 
 ### Implemented Features
 
@@ -318,6 +342,10 @@
 | Context intelligence, token estimation (G4) & repo map (G11, G3) | ✅ Done | 0009 |
 | Git branch & stash operations (G16) | ✅ Done | 0009 |
 | Bench module split (local.rs / cloud.rs) (Item 31) | ✅ Done | 0010 |
+| Status/WARN messages to fixed status bar (no chat leak) | ✅ Done | UI |
+| ESC handling: interrupt + approval deny + Ctrl+C twice quit | ✅ Done | UI |
+| Windows duplicate character input fix (KeyEventKind filter) | ✅ Done | UI |
+| Fixed TUI layout: dedicated status line, no overlap during retries | ✅ Done | UI |
 
 ### All Open Demands
 
@@ -344,7 +372,9 @@
 
 | Sprint | Focus | Items | Timeline |
 |--------|-------|-------|----------|
-| **1** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
+| **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
+| **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
+| **3** | Architecture | G5 (sub-agents), G9 (streaming deltas), G7 (MCP) | 1-2 semanas |
 
 ### Test Coverage
 
