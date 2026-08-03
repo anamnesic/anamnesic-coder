@@ -1,5 +1,7 @@
 use crate::compressor::caveman::CavemanLevel;
 
+const PROMPT_VERSION: &str = "0.1.0";
+
 pub struct PlannerPrompt;
 
 impl PlannerPrompt {
@@ -41,6 +43,10 @@ Keep plans minimal: 1-6 steps. Only include necessary steps. Output ONLY the JSO
         } else {
             format!("{}{}", base, suffix)
         }
+    }
+
+    pub fn version() -> &'static str {
+        PROMPT_VERSION
     }
 }
 
@@ -91,6 +97,10 @@ impl CoderPrompt {
     pub fn with_caveman(level: &CavemanLevel) -> String {
         Self::with_context(level, "")
     }
+
+    pub fn version() -> &'static str {
+        PROMPT_VERSION
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +122,29 @@ mod tests {
         assert!(full_prompt.contains("Rule 1"));
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn planner_prompt_contains_expected_sections() {
+        let prompt = PlannerPrompt::system();
+        assert!(prompt.contains("JSON plan"), "missing JSON plan section");
+        assert!(prompt.contains("Step types:"), "missing step types");
+        assert!(prompt.contains("Output JSON format:"), "missing output format");
+    }
+
+    #[test]
+    fn coder_prompt_contains_expected_sections() {
+        let prompt = CoderPrompt::system();
+        assert!(prompt.contains("Observe"), "missing Observe phase");
+        assert!(prompt.contains("Act"), "missing Act phase");
+        assert!(prompt.contains("Verify"), "missing Verify phase");
+        assert!(prompt.contains("Repair"), "missing Repair phase");
+    }
+
+    #[test]
+    fn prompts_report_version() {
+        assert!(!PlannerPrompt::version().is_empty());
+        assert!(!CoderPrompt::version().is_empty());
+        assert_eq!(PlannerPrompt::version(), CoderPrompt::version());
     }
 }

@@ -356,6 +356,7 @@
 | MCP client with stdio transport (G7) | ✅ Done | 0012 |
 | Streaming tool call deltas (G9) | ✅ Done | 0013 |
 | Provider health checks & circuit breaking | ✅ Done | 0014 |
+| Prompts versioned/tested | ✅ Done | — |
 | Status/WARN messages to fixed status bar (no chat leak) | ✅ Done | UI |
 | ESC handling: interrupt + approval deny + Ctrl+C twice quit | ✅ Done | UI |
 | Windows duplicate character input fix (KeyEventKind filter) | ✅ Done | UI |
@@ -366,7 +367,6 @@
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| — | P1 | Prompts versioned/tested | Quality | Médio |
 | G12 | P2 | Lint integration | Harness | Médio |
 | G13 | P2 | Web search tool | Harness | Médio |
 | G14 | P2 | Session persistence | Harness | Médio |
