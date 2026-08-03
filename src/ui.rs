@@ -159,6 +159,9 @@ pub struct App {
     pub indexing_enabled: bool,
     pub info_sections: Vec<InfoPanelSection>,
     pub info_selected: usize,
+    /// Tracks the in-flight streaming tool-call delta so chunks of the same
+    /// call accumulate on one chat line instead of stacking new lines.
+    pub last_delta_line: Option<(usize, String)>,
 }
 
 impl App {
@@ -229,11 +232,39 @@ impl App {
                 InfoPanelSection::closed("Memory"),
             ],
             info_selected: 0,
+            last_delta_line: None,
         }
     }
 
     pub fn add_message(&mut self, role: &str, content: &str) {
         self.messages.push((role.to_string(), content.to_string()));
+    }
+
+    /// Accumulate streaming tool-call argument deltas onto the most recent
+    /// delta line for the same call index. A new call (or new index) starts a
+    /// fresh line. Prevents the chat from flooding with one line per SSE chunk.
+    pub fn feed_tool_delta(&mut self, index: usize, name: &str, args_delta: &str) {
+        const MAX_DELTA_CHARS: usize = 240;
+        let mut text;
+        if let Some((last_index, ref last_text)) = self.last_delta_line {
+            if last_index == index {
+                if let Some((_, last)) = self.messages.last_mut() {
+                    if last.starts_with("Δ ") {
+                        text = last_text.clone();
+                        if text.chars().count() < MAX_DELTA_CHARS {
+                            text.push_str(args_delta);
+                        }
+                        *last = text.clone();
+                        self.last_delta_line = Some((index, text));
+                        return;
+                    }
+                }
+            }
+        }
+        let tag = format!("Δ {name}[{index}]");
+        text = format!("{tag} {args_delta}");
+        self.messages.push(("Tool".to_string(), text.clone()));
+        self.last_delta_line = Some((index, text));
     }
 
     pub fn clear_input(&mut self) {
@@ -701,7 +732,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     AgentEvent::ToolCallDelta { index, name, args_delta } => {
                         let prefix = name.as_deref().unwrap_or("?");
-                        a.add_message("Tool", &format!("{prefix}[{index}] Δ {args_delta}"));
+                        a.feed_tool_delta(index, prefix, &args_delta);
                     }
                     AgentEvent::PlanStep {
                         index,
@@ -1013,9 +1044,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     section.open = !section.open;
                                 }
                             }
-                            Focus::Editor => {
+                            Focus::Editor
                                 // insert newline at cursor
-                                if guard.editor_row <= guard.editor_lines.len() {
+                                if guard.editor_row <= guard.editor_lines.len() => {
                                     let line = if guard.editor_row < guard.editor_lines.len() {
                                         guard.editor_lines[guard.editor_row].clone()
                                     } else {
@@ -1035,7 +1066,6 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     guard.editor_col = 0;
                                     guard.editor_dirty = true;
                                 }
-                            }
                             _ => {}
                         }
                     }
@@ -1174,11 +1204,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
             }
             Ok(Event::Mouse(mouse)) => {
                 let mut guard = app.lock().unwrap();
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    if !guard.loading {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !guard.loading {
                         guard.focus = Focus::Messages;
                     }
-                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         guard.scroll_offset = guard.scroll_offset.saturating_sub(5);
@@ -1330,7 +1359,7 @@ fn draw<B: ratatui::backend::Backend>(
         // Fixed status line: shows current status text (warnings, planning, retries)
         // truncated to terminal width. Never wraps — keeps layout stable.
         let status_w = size.width as usize;
-        let status_text = truncate_str(&app.status, status_w.saturating_sub(2));
+        let status_text = truncate_str(&sanitize_status(&app.status), status_w.saturating_sub(2));
         let status_line = Paragraph::new(Line::from(vec![Span::styled(
             format!(" {} ", status_text),
             Style::default().fg(Color::Yellow),
@@ -1423,21 +1452,17 @@ fn draw<B: ratatui::backend::Backend>(
         f.render_widget(panel, cols[0]);
 
         // Right column: messages or editor (full height — input lives at the bottom bar).
-        if app.editor_file.is_some() {
+        if let Some(editor_file) = app.editor_file.as_ref() {
             let title = format!(
                 "Editor - {}{}",
-                app.editor_file.as_ref().unwrap(),
+                editor_file,
                 if app.editor_dirty { " *" } else { "" }
             );
             // compute visible lines based on scroll and area height
             let area_height = cols[1].height as usize - 2; // leave room for borders
             let total_lines = app.editor_lines.len();
             let scroll = if app.editor_scroll + area_height > total_lines {
-                if total_lines > area_height {
-                    total_lines - area_height
-                } else {
-                    0
-                }
+                total_lines.saturating_sub(area_height)
             } else {
                 app.editor_scroll
             };
@@ -1606,7 +1631,7 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
             _ => Style::default().fg(Color::Gray),
         };
         let label = format!("{role}: ");
-        let md_rendered = render_markdown_lines(content);
+        let md_rendered = render_markdown_lines(content).map(expand_multiline_spans);
         if let Some(md_lines) = md_rendered {
             if !md_lines.is_empty() {
                 let mut md_iter = md_lines.into_iter();
@@ -1726,6 +1751,25 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
     }
 }
 
+/// Split any span that embeds newlines (e.g. a fenced code block) into one
+/// span per display row, so each entry in the returned list occupies exactly
+/// one terminal line. Keeps vertical scroll math exact in `flatten_messages`.
+fn expand_multiline_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for span in spans {
+        if span.content.contains('\n') {
+            for piece in span.content.split('\n') {
+                let mut line = span.clone();
+                line.content = piece.to_string().into();
+                out.push(line);
+            }
+        } else {
+            out.push(span);
+        }
+    }
+    out
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1734,6 +1778,26 @@ fn truncate_str(s: &str, max: usize) -> String {
         out = format!("…{out}");
         out
     }
+}
+
+/// Collapse a status message to a single display line: newlines/carriage
+/// returns become spaces and repeated whitespace is squeezed, so the fixed
+/// status row can never render as stacked lines (e.g. fallback error chains).
+fn sanitize_status(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for ch in s.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ' {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    out
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -1800,6 +1864,52 @@ mod tests {
         assert_eq!(display_role("user"), "User");
         assert_eq!(display_role("assistant"), "Assistant");
         assert_eq!(display_role("system"), "system");
+    }
+
+    #[test]
+    fn sanitize_status_removes_newlines() {
+        assert_eq!(sanitize_status("a\nb"), "a b");
+        assert_eq!(sanitize_status("a\r\nb"), "a b");
+        assert_eq!(sanitize_status("a\tb"), "a b");
+        assert_eq!(sanitize_status("a\n\nb"), "a b");
+        assert_eq!(sanitize_status(" a b "), " a b ");
+    }
+
+    #[test]
+    fn expand_multiline_spans_splits_code_blocks() {
+        let spans = vec![
+            Span::raw("before"),
+            Span::raw("let x = 1;\nlet y = 2;\nlet z = 3;"),
+            Span::raw("after"),
+        ];
+        let out = expand_multiline_spans(spans);
+        let texts: Vec<&str> = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            texts,
+            vec!["before", "let x = 1;", "let y = 2;", "let z = 3;", "after"]
+        );
+        assert!(out.iter().all(|s| !s.content.contains('\n')));
+    }
+
+    #[test]
+    fn feed_tool_delta_accumulates_on_one_line() {
+        let mut app = App::new("model", "off");
+        app.feed_tool_delta(0, "edit_file", "{\"path\":");
+        app.feed_tool_delta(0, "?", "\"a.rs\",");
+        app.feed_tool_delta(0, "?", "\"new\":1}");
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "Tool");
+        assert_eq!(app.messages[0].1, "Δ edit_file[0] {\"path\":\"a.rs\",\"new\":1}");
+    }
+
+    #[test]
+    fn feed_tool_delta_starts_new_line_for_new_index() {
+        let mut app = App::new("model", "off");
+        app.feed_tool_delta(0, "read_file", "a");
+        app.feed_tool_delta(1, "edit_file", "b");
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages[0].1.starts_with("Δ read_file[0]"));
+        assert!(app.messages[1].1.starts_with("Δ edit_file[1]"));
     }
 
     #[test]

@@ -18,30 +18,22 @@ pub fn estimate_tokens(text: &str) -> usize {
     let mut current_word_len = 0usize;
 
     for c in text.chars() {
-        if c.is_ascii_whitespace() {
-            if current_word_len > 0 {
-                tokens += (current_word_len + 3) / 4;
-                current_word_len = 0;
-            }
-            tokens += 1;
-        } else if c.is_ascii_punctuation() {
-            if current_word_len > 0 {
-                tokens += (current_word_len + 3) / 4;
-                current_word_len = 0;
-            }
-            tokens += 1;
+        let extra = if c.is_ascii_whitespace() || c.is_ascii_punctuation() {
+            1
         } else if !c.is_ascii() {
-            if current_word_len > 0 {
-                tokens += (current_word_len + 3) / 4;
-                current_word_len = 0;
-            }
-            tokens += 2;
+            2
         } else {
             current_word_len += 1;
+            continue;
+        };
+        if current_word_len > 0 {
+            tokens += current_word_len.div_ceil(4);
+            current_word_len = 0;
         }
+        tokens += extra;
     }
     if current_word_len > 0 {
-        tokens += (current_word_len + 3) / 4;
+        tokens += current_word_len.div_ceil(4);
     }
     tokens.max(1)
 }

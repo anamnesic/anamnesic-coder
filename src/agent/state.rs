@@ -30,7 +30,9 @@ pub struct AgentState {
 }
 
 impl AgentState {
-    pub fn new(config: Config) -> anyhow::Result<Self> {
+    pub fn new(mut config: Config) -> anyhow::Result<Self> {
+        config.workspace_dir =
+            crate::tools::fs::normalize_workspace_path(&config.workspace_dir);
         let long_memory = LongTermMemory::new(config.memory_dir.join("memory.db"))?;
         Ok(AgentState {
             retries: 0,

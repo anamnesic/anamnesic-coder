@@ -85,7 +85,7 @@ fn try_resolve(name: &str, root: &Path) -> Option<PathBuf> {
     let digest = manifest["layers"]
         .as_array()?
         .iter()
-        .find(|l| l["mediaType"].as_str().map_or(false, |m| m.contains("model")))?
+        .find(|l| l["mediaType"].as_str().is_some_and(|m| m.contains("model")))?
         ["digest"]
         .as_str()?
         .replace("sha256:", "sha256-");

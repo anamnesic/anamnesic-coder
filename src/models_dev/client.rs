@@ -16,10 +16,7 @@ impl ModelsDevClient {
     /// Never panics — on any error returns an empty catalog and logs a warning.
     pub fn load() -> Self {
         let cache = cache_path();
-        match try_load_cache(&cache) {
-            Some(c) => return Self { catalog: c },
-            None => {}
-        }
+        if let Some(c) = try_load_cache(&cache) { return Self { catalog: c } }
         match fetch_and_cache(&cache) {
             Ok(c)  => Self { catalog: c },
             Err(e) => {
@@ -148,7 +145,7 @@ impl ModelsDevClient {
 
         rows.sort_by(|a, b| a.1.cost.input.partial_cmp(&b.1.cost.input).unwrap_or(std::cmp::Ordering::Equal));
 
-        println!("\n{:<30} {:<14} {:>9} {:>9} {:>9}  {}", "Model ID", "Provider", "In$/MTok", "Out$/MTok", "Ctx(K)", "Caps");
+        println!("\n{:<30} {:<14} {:>9} {:>9} {:>9}  Caps", "Model ID", "Provider", "In$/MTok", "Out$/MTok", "Ctx(K)");
         println!("{}", "─".repeat(95));
         for (pid, m) in &rows {
             let caps = [

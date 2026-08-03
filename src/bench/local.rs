@@ -107,7 +107,7 @@ pub fn rank_models(models_dir: &Path, category: &str) -> Vec<BenchResult> {
         .map(|name| {
             let mut r = benchmark_model(name, models_dir);
             if let Some((rank, rec)) = hw_recs.iter().enumerate()
-                .find(|(_, rec)| names_match(&rec.model.name, name))
+                .find(|(_, rec)| names_match(rec.model.name, name))
             {
                 r.hw_score = Some(rec.score.total);
                 r.predicted_tps = Some(estimate_tps_from_catalog(&hw, &rec.model, category));

@@ -31,10 +31,7 @@ impl ProviderStore {
     /// Load from `~/.config/rustcode/providers.toml`.
     /// Returns empty store if file doesn't exist yet.
     pub fn load() -> Self {
-        match Self::load_inner() {
-            Ok(s) => s,
-            Err(_) => Self::default(),
-        }
+        Self::load_inner().unwrap_or_default()
     }
 
     fn load_inner() -> Result<Self> {
@@ -189,7 +186,7 @@ fn load_env_with_dotenv() -> HashMap<String, String> {
     // Try project .env in cwd, then parent dirs up to 3 levels
     let candidates = [
         std::env::current_dir().ok().map(|p| p.join(".env")),
-        std::env::current_dir().ok().map(|p| p.parent().map(|pp| pp.join(".env"))).flatten(),
+        std::env::current_dir().ok().and_then(|p| p.parent().map(|pp| pp.join(".env"))),
     ];
     for maybe_path in candidates.into_iter().flatten() {
         if maybe_path.exists() {

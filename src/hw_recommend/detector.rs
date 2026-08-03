@@ -138,9 +138,9 @@ struct GpuInfo {
 
 fn detect_gpu() -> GpuInfo {
     let (model, vendor, vram_mb) = detect_gpu_nvidia()
-        .or_else(|| detect_gpu_amd())
-        .or_else(|| detect_gpu_intel())
-        .or_else(|| detect_gpu_lspci())
+        .or_else(detect_gpu_amd)
+        .or_else(detect_gpu_intel)
+        .or_else(detect_gpu_lspci)
         .unwrap_or_else(|| ("Unknown".into(), "Unknown".into(), 0));
 
     GpuInfo {

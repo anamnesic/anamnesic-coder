@@ -31,7 +31,7 @@ impl GitTools {
     pub fn diff(&self, target: &str) -> String { self.git(&["diff", target]) }
     pub fn restore(&self, path: &str) -> String { self.git(&["restore", path]) }
     pub fn status(&self) -> String { self.git(&["status"]) }
-    pub fn log(&self, count: usize) -> String { self.git(&["log", &format!("--oneline"), &format!("-{}", count)]) }
+    pub fn log(&self, count: usize) -> String { self.git(&["log", "--oneline", &format!("-{}", count)]) }
     pub fn stash(&self, msg: &str) -> String {
         if msg.is_empty() {
             self.git(&["stash"])

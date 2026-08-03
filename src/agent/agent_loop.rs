@@ -71,11 +71,14 @@ pub enum ApprovalDecision {
 
 static APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Streamed tool-call argument delta callback: `(call_index, tool_name, args_delta)`.
+pub type ToolCallDeltaFn = Arc<dyn Fn(usize, Option<&str>, &str) + Send + Sync>;
+
 /// Optional UI hooks for the agent loop: progress, approval and cancellation.
 #[derive(Default, Clone)]
 pub struct AgentHooks {
     pub on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
-    pub on_tool_call_delta: Option<Arc<dyn Fn(usize, Option<&str>, &str) + Send + Sync>>,
+    pub on_tool_call_delta: Option<ToolCallDeltaFn>,
     pub on_approval: Option<Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync>>,
     pub interrupt: Option<Arc<AtomicBool>>,
 }
@@ -1057,9 +1060,10 @@ fn truncate_tool_output(value: &str, limit: usize) -> String {
 }
 
 fn search_in(workspace: &std::path::Path, pattern: &str) -> String {
+    let normalized = crate::tools::fs::normalize_workspace_path(workspace);
     match std::process::Command::new("rg")
         .args(["-n", "--max-count", "20", pattern])
-        .current_dir(workspace)
+        .current_dir(&normalized)
         .output()
     {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
@@ -1069,7 +1073,7 @@ fn search_in(workspace: &std::path::Path, pattern: &str) -> String {
             String::from_utf8_lossy(&out.stderr).trim()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            search_workspace_without_rg(workspace, pattern)
+            search_workspace_without_rg(&normalized, pattern)
         }
         Err(error) => format!("search failed: {error}"),
     }

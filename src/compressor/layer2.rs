@@ -143,7 +143,7 @@ fn consolidate_prefixes(input: &str) -> String {
     out
 }
 
-fn get_prefix<'a>(line: &'a str, max_len: usize) -> &'a str {
+fn get_prefix(line: &str, max_len: usize) -> &str {
     let end = line.len().min(max_len);
     &line[..end]
 }

@@ -146,7 +146,7 @@ impl GgufReader {
                         match arr_type {
                             0 | 1 | 7 => { rdr.read_u8(&mut pos)?; },
                             2 | 3     => { rdr.read_u16(&mut pos)?; },
-                            4 | 5 | 6 => {
+                            4..=6 => {
                                 let v = rdr.read_u32(&mut pos)?;
                                 rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
                             },
@@ -154,7 +154,7 @@ impl GgufReader {
                                 let s = rdr.read_string(&mut pos)?;
                                 rdr.metadata_str.insert(format!("{}_{}", key, i), s);
                             },
-                            10 | 11 | 12 => {
+                            10..=12 => {
                                 let v = rdr.read_u64(&mut pos)?;
                                 rdr.metadata_int.insert(format!("{}_{}", key, i), v as i64);
                             },

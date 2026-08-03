@@ -39,7 +39,7 @@ pub fn silu(out: &mut [f32], x: &[f32], n: usize) {
 }
 
 pub fn silu_inplace(x: &mut [f32], n: usize) {
-    for i in 0..n { x[i] = x[i] / (1.0 + (-x[i]).exp()); }
+    for v in x[..n].iter_mut() { *v = *v / (1.0 + (-*v).exp()); }
 }
 
 pub fn matmul(dst: &mut [f32], a: &[f32], b: &[f32], m: usize, n: usize, k: usize) {
@@ -96,9 +96,14 @@ pub fn softmax(x: &mut [f32], n: usize, rows: usize) {
         let row = &mut x[r * n..(r + 1) * n];
         let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
-        for i in 0..n { row[i] = (row[i] - maxv).exp(); sum += row[i]; }
+        for v in row.iter_mut().take(n) {
+            *v = (*v - maxv).exp();
+            sum += *v;
+        }
         let inv = 1.0 / sum;
-        for i in 0..n { row[i] *= inv; }
+        for v in row.iter_mut().take(n) {
+            *v *= inv;
+        }
     }
 }
 

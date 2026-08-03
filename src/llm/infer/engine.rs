@@ -50,8 +50,9 @@ fn gemv(
         ops::matmul_nt(out, x, weights, 1, rows, cols);
     }
 }
-
-
+// Inference hot path: many scratch buffers are passed directly to avoid a
+// per-call allocation. Grouping them would add an allocation to every token.
+#[allow(clippy::too_many_arguments)]
 fn forward_layer(
     model: &super::model::Model,
     kv_cache: &mut [f32],
@@ -332,7 +333,7 @@ impl InferenceEngine {
                     let mut scored: Vec<(f32, usize)> = logits.iter().enumerate().map(|(i, &v)| (v, i)).collect();
                     scored.select_nth_unstable_by(top_k - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let threshold = scored[top_k - 1].0;
-                    for (_i, v) in logits.iter_mut().enumerate() {
+                    for v in logits.iter_mut() {
                         if *v < threshold { *v = f32::NEG_INFINITY; }
                     }
                 }

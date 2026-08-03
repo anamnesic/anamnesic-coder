@@ -31,7 +31,7 @@ fn dequantize_q4_0_row(block: &[u8], out: &mut [f32], n: i64) {
             let q = block[b_offset + 2 + i];
             let idx_base = b * 32 + i as i64 * 2;
             let q0 = (((q & 0x0F) as i8) << 4) as f32 * 0.0625f32;
-            let q1 = (((q & 0xF0) as i8)) as f32 * 0.0625f32;
+            let q1 = ((q & 0xF0) as i8) as f32 * 0.0625f32;
             if idx_base < n && (idx_base as usize) < out.len() {
                 out[idx_base as usize] = q0 * d;
             }
@@ -63,13 +63,13 @@ fn dequantize_q8_0_row(block: &[u8], out: &mut [f32], n: i64) {
 
 fn dequantize_f16_row(block: &[u8], out: &mut [f32], n: i64) {
     let count = (n as usize).min(out.len());
-    for i in 0..count {
+    for (i, slot) in out[..count].iter_mut().enumerate() {
         let offset = i * 2;
         if offset + 2 > block.len() {
             break;
         }
         let h = u16::from_le_bytes(block[offset..offset + 2].try_into().unwrap_or_default());
-        out[i] = half_to_f32(h);
+        *slot = half_to_f32(h);
     }
 }
 
@@ -98,14 +98,14 @@ impl Tensor {
             GgmlType::Q4_0 => {
                 for row in (0..n).step_by(self.dims[0] as usize) {
                     let row_size = self.dims[0];
-                    let src = &self.data[(row / self.dims[0] as i64) as usize * ((row_size + 31) / 32) as usize * 18..];
+                    let src = &self.data[(row / self.dims[0]) as usize * ((row_size + 31) / 32) as usize * 18..];
                     dequantize_q4_0_row(src, &mut out[row as usize..], row_size);
                 }
             },
             GgmlType::Q8_0 => {
                 for row in (0..n).step_by(self.dims[0] as usize) {
                     let row_size = self.dims[0];
-                    let src = &self.data[(row / self.dims[0] as i64) as usize * ((row_size + 31) / 32) as usize * 34..];
+                    let src = &self.data[(row / self.dims[0]) as usize * ((row_size + 31) / 32) as usize * 34..];
                     dequantize_q8_0_row(src, &mut out[row as usize..], row_size);
                 }
             },
@@ -217,7 +217,7 @@ const QK_K: usize = 256;
 /// Q4_K: block = 2(d f16) + 2(dmin f16) + 12(scales) + 128(4-bit qs) = 144 bytes
 fn dequantize_q4_k(data: &[u8], out: &mut [f32], n: i64) {
     const BLOCK: usize = 144;
-    let nb = (n as usize + QK_K - 1) / QK_K;
+    let nb = (n as usize).div_ceil(QK_K);
     for b in 0..nb {
         let bs = b * BLOCK;
         let d    = half_to_f32(u16::from_le_bytes([data[bs],   data[bs+1]]));
@@ -260,7 +260,7 @@ fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
 /// Q6_K: block = 128(ql) + 64(qh) + 16(scales i8) + 2(d f16) = 210 bytes
 fn dequantize_q6_k(data: &[u8], out: &mut [f32], n: i64) {
     const BLOCK: usize = 210;
-    let nb = (n as usize + QK_K - 1) / QK_K;
+    let nb = (n as usize).div_ceil(QK_K);
     for b in 0..nb {
         let bs = b * BLOCK;
         let ql = &data[bs..bs+128];
@@ -277,10 +277,10 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32], n: i64) {
         for _half in 0..2 {
             for l in 0..32usize {
                 let is = l / 16;
-                let q1 = (((ql[ql_off+l]    & 0xF) | (((qh[qh_off+l] >> 0) & 3) << 4)) as u8 as i8).wrapping_sub(32);
-                let q2 = (((ql[ql_off+l+32] & 0xF) | (((qh[qh_off+l] >> 2) & 3) << 4)) as u8 as i8).wrapping_sub(32);
-                let q3 = (((ql[ql_off+l]    >> 4)  | (((qh[qh_off+l] >> 4) & 3) << 4)) as u8 as i8).wrapping_sub(32);
-                let q4 = (((ql[ql_off+l+32] >> 4)  | (((qh[qh_off+l] >> 6) & 3) << 4)) as u8 as i8).wrapping_sub(32);
+                let q1 = (((ql[ql_off+l]    & 0xF) | ((qh[qh_off+l] & 3) << 4)) as i8).wrapping_sub(32);
+                let q2 = (((ql[ql_off+l+32] & 0xF) | (((qh[qh_off+l] >> 2) & 3) << 4)) as i8).wrapping_sub(32);
+                let q3 = (((ql[ql_off+l]    >> 4)  | (((qh[qh_off+l] >> 4) & 3) << 4)) as i8).wrapping_sub(32);
+                let q4 = (((ql[ql_off+l+32] >> 4)  | (((qh[qh_off+l] >> 6) & 3) << 4)) as i8).wrapping_sub(32);
                 let s1 = data[bs+192 + sc_off + is    ] as i8 as f32;
                 let s2 = data[bs+192 + sc_off + is + 2] as i8 as f32;
                 let s3 = data[bs+192 + sc_off + is + 4] as i8 as f32;
@@ -301,7 +301,7 @@ fn dequantize_q6_k(data: &[u8], out: &mut [f32], n: i64) {
 /// Q8_K: block = 4(d f32) + 256(qs i8) + 32(bsums i16) = 292 bytes
 fn dequantize_q8_k(data: &[u8], out: &mut [f32], n: i64) {
     const BLOCK: usize = 292;
-    let nb = (n as usize + QK_K - 1) / QK_K;
+    let nb = (n as usize).div_ceil(QK_K);
     for b in 0..nb {
         let bs = b * BLOCK;
         let d = f32::from_le_bytes([data[bs], data[bs+1], data[bs+2], data[bs+3]]);
@@ -318,7 +318,7 @@ fn dequantize_q8_k(data: &[u8], out: &mut [f32], n: i64) {
 fn dequantize_q5_0(data: &[u8], out: &mut [f32], n: i64) {
     const BLOCK: usize = 22;
     const QK: usize = 32;
-    let nb = (n as usize + QK - 1) / QK;
+    let nb = (n as usize).div_ceil(QK);
     for b in 0..nb {
         let bs = b * BLOCK;
         let d = half_to_f32(u16::from_le_bytes([data[bs], data[bs+1]]));
@@ -329,7 +329,7 @@ fn dequantize_q5_0(data: &[u8], out: &mut [f32], n: i64) {
         for i in 0..y_len {
             let nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0xF;
             let upper_bit = (qh[i / 8] >> (i % 8)) & 1;
-            let q = (nibble as u8 | (upper_bit << 4)) as i8 as i32 - 16;
+            let q = (nibble | (upper_bit << 4)) as i8 as i32 - 16;
             out[y_base + i] = d * q as f32;
         }
     }

@@ -21,6 +21,49 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Strip a Windows verbatim-prefix form (`\\?\`, `//?/`, `\\?/`) from a path.
+/// These prefixes make canonicalized and raw paths disagree under `starts_with`
+/// and leak into tool output (e.g. `//?/C:/Users/.../docs/.obsidian/`).
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    let stripped = raw
+        .strip_prefix("\\\\?\\")
+        .or_else(|| raw.strip_prefix("//?/"))
+        .or_else(|| raw.strip_prefix("\\\\?/"))
+        .unwrap_or(&raw)
+        .replace('/', "\\");
+    PathBuf::from(stripped)
+}
+
+/// Canonical, single-form workspace path used for containment checks and as the
+/// working directory for child processes (git, cargo, rg, tests). Accepts
+/// Obsidian-style verbatim paths like `//?/C:/Users/...`, normalizes forward
+/// slashes, resolves relative paths against the current directory, and
+/// canonicalizes when possible.
+pub fn normalize_workspace_path(path: &Path) -> PathBuf {
+    let cleaned = {
+        #[cfg(windows)]
+        {
+            strip_verbatim_prefix(path)
+        }
+        #[cfg(not(windows))]
+        {
+            path.to_path_buf()
+        }
+    };
+    if cleaned.is_absolute() {
+        cleaned.canonicalize().unwrap_or_else(|_| normalize(&cleaned))
+    } else {
+        let absolute = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&cleaned);
+        absolute
+            .canonicalize()
+            .unwrap_or_else(|_| normalize(&absolute))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileTools {
     workspace: PathBuf,
@@ -142,12 +185,43 @@ mod tests {
         assert!(root.contains(&"sub/".to_string()), "directories should appear with trailing /");
         assert_eq!(tools.list_files("sub"), vec!["sub/b.txt"]);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_workspace_is_supported() {
+        let cwd = std::env::current_dir().unwrap();
+        let forward = cwd.display().to_string().replace('\\', "/");
+        let verbatim = std::path::PathBuf::from(format!("//?/{forward}/"));
+        let tools = FileTools::new(verbatim);
+        tools.write_file("verbatim-test.txt", "x").unwrap();
+        assert_eq!(tools.read_file("verbatim-test.txt").unwrap(), "x");
+        let tree = tools.list_tree("", 2, 50).unwrap();
+        assert!(tree.contains("verbatim-test.txt"), "tree: {tree}");
+        let files = tools.list_files("");
+        assert!(files.iter().any(|f| f == "verbatim-test.txt"), "files: {files:?}");
+        let _ = std::fs::remove_file(cwd.join("verbatim-test.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_verbatim_path_inside_workspace_resolves() {
+        let cwd = std::env::current_dir().unwrap();
+        let tools = FileTools::new(cwd.clone());
+        tools.write_file("verbatim-sub/abs.txt", "data").unwrap();
+        let absolute = format!(
+            "//?/{}/verbatim-sub/abs.txt",
+            cwd.display().to_string().replace('\\', "/")
+        );
+        assert_eq!(tools.read_file(&absolute).unwrap(), "data");
+        let _ = std::fs::remove_dir_all(cwd.join("verbatim-sub"));
+    }
 }
 
 impl FileTools {
     pub fn new(workspace: PathBuf) -> Self {
-        fs::create_dir_all(&workspace).ok();
-        FileTools { workspace }
+        let ws = normalize_workspace_path(&workspace);
+        fs::create_dir_all(&ws).ok();
+        FileTools { workspace: ws }
     }
 
     fn resolve(&self, path: &str) -> Option<PathBuf> {
@@ -158,10 +232,6 @@ impl FileTools {
             self.workspace.join(raw)
         };
         let normalized = normalize(&joined);
-        let ws = self
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| normalize(&self.workspace));
 
         let mut current = normalized.clone();
         let mut suffix: Vec<std::ffi::OsString> = Vec::new();
@@ -178,10 +248,29 @@ impl FileTools {
         for part in suffix.iter().rev() {
             real.push(part);
         }
-        if real.starts_with(&ws) {
+        if self.contains_path(&real) {
             Some(real)
         } else {
             None
+        }
+    }
+
+    /// True when `candidate` lives inside the workspace, tolerating Windows
+    /// verbatim-prefix (`\\?\` / `//?/`) form differences between the
+    /// canonicalized candidate and the stored workspace path.
+    fn contains_path(&self, candidate: &Path) -> bool {
+        if candidate.starts_with(&self.workspace) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let cand = strip_verbatim_prefix(candidate);
+            let ws = strip_verbatim_prefix(&self.workspace);
+            cand.starts_with(&ws)
+        }
+        #[cfg(not(windows))]
+        {
+            false
         }
     }
 
@@ -219,19 +308,21 @@ impl FileTools {
         }) else {
             return entries_out;
         };
-        let ws = self.workspace.canonicalize().unwrap_or_else(|_| self.workspace.clone());
         let real_p = p.canonicalize().unwrap_or(p);
         if let Ok(entries) = fs::read_dir(&real_p) {
             for entry in entries.flatten() {
                 let entry_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-                if let Ok(rel) = entry_path.strip_prefix(&ws) {
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let mut name = rel.to_string_lossy().replace('\\', "/");
-                    if is_dir && !name.ends_with('/') {
-                        name.push('/');
-                    }
-                    entries_out.push(name);
+                let name = entry_path
+                    .strip_prefix(&self.workspace)
+                    .or_else(|_| entry_path.strip_prefix(&real_p))
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| entry.file_name().to_string_lossy().replace('\\', "/"));
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let mut name = name;
+                if is_dir && !name.ends_with('/') {
+                    name.push('/');
                 }
+                entries_out.push(name);
             }
         }
         entries_out.sort();
@@ -283,6 +374,7 @@ impl FileTools {
         if !root.is_dir() {
             anyhow::bail!("tree path is not a directory");
         }
+        let root_anchor = root.clone();
         let mut pending = vec![(root, 0usize)];
         let mut output = Vec::new();
         while let Some((directory, depth)) = pending.pop() {
@@ -301,12 +393,12 @@ impl FileTools {
                 if file_type.is_symlink() {
                     continue;
                 }
-                let relative = entry
-                    .path()
+                let entry_path = entry.path();
+                let relative = entry_path
                     .strip_prefix(&self.workspace)
-                    .unwrap_or(&entry.path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                    .or_else(|_| entry_path.strip_prefix(&root_anchor))
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| entry.file_name().to_string_lossy().replace('\\', "/"));
                 if file_type.is_dir() {
                     output.push(format!("{relative}/"));
                     if depth < max_depth {

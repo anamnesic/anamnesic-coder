@@ -200,9 +200,11 @@ async fn main() -> Result<()> {
     providers::load_dotenv();
     llm::infer::ops::init_thread_pool();
     let cli = Cli::parse();
-    let mut cfg = Config::default();
-    cfg.workspace_dir = PathBuf::from(&cli.dir);
-    cfg.use_local = cli.local;
+    let mut cfg = Config {
+        workspace_dir: crate::tools::fs::normalize_workspace_path(&PathBuf::from(&cli.dir)),
+        use_local: cli.local,
+        ..Config::default()
+    };
     let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);

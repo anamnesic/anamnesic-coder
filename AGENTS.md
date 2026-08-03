@@ -31,4 +31,8 @@ Each index.md file contains a list of files in that directory with brief descrip
 - [`docs/adr/0008-robustness-and-floating-point-safety.md`](docs/adr/0008-robustness-and-floating-point-safety.md) — Robustness, Floating Point Safety & Store Key Masking
 - [`docs/adr/0009-context-intelligence-and-repo-map.md`](docs/adr/0009-context-intelligence-and-repo-map.md) — Context Intelligence, Calibrated Token Estimation & Repo Map
 - [`docs/adr/0010-benchmark-module-refactoring.md`](docs/adr/0010-benchmark-module-refactoring.md) — Benchmark Module Refactoring (Local / Cloud Split)
+- [`docs/adr/0011-sub-agent-task-tool.md`](docs/adr/0011-sub-agent-task-tool.md) — Sub-Agent Task Tool (`task`)
+- [`docs/adr/0012-mcp-client.md`](docs/adr/0012-mcp-client.md) — MCP Client (Model Context Protocol, stdio)
+- [`docs/adr/0013-streaming-tool-call-deltas.md`](docs/adr/0013-streaming-tool-call-deltas.md) — Streaming Tool Call Deltas
+- [`docs/adr/0014-circuit-breaker.md`](docs/adr/0014-circuit-breaker.md) — Provider Health Checks & Circuit Breaking
 - [`docs/gap-analysis-2026-08.md`](docs/gap-analysis-2026-08.md) — 2026 Competitor Gap Analysis Report

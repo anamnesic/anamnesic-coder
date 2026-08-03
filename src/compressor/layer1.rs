@@ -63,7 +63,7 @@ fn strip_ansi(input: &str) -> String {
         if c == '\x1b' && chars.peek() == Some(&'[') {
             chars.next();
             while let Some(&n) = chars.peek() {
-                if n == 'm' || n == 'H' || (n >= '@' && n <= '~') {
+                if n == 'm' || n == 'H' || ('@'..='~').contains(&n) {
                     chars.next();
                     break;
                 }
