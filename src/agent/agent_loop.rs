@@ -23,6 +23,11 @@ pub enum AgentEvent {
         name: String,
         summary: String,
     },
+    ToolCallDelta {
+        index: usize,
+        name: Option<String>,
+        args_delta: String,
+    },
     PlanStep {
         index: usize,
         total: usize,
@@ -70,6 +75,7 @@ static APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default, Clone)]
 pub struct AgentHooks {
     pub on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
+    pub on_tool_call_delta: Option<Arc<dyn Fn(usize, Option<&str>, &str) + Send + Sync>>,
     pub on_approval: Option<Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync>>,
     pub interrupt: Option<Arc<AtomicBool>>,
 }
@@ -911,6 +917,7 @@ fn execute_tool(
                                     }
                                 }
                             })),
+                            on_tool_call_delta: None,
                             on_approval: None,
                             interrupt: None,
                         };
@@ -1558,6 +1565,7 @@ mod tests {
         let captured = Arc::clone(&events);
         let hooks = AgentHooks {
             on_event: Some(Arc::new(move |event| captured.lock().unwrap().push(event))),
+            on_tool_call_delta: None,
             on_approval: None,
             interrupt: None,
         };

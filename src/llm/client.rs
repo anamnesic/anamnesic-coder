@@ -347,7 +347,8 @@ impl LlmClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed")))
     }
 
-    /// Stream a response, invoking `on_token` for each text chunk.
+    /// Stream a response, invoking `on_token` for each text chunk and
+    /// `on_tool_call_delta` for incremental tool-call arguments.
     /// Falls back to non-streaming output for local engines.
     pub async fn stream(
         &self,
@@ -356,6 +357,7 @@ impl LlmClient {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        on_tool_call_delta: &mut dyn FnMut(usize, Option<&str>, &str),
     ) -> Result<String> {
         match self {
             LlmClient::Ollama(c) => {
@@ -364,7 +366,7 @@ impl LlmClient {
             }
             LlmClient::Cloud(c) => {
                 let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-                c.stream_chat(model, messages, tools, response_format, on_token)
+                c.stream_chat(model, messages, tools, response_format, on_token, on_tool_call_delta)
                     .await
             }
             LlmClient::Local(eng) => {
@@ -885,7 +887,8 @@ impl CloudClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("cloud chat failed after retries")))
     }
 
-    /// Stream a chat completion (SSE), feeding content deltas to `on_token`.
+    /// Stream a chat completion (SSE), feeding content deltas to `on_token`
+    /// and structured tool-call deltas to `on_tool_call_delta`.
     pub async fn stream_chat(
         &self,
         model: &str,
@@ -893,6 +896,7 @@ impl CloudClient {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        on_tool_call_delta: &mut dyn FnMut(usize, Option<&str>, &str),
     ) -> Result<String> {
         let mut body = CloudStreamRequest {
             model: model.to_string(),
@@ -951,6 +955,12 @@ impl CloudClient {
                         }
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc in tcs {
+                                let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str());
+                                let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
+                                if !args.is_empty() {
+                                    on_tool_call_delta(index, name, args);
+                                }
                                 on_token(
                                     &serde_json::json!({
                                         "tool_call": tc

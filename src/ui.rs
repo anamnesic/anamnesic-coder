@@ -590,6 +590,7 @@ fn run_input(
             on_event: Some(Arc::new(move |ev| {
                 let _ = agent_tx_clone.send(ev);
             })),
+            on_tool_call_delta: None,
             on_approval: Some(Arc::new(move |request| {
                 if approval_tx_clone.send(request).is_err() {
                     return ApprovalDecision::Deny;
@@ -697,6 +698,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     AgentEvent::ToolCall { name, summary } => {
                         let s: String = summary.chars().take(120).collect();
                         a.add_message("Tool", &format!("{name} — {s}"));
+                    }
+                    AgentEvent::ToolCallDelta { index, name, args_delta } => {
+                        let prefix = name.as_deref().unwrap_or("?");
+                        a.add_message("Tool", &format!("{prefix}[{index}] Δ {args_delta}"));
                     }
                     AgentEvent::PlanStep {
                         index,
@@ -1860,5 +1865,24 @@ mod tests {
         assert_eq!(st.config.coder_model, "granite3.3:2b");
         assert_eq!(st.config.summarizer_model, "granite3.3:2b");
         assert!(!router.is_cloud_model("granite3.3:2b"));
+    }
+
+    #[test]
+    fn tool_call_delta_event_is_handled() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let hooks = AgentHooks {
+            on_event: Some(Arc::new(move |ev| captured.lock().unwrap().push(ev))),
+            on_tool_call_delta: None,
+            on_approval: None,
+            interrupt: None,
+        };
+        hooks.emit(AgentEvent::ToolCallDelta {
+            index: 0,
+            name: Some("read_file".into()),
+            args_delta: "{\"path\":\"/tmp".into(),
+        });
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
     }
 }

@@ -434,7 +434,7 @@ async fn execute_step_inner(
                 .stream(&state.config.coder_model, &prompt, None, None, &mut |tok| {
                     let _ = write!(out, "{}", tok);
                     let _ = out.flush();
-                })
+                }, &mut |_, _, _| {})
                 .await;
             println!();
             if let Err(e) = result {

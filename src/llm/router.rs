@@ -342,10 +342,11 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        on_tool_call_delta: &mut dyn FnMut(usize, Option<&str>, &str),
     ) -> Result<String> {
         let (_, api_id) = self.resolve(model);
         self.client_for(model)?
-            .stream(&api_id, prompt, tools, response_format, on_token)
+            .stream(&api_id, prompt, tools, response_format, on_token, on_tool_call_delta)
             .await
     }
 }

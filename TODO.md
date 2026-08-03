@@ -124,11 +124,12 @@
 - **Files:** `src/agent/loop.rs`, `src/llm/prompt.rs`
 - **Fix:** Na construção do system prompt, procurar e ler `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, ou `CONTEXT.md` na raiz do workspace. Injetar o conteúdo no system prompt.
 
-### G9. Streaming Tool Call Deltas
+### ~~G9. Streaming Tool Call Deltas~~ ✅ DONE
 - **Gap:** Tool calls são parseados apenas de respostas completas. Não há streaming incremental de tool call deltas durante SSE.
 - **Impact:** UX — o usuário não vê o que o modelo está decidindo até a resposta completa chegar.
-- **Files:** `src/llm/client.rs`
-- **Fix:** No streaming SSE, parsear `tool_calls` incrementalmente (acumular `function.arguments` chunk-by-chunk). Emitir eventos parciais via `AgentHooks`.
+- **Files:** `src/llm/client.rs`, `src/llm/router.rs`, `src/agent/agent_loop.rs`, `src/ui.rs`
+- **Fix:** Implementado streaming incremental de tool call deltas. `CloudClient::stream_chat` agora aceita `on_tool_call_delta` callback e emite `(index, name, args_delta)` para cada delta SSE. `LlmClient::stream` e `LlmRouter::stream` propagam o callback. `AgentEvent::ToolCallDelta` adicionado para eventos parciais. `AgentHooks::on_tool_call_delta` adicionado. UI handle `ToolCallDelta` exibindo `name[index] Δ args_delta`. `executor.rs` atualizado para passar no-op delta callback. 174 tests pass.
+- **Ref:** ADR 0013
 
 ### G10. `list_files` Should Include Directories
 - **Gap:** `list_files` só retorna arquivos (`is_file()`), não diretórios. Antigravity e Claude Code retornam ambos.
