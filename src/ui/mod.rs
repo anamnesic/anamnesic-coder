@@ -750,18 +750,69 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
     let clean = name.trim_end_matches(" [cloud]").to_string();
     if clean == "auto" {
         app.auto_model = true;
-        let best = "glm-5.2";
+        let provider = app.provider.clone();
+        let catalog = crate::models_dev::ModelsDevClient::load();
+        let cloud_candidates: Vec<String> = catalog
+            .provider_models(&provider)
+            .into_iter()
+            .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
+            .map(|m| crate::models_dev::base_id(&m.id))
+            .collect();
+
+        let candidates = if !cloud_candidates.is_empty() {
+            cloud_candidates
+        } else {
+            let st = state.lock().unwrap();
+            let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
+            if !local.is_empty() {
+                local
+            } else {
+                vec!["glm-5.2".to_string()]
+            }
+        };
+
+        app.add_message(
+            "System",
+            &format!("Testing availability across {} candidate models…", candidates.len()),
+        );
+
+        let router_clone = router.clone();
+        let candidates_clone = candidates.clone();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (best, latency) = rt
+            .block_on(async move {
+                router_clone
+                    .select_best_available_model(&candidates_clone)
+                    .await
+            })
+            .unwrap_or_else(|_| (candidates[0].clone(), std::time::Duration::from_millis(0)));
+
         {
             let mut st = state.lock().unwrap();
-            st.config.coder_model = best.to_string();
-            st.config.planner_model = best.to_string();
-            st.config.summarizer_model = best.to_string();
+            st.config.coder_model = best.clone();
+            st.config.planner_model = best.clone();
+            st.config.summarizer_model = best.clone();
         }
-        app.model = best.to_string();
-        router.set_model(best);
-        router.mark_cloud(best);
-        app.add_message("System", "Auto model enabled — GLM-5.2 (will fallback on failure)");
-        app.status = format!("Ready · model: {best} (auto) · Esc interrupt");
+        app.model = best.clone();
+        router.set_model(&best);
+        if catalog.provider_model_api_id(&provider, &best).is_some() {
+            router.mark_cloud(&best);
+        }
+
+        let lat_ms = latency.as_millis();
+        if lat_ms > 0 {
+            app.add_message(
+                "System",
+                &format!("✓ Auto mode tested availability: selected {best} ({lat_ms}ms latency, 200 OK)"),
+            );
+            app.status = format!("Ready · model: {best} (auto {lat_ms}ms) · Esc interrupt");
+        } else {
+            app.add_message(
+                "System",
+                &format!("✓ Auto mode enabled — selected {best} (fallback active)"),
+            );
+            app.status = format!("Ready · model: {best} (auto) · Esc interrupt");
+        }
         return;
     }
     app.auto_model = false;

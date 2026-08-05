@@ -170,6 +170,60 @@ impl LlmRouter {
         self.resolve(model).0
     }
 
+    /// Probe a model with a quick lightweight request to measure availability and latency (ms).
+    /// Returns `Ok(Duration)` on success, or `Err` if unavailable / failing / rate limited.
+    pub async fn test_model_availability(&self, model: &str) -> Result<std::time::Duration> {
+        let (_, api_id) = self.resolve(model);
+        let client = self.client_for(model)?;
+        let start = std::time::Instant::now();
+        let timeout_duration = std::time::Duration::from_secs(4);
+
+        tokio::time::timeout(
+            timeout_duration,
+            client.generate(&api_id, "Hi", None, None),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout probing model '{model}'"))?
+        .map_err(|e| anyhow::anyhow!("Probe failed for model '{model}': {e}"))?;
+
+        Ok(start.elapsed())
+    }
+
+    /// Test a list of candidate model names and return the candidate model
+    /// with the best availability (lowest latency + 200 OK status).
+    pub async fn select_best_available_model(
+        &self,
+        candidates: &[String],
+    ) -> Result<(String, std::time::Duration)> {
+        if candidates.is_empty() {
+            anyhow::bail!("No candidate models provided for auto selection");
+        }
+
+        let mut best: Option<(String, std::time::Duration)> = None;
+
+        for candidate in candidates {
+            if let Ok(latency) = self.test_model_availability(candidate).await {
+                match &best {
+                    None => {
+                        best = Some((candidate.clone(), latency));
+                    }
+                    Some((_, best_latency)) => {
+                        if latency < *best_latency {
+                            best = Some((candidate.clone(), latency));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(best_res) = best {
+            Ok(best_res)
+        } else {
+            // Fallback to first candidate if probes failed/offline
+            Ok((candidates[0].clone(), std::time::Duration::from_millis(0)))
+        }
+    }
+
     /// Pick the concrete client for a model id (cloned; cheap for reqwest).
     pub fn client_for(&self, model: &str) -> Result<LlmClient> {
         if self.is_cloud_model(model) {
@@ -598,5 +652,13 @@ mod tests {
         // Should not panic; the test catalog may or may not have a same-tier fallback.
         r.set_model("nvidia/llama-3.1-nemotron-70b-instruct");
         // No same-tier model in test catalog, so fallback should remain None or unchanged.
+    }
+
+    #[tokio::test]
+    async fn select_best_available_model_returns_first_if_probes_fail() {
+        let r = router();
+        let candidates = vec!["nvidia/unknown-a".to_string(), "nvidia/unknown-b".to_string()];
+        let (selected, _) = r.select_best_available_model(&candidates).await.unwrap();
+        assert_eq!(selected, "nvidia/unknown-a");
     }
 }
