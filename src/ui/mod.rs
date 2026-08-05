@@ -2489,23 +2489,50 @@ fn user_message_lines(content: &str) -> Vec<Line<'static>> {
 /// Codex-style assistant cell: markdown rendered, first line prefixed with
 /// `• ` (dim), continuation lines with two spaces.
 fn assistant_message_lines(content: &str) -> Vec<Line<'static>> {
-    let md_lines = render_markdown_lines(content)
-        .map(expand_multiline_spans)
-        .map(collapse_consecutive_blanks)
-        .filter(|spans| !spans.is_empty());
-    let spans: Vec<Span<'static>> = match md_lines {
+    let raw_spans = match render_markdown_lines(content) {
         Some(spans) => spans,
         None => vec![Span::styled(content.to_string(), Style::default().fg(Color::Gray))],
     };
+
     let mut out = Vec::new();
-    for (i, span) in spans.into_iter().enumerate() {
-        let prefix = if i == 0 {
+    let mut current_line_spans: Vec<Span<'static>> = Vec::new();
+    let mut is_first_line = true;
+
+    for span in raw_spans {
+        if span.content.contains('\n') {
+            let parts: Vec<&str> = span.content.split('\n').collect();
+            for (idx, part) in parts.iter().enumerate() {
+                if !part.is_empty() {
+                    current_line_spans.push(Span::styled((*part).to_string(), span.style));
+                }
+                if idx < parts.len() - 1 {
+                    let prefix = if is_first_line {
+                        is_first_line = false;
+                        Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
+                    } else {
+                        Span::styled("  ", Style::default())
+                    };
+                    let mut line_spans = vec![prefix];
+                    line_spans.append(&mut current_line_spans);
+                    out.push(Line::from(line_spans));
+                }
+            }
+        } else {
+            current_line_spans.push(span);
+        }
+    }
+
+    if !current_line_spans.is_empty() {
+        let prefix = if is_first_line {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::styled("  ", Style::default())
         };
-        out.push(Line::from(vec![prefix, span]));
+        let mut line_spans = vec![prefix];
+        line_spans.append(&mut current_line_spans);
+        out.push(Line::from(line_spans));
     }
+
     out
 }
 
@@ -2663,8 +2690,8 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             }
             Event::Code(t) => {
                 spans.push(Span::styled(
-                    format!(" {} ", t.as_ref()),
-                    Style::default().fg(Color::Yellow).bg(Color::Gray),
+                    t.as_ref().to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -2677,7 +2704,7 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
                     if !spans.is_empty() && !in_code {
-                        spans.push(Span::raw("\n".to_string()));
+                        spans.push(Span::raw("\n\n".to_string()));
                     }
                 }
                 Tag::CodeBlock(_) => {
