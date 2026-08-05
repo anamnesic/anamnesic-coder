@@ -190,6 +190,11 @@ pub struct App {
     /// Whether the reasoning panel is expanded (showing full content)
     /// or collapsed (showing only a summary).
     pub reasoning_expanded: bool,
+    /// Whether tool call details are expanded (showing full output)
+    /// or collapsed (showing rollup summary).
+    pub tool_calls_expanded: bool,
+    /// Number of collapsed tool calls in the current view.
+    pub collapsed_tool_count: usize,
     /// Fuzzy file-search overlay state (Ctrl+P): query, ranking and selection.
     pub file_search: bool,
     pub file_search_query: String,
@@ -287,6 +292,8 @@ impl App {
             streaming_assistant: false,
             diff_content: Vec::new(),
             reasoning_expanded: true,
+            tool_calls_expanded: false,
+            collapsed_tool_count: 0,
             file_search: false,
             file_search_query: String::new(),
             file_search_selected: 0,
@@ -1151,6 +1158,17 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 }
                 // Ctrl+T: toggle reasoning panel expand/collapse.
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                    guard.reasoning_expanded = !guard.reasoning_expanded;
+                    continue;
+                }
+                // Ctrl+O: toggle tool call details expand/collapse.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+                    guard.tool_calls_expanded = !guard.tool_calls_expanded;
+                    continue;
+                }
+                // Ctrl+R: toggle compact/expanded view.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                    guard.tool_calls_expanded = !guard.tool_calls_expanded;
                     guard.reasoning_expanded = !guard.reasoning_expanded;
                     continue;
                 }
@@ -2156,11 +2174,20 @@ fn count_wrapped_lines(lines: &[Line<'static>], width: usize) -> usize {
 /// with a dim `•` bullet, and status/tool messages stay compact and subdued.
 fn flatten_messages(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let mut tool_count = 0usize;
+    let mut tool_buffer = Vec::new();
     for (role, content) in &app.messages {
         match role.to_ascii_lowercase().as_str() {
-            "user" => lines.extend(user_message_lines(content)),
-            "assistant" => lines.extend(assistant_message_lines(content)),
+            "user" => {
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(user_message_lines(content));
+            }
+            "assistant" => {
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(assistant_message_lines(content));
+            }
             "thinking" => {
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
                 if app.reasoning_expanded {
                     lines.extend(status_message_lines(role, content));
                 } else {
@@ -2168,11 +2195,47 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
                     lines.extend(status_message_lines("thinking", &summary));
                 }
             }
-            _ => lines.extend(status_message_lines(role, content)),
+            "tool" => {
+                if app.tool_calls_expanded {
+                    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                    lines.extend(status_message_lines(role, content));
+                } else {
+                    tool_count += 1;
+                    tool_buffer.push(content.clone());
+                }
+            }
+            _ => {
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(status_message_lines(role, content));
+            }
         }
         lines.push(Line::from(""));
     }
+    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
     lines
+}
+
+/// Flush accumulated tool calls into a rollup summary or individual lines.
+fn flush_tool_rollup(
+    app: &App,
+    count: &mut usize,
+    buffer: &mut Vec<String>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    if *count == 0 {
+        return;
+    }
+    if app.tool_calls_expanded {
+        for content in buffer.drain(..) {
+            lines.extend(status_message_lines("tool", &content));
+            lines.push(Line::from(""));
+        }
+    } else {
+        let summary = format!("↳ {} tool use{}", count, if *count == 1 { "" } else { "s" });
+        lines.extend(status_message_lines("tool", &summary));
+    }
+    *count = 0;
+    buffer.clear();
 }
 
 /// Codex-style user cell: `› ` (bold dim) on the first line, `  ` continuation.
@@ -2719,11 +2782,27 @@ mod tests {
         app.add_message("System", "ready");
         app.add_message("Error", "boom");
         app.add_message("Tool", "edit_file — changed src/main.rs");
+        app.tool_calls_expanded = true;
         let lines = flatten_messages(&app);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(texts[0], "ready");
         assert!(texts[2].starts_with("✗ boom"));
         assert!(texts[4].starts_with("↳ edit_file — changed src/main.rs"));
+    }
+
+    #[test]
+    fn flatten_messages_collapses_tool_calls_when_expanded_is_false() {
+        let mut app = App::new("model", "off");
+        app.tool_calls_expanded = false;
+        app.add_message("Tool", "edit_file — changed src/main.rs");
+        app.add_message("Tool", "run_tests — all passed");
+        app.add_message("Tool", "bash — exit 0");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        // All 3 tool calls should be collapsed into a single rollup line.
+        let tool_lines: Vec<_> = texts.iter().filter(|t| t.starts_with("↳")).collect();
+        assert_eq!(tool_lines.len(), 1);
+        assert!(tool_lines[0].contains("3 tool uses"));
     }
 
     #[test]
