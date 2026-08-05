@@ -2407,7 +2407,10 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
                 TagEnd::CodeBlock => {
                     spans.push(Span::styled(
                         code_text.clone(),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(30, 30, 30))
+                            .add_modifier(Modifier::BOLD),
                     ));
                     in_code = false;
                     code_text.clear();
