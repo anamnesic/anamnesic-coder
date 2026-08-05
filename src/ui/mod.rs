@@ -47,9 +47,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "Show model, provider, directory, context tokens"),
     (
         "/model",
-        "Select the active model (no arg = pick from list)",
+        "Select the active model (no arg = pick from best models for NVIDIA)",
     ),
-    ("/models", "List available models"),
     (
         "/provider",
         "Select cloud model provider (no arg = pick from list)",
@@ -191,10 +190,8 @@ pub struct App {
     /// or collapsed (showing only a summary).
     pub reasoning_expanded: bool,
     /// Whether tool call details are expanded (showing full output)
-    /// or collapsed (showing rollup summary).
+    /// or collapsed (showing rollup summary). Toggled with Ctrl+O or Ctrl+E.
     pub tool_calls_expanded: bool,
-    /// Number of collapsed tool calls in the current view.
-    pub collapsed_tool_count: usize,
     /// Fuzzy file-search overlay state (Ctrl+P): query, ranking and selection.
     pub file_search: bool,
     pub file_search_query: String,
@@ -205,6 +202,8 @@ pub struct App {
     pub info_popup: bool,
     /// Accumulated reasoning content for thinking models (GLM-5.2, deepseek-r1).
     pub reasoning: String,
+    /// Active top tab: 0 = Session, 1 = Issues, 2 = Pull Requests, 3 = Gists
+    pub active_tab: usize,
 }
 
 /// Byte offset of the `char_index`-th character of `s`. Clamped to `s.len()`
@@ -235,7 +234,7 @@ impl App {
             editor_scroll: 0,
             input_history: Vec::new(),
             history_index: None,
-            status: "Ready · Enter to send · Tab: mode · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
+            status: "Ready · F1: Session · F2: Issues · F3: PRs · F4: Gists · Enter to send · Esc interrupt"
                 .into(),
             scroll_offset: 0,
             follow: true,
@@ -293,7 +292,6 @@ impl App {
             diff_content: Vec::new(),
             reasoning_expanded: true,
             tool_calls_expanded: false,
-            collapsed_tool_count: 0,
             file_search: false,
             file_search_query: String::new(),
             file_search_selected: 0,
@@ -301,6 +299,7 @@ impl App {
             file_search_paths: Vec::new(),
             info_popup: false,
             reasoning: String::new(),
+            active_tab: 0,
         }
     }
 
@@ -308,9 +307,6 @@ impl App {
         self.messages.push((role.to_string(), content.to_string()));
     }
 
-    /// Accumulate streaming tool-call argument deltas onto the most recent
-    /// delta line for the same call index. A new call (or new index) starts a
-    /// fresh line. Prevents the chat from flooding with one line per SSE chunk.
     pub fn feed_tool_delta(&mut self, index: usize, name: &str, args_delta: &str) {
         const MAX_DELTA_CHARS: usize = 240;
         let mut text;
@@ -505,7 +501,7 @@ impl App {
     }
 }
 
-/// Handle TUI slash commands (e.g. /models). Returns true if the command was
+/// Handle TUI slash commands (e.g. /model). Returns true if the command was
 /// handled locally and should not be sent to the agent.
 fn handle_slash_command(
     input: &str,
@@ -515,50 +511,6 @@ fn handle_slash_command(
 ) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("");
     match cmd {
-        "/models" => {
-            let st = state.lock().unwrap();
-            let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
-            let dir = st.config.models_dir.clone();
-            drop(st);
-            let provider = app.provider.clone();
-            let cloud: Vec<String> = crate::models_dev::ModelsDevClient::load()
-                .provider_models(&provider)
-                .into_iter()
-                .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-                .map(|m| format!("{} [cloud]", crate::models_dev::base_id(&m.id)))
-                .collect();
-            let cloud = unique_model_ids(cloud);
-            if local.is_empty() && cloud.is_empty() {
-                app.add_message(
-                    "System",
-                    &format!(
-                        "No models found in {} or for provider {} in the models.dev catalog.",
-                        dir.display(),
-                        provider
-                    ),
-                );
-            } else {
-                let mut out = String::from("Local models:");
-                if local.is_empty() {
-                    out.push_str(" (none)");
-                }
-                for m in &local {
-                    out.push_str("\n  ");
-                    out.push_str(m);
-                }
-                out.push_str(&format!("\nCloud models ({provider}):"));
-                if cloud.is_empty() {
-                    out.push_str(" (none)");
-                }
-                for m in &cloud {
-                    out.push_str("\n  ");
-                    out.push_str(m);
-                }
-                app.add_message("System", &out);
-            }
-            app.status = "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt".into();
-            true
-        }
         "/reset" => {
             state.lock().unwrap().reset();
             app.messages.clear();
@@ -640,12 +592,45 @@ fn handle_slash_command(
                 let dir = st.config.models_dir.clone();
                 drop(st);
                 // Cloud models come from the models.dev catalog for the active provider.
-                let provider = app.provider.clone();
-                let cloud: Vec<String> = crate::models_dev::ModelsDevClient::load()
+let provider = app.provider.clone();
+                let catalog = crate::models_dev::ModelsDevClient::load();
+                let mut cloud_ranked: Vec<(usize, String)> = catalog
                     .provider_models(&provider)
                     .into_iter()
                     .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-                    .map(|m| format!("{} [cloud]", crate::models_dev::base_id(&m.id)))
+                    .filter(|m| {
+                        if provider == "nvidia" {
+                            let base = crate::models_dev::base_id(&m.id);
+                            matches!(
+                                base.as_str(),
+                                "glm-5.2"
+                                    | "qwen3.5-397b-a17b"
+                                    | "deepseek-v4-pro"
+                                    | "kimi-k2.6"
+                                    | "minimax-m3"
+                                    | "nemotron-3-ultra-550b-a55b"
+                            )
+                        } else {
+                            match &m.release_date {
+                                Some(d) if d.starts_with("2026") => m.open_weights,
+                                _ => false,
+                            }
+                        }
+                    })
+.map(|m| {
+                         let base = crate::models_dev::base_id(&m.id);
+                         let display = if provider == "nvidia" {
+                             ranked_model_name(&base)
+                         } else {
+                             base.clone()
+                         };
+                         (ranked_model_order(&base), display)
+                     })
+                    .collect();
+                cloud_ranked.sort_by_key(|(rank, _)| *rank);
+                let cloud: Vec<String> = cloud_ranked
+                    .into_iter()
+                    .map(|(_, name)| format!("{} [cloud]", name))
                     .collect();
                 let mut items: Vec<String> = local.clone();
                 items.extend(unique_model_ids(cloud));
@@ -662,7 +647,10 @@ fn handle_slash_command(
                     app.model_selected = app
                         .model_items
                         .iter()
-                        .position(|m| m.trim_end_matches(" [cloud]") == app.model)
+                        .position(|m| {
+                            let trimmed = m.trim_end_matches(" [cloud]");
+                            trimmed.eq_ignore_ascii_case(&app.model)
+                        })
                         .unwrap_or(0);
                     app.model_selector = true;
                 }
@@ -739,6 +727,34 @@ fn unique_model_ids(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Return the ranked display name for a model base ID, or the ID itself
+/// if not in the top list.  Used for the NVIDIA provider's best-model picker.
+fn ranked_model_name(base_id: &str) -> String {
+    match base_id {
+        "glm-5.2" => "GLM-5.2".into(),
+        "qwen3.5-397b-a17b" => "Qwen3.5-397B-A17B".into(),
+        "deepseek-v4-pro" => "DeepSeek-V4-Pro".into(),
+        "kimi-k2.6" => "Kimi-K2.6".into(),
+        "minimax-m3" => "MiniMax-M3".into(),
+        "nemotron-3-ultra-550b-a55b" => "Nemotron-3-Ultra-550B-A55B".into(),
+        _ => base_id.to_string(),
+    }
+}
+
+/// Return the rank position of a model base ID in the NVIDIA best-model list.
+/// Models not in the list sort last.
+fn ranked_model_order(base_id: &str) -> usize {
+    match base_id {
+        "glm-5.2" => 0,
+        "qwen3.5-397b-a17b" => 1,
+        "deepseek-v4-pro" => 2,
+        "kimi-k2.6" => 3,
+        "minimax-m3" => 4,
+        "nemotron-3-ultra-550b-a55b" => 5,
+        _ => usize::MAX,
+    }
+}
+
 /// Set the active coder model for subsequent agent turns.  Strips the
 /// " [cloud]" picker suffix and tells the router whether the model is a cloud
 /// model so requests go to the right backend.
@@ -794,7 +810,7 @@ fn set_active_provider(
             app.provider = name.to_string();
             app.add_message("System", &format!("Cloud provider set to {name} ({base})"));
             app.status =
-                format!("Ready · provider: {name} · run /models or /model to list its models");
+                format!("Ready · provider: {name} · run /model to list its models");
         }
         Err(e) => {
             app.add_message("Error", &format!("Provider {name} not configured: {e}"));
@@ -1163,6 +1179,11 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 }
                 // Ctrl+O: toggle tool call details expand/collapse.
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+                    guard.tool_calls_expanded = !guard.tool_calls_expanded;
+                    continue;
+                }
+                // Ctrl+E: toggle tool call timeline expand/collapse.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
                     guard.tool_calls_expanded = !guard.tool_calls_expanded;
                     continue;
                 }
@@ -1623,9 +1644,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
             Ok(Event::Mouse(mouse)) => {
                 let mut guard = app.lock().unwrap();
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && !guard.loading {
-                        guard.focus = Focus::Messages;
-                    }
+                    && !guard.loading
+                {
+                    guard.focus = Focus::Messages;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         guard.scroll_offset = guard.scroll_offset.saturating_sub(5);
@@ -1633,6 +1655,32 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     MouseEventKind::ScrollDown => {
                         guard.scroll_offset += 5;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        // Toggle tool call rollup expansion on click.
+                        let flattened = flatten_messages(&guard);
+                        let msg_area_top = 2; // margin(1) + header(1)
+                        let clicked_row = mouse.row as usize;
+                        if clicked_row > msg_area_top {
+                            let offset = if guard.follow {
+                                flattened
+                                    .len()
+                                    .saturating_sub(guard.scroll_offset)
+                            } else {
+                                guard.scroll_offset
+                            };
+                            let line_idx = clicked_row - msg_area_top + offset;
+                            if line_idx < flattened.len() {
+                                let line_text = flattened[line_idx].to_string();
+                                if line_text.starts_with("●")
+                                    || line_text.starts_with("Δ")
+                                    || line_text.contains(" tool use")
+                                {
+                                    guard.tool_calls_expanded =
+                                        !guard.tool_calls_expanded;
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1843,7 +1891,7 @@ fn draw<B: ratatui::backend::Backend>(
         } else if app.pending_approval.is_some() {
             " a: allow once · s: allow session · d: deny ".into()
         } else {
-            " Esc interrupt ".into()
+            " Esc interrupt · Ctrl+O tool calls · Ctrl+E tool calls · Ctrl+R view ".into()
         };
         let bottom_pad = (size.width as usize)
             .saturating_sub(bottom_left.chars().count() + bottom_right.chars().count());
@@ -2182,17 +2230,64 @@ fn flush_tool_rollup(
     if *count == 0 {
         return;
     }
-    if app.tool_calls_expanded {
+    let expanded = app.tool_calls_expanded;
+    if expanded {
         for content in buffer.drain(..) {
             lines.extend(status_message_lines("tool", &content));
             lines.push(Line::from(""));
         }
     } else {
-        let summary = format!("↳ {} tool use{}", count, if *count == 1 { "" } else { "s" });
+        let summary = format_tool_rollup(buffer);
         lines.extend(status_message_lines("tool", &summary));
     }
     *count = 0;
     buffer.clear();
+}
+
+/// Build a rollup summary string from tool call contents.
+/// Groups by tool name and shows counts, e.g. "Read file, Glob, Bash ×5".
+/// Active (streaming) tool calls are marked with a ● prefix.
+fn format_tool_rollup(buffer: &[String]) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut active_tools: Vec<String> = Vec::new();
+    for content in buffer {
+        let name = extract_tool_name(content);
+        if content.starts_with("Δ ") {
+            if !active_tools.contains(&name) {
+                active_tools.push(name.clone());
+            }
+        }
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(name, &count)| {
+            let is_active = active_tools.contains(name);
+            let prefix = if is_active { "● " } else { "" };
+            if count > 1 {
+                format!("{prefix}{name} ×{count}")
+            } else {
+                format!("{prefix}{name}")
+            }
+        })
+        .collect();
+    let total = buffer.len();
+    let plural = if total == 1 { "" } else { "s" };
+    format!("{} tool use{}: {}", total, plural, parts.join(", "))
+}
+
+/// Extract the tool name from a tool call content string.
+/// Handles both "Δ name[idx] ..." (delta) and "name — summary" (completed) formats.
+fn extract_tool_name(content: &str) -> String {
+    if let Some(rest) = content.strip_prefix("Δ ") {
+        let end = rest.find(['[', ' ']).unwrap_or(rest.len());
+        rest[..end].to_string()
+    } else if let Some(pos) = content.find(' ') {
+        content[..pos].to_string()
+    } else {
+        content.to_string()
+    }
 }
 
 fn flatten_messages(app: &App) -> Vec<Line<'static>> {
@@ -2204,17 +2299,32 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
         match role.to_ascii_lowercase().as_str() {
             "user" => {
                 in_plan = false;
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                flush_tool_rollup(
+                    app,
+                    &mut tool_count,
+                    &mut tool_buffer,
+                    &mut lines,
+                );
                 lines.extend(user_message_lines(content));
             }
             "assistant" => {
                 in_plan = false;
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                flush_tool_rollup(
+                    app,
+                    &mut tool_count,
+                    &mut tool_buffer,
+                    &mut lines,
+                );
                 lines.extend(assistant_message_lines(content));
             }
             "thinking" => {
                 in_plan = false;
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                flush_tool_rollup(
+                    app,
+                    &mut tool_count,
+                    &mut tool_buffer,
+                    &mut lines,
+                );
                 if app.reasoning_expanded {
                     lines.extend(status_message_lines(role, content));
                 } else {
@@ -2224,12 +2334,22 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
             }
             "plan" => {
                 in_plan = true;
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                flush_tool_rollup(
+                    app,
+                    &mut tool_count,
+                    &mut tool_buffer,
+                    &mut lines,
+                );
                 lines.extend(status_message_lines(role, content));
             }
             "tool" => {
                 if app.tool_calls_expanded {
-                    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                    flush_tool_rollup(
+                        app,
+                        &mut tool_count,
+                        &mut tool_buffer,
+                        &mut lines,
+                    );
                     if in_plan {
                         lines.extend(plan_tool_message_lines(content));
                     } else {
@@ -2242,13 +2362,23 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
             }
             _ => {
                 in_plan = false;
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                flush_tool_rollup(
+                    app,
+                    &mut tool_count,
+                    &mut tool_buffer,
+                    &mut lines,
+                );
                 lines.extend(status_message_lines(role, content));
             }
         }
         lines.push(Line::from(""));
     }
-    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+    flush_tool_rollup(
+        app,
+        &mut tool_count,
+        &mut tool_buffer,
+        &mut lines,
+    );
     lines
 }
 
@@ -2350,12 +2480,38 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
             Style::default().fg(Color::LightMagenta),
             false,
         ),
-        "tool" => (
-            "↳ ",
-            Style::default().fg(Color::Gray),
-            Style::default().fg(Color::Gray),
-            false,
-        ),
+        "tool" => {
+            let is_active = content.starts_with('Δ');
+            let is_rollup = content.contains("tool use");
+            let icon = if is_rollup {
+                "↳ "
+            } else if content.contains("list_dir") || content.contains("search") || content.contains("grep") {
+                "🔍 "
+            } else if content.contains("read") {
+                "📖 "
+            } else if content.contains("write") || content.contains("replace") || content.contains("edit") {
+                "✏️ "
+            } else if content.contains("run") || content.contains("exec") || content.contains("cargo") {
+                "⚡ "
+            } else if content.contains("verify") || content.contains("test") {
+                "🧪 "
+            } else if is_active {
+                "⏳ "
+            } else {
+                "↳ "
+            };
+            let prefix_style = if is_active {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let content_style = if is_active {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            (icon, prefix_style, content_style, false)
+        }
         "file" => (
             "↳ ",
             Style::default().fg(Color::Cyan),
@@ -2813,7 +2969,7 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(texts[0], "ready");
         assert!(texts[2].starts_with("✗ boom"));
-        assert!(texts[4].starts_with("↳ edit_file — changed src/main.rs"));
+        assert!(texts[4].contains("edit_file — changed src/main.rs"));
     }
 
     #[test]
@@ -2829,6 +2985,28 @@ mod tests {
         let tool_lines: Vec<_> = texts.iter().filter(|t| t.starts_with("↳")).collect();
         assert_eq!(tool_lines.len(), 1);
         assert!(tool_lines[0].contains("3 tool uses"));
+        assert!(tool_lines[0].contains("edit_file"));
+    }
+
+    #[test]
+    fn extract_tool_name_handles_delta_and_completed_formats() {
+        assert_eq!(extract_tool_name("Δ edit_file[0] {\"path\": \"a.rs\"}"), "edit_file");
+        assert_eq!(extract_tool_name("Δ run_tests[3] all passed"), "run_tests");
+        assert_eq!(extract_tool_name("read_file — read src/main.rs"), "read_file");
+        assert_eq!(extract_tool_name("bash"), "bash");
+    }
+
+    #[test]
+    fn flatten_messages_rollup_with_streaming_delta_does_not_panic() {
+        let mut app = App::new("model", "off");
+        app.tool_calls_expanded = false;
+        app.add_message("Tool", "read_file — read src/main.rs");
+        app.feed_tool_delta(0, "edit_file", "{\"path\":\"a.rs\"}");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let tool_lines: Vec<_> = texts.iter().filter(|t| t.starts_with("↳")).collect();
+        assert_eq!(tool_lines.len(), 1);
+        assert!(tool_lines[0].contains("2 tool uses"));
     }
 
     #[test]

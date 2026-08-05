@@ -3,55 +3,1331 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>anamnesic — terminal</title>
+  <title>Anamnesic Harness — AI Coding Agent</title>
+
+  <!-- Google Fonts: Inter & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- xterm.js CSS & JS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+
   <style>
-    html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; }
-    #term { width: 100vw; height: 100vh; }
+    :root {
+      --bg-main: #07090e;
+      --bg-panel: #0d111a;
+      --bg-card: #131a27;
+      --bg-card-hover: #182234;
+      --border-color: #1e293b;
+      --border-color-light: #334155;
+      
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      
+      --accent-cyan: #06b6d4;
+      --accent-cyan-glow: rgba(6, 182, 212, 0.15);
+      --accent-emerald: #10b981;
+      --accent-emerald-glow: rgba(16, 185, 129, 0.15);
+      --accent-purple: #8b5cf6;
+      --accent-purple-glow: rgba(139, 92, 246, 0.15);
+      --accent-amber: #f59e0b;
+      --accent-red: #ef4444;
+      --accent-blue: #3b82f6;
+      
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', Consolas, Monaco, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* --- TOP HEADER BAR --- */
+    .header-bar {
+      height: 52px;
+      background-color: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      user-select: none;
+      z-index: 100;
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: linear-gradient(135deg, rgba(6, 182, 212, 0.2), rgba(139, 92, 246, 0.2));
+      border: 1px solid rgba(6, 182, 212, 0.4);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.5px;
+      color: #7dd3fc;
+    }
+
+    .brand-icon {
+      font-size: 14px;
+      color: var(--accent-cyan);
+    }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .meta-pill {
+      background-color: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    .meta-pill.branch {
+      color: var(--accent-emerald);
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .meta-pill.auto {
+      color: var(--accent-purple);
+      border-color: rgba(139, 92, 246, 0.3);
+    }
+
+    /* TOP TABS */
+    .top-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      height: 100%;
+    }
+
+    .tab-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 38px;
+      padding: 0 16px;
+      background: transparent;
+      border: none;
+      border-radius: 6px;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-main);
+      background-color: rgba(255, 255, 255, 0.04);
+    }
+
+    .tab-btn.active {
+      color: var(--accent-cyan);
+      background-color: var(--accent-cyan-glow);
+      border-bottom: 2px solid var(--accent-cyan);
+      font-weight: 600;
+    }
+
+    .tab-badge {
+      background-color: rgba(255, 255, 255, 0.1);
+      color: var(--text-muted);
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-weight: 600;
+    }
+
+    .tab-btn.active .tab-badge {
+      background-color: rgba(6, 182, 212, 0.25);
+      color: var(--accent-cyan);
+    }
+
+    /* --- MAIN CONTENT AREA --- */
+    .main-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .tab-content {
+      display: none;
+      width: 100%;
+      height: 100%;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .tab-content.active {
+      display: flex;
+    }
+
+    /* SESSION VIEW SUB-NAV / VIEW SWITCHER */
+    .view-toolbar {
+      height: 40px;
+      background-color: rgba(13, 17, 26, 0.8);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 12px;
+    }
+
+    .view-modes {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background-color: rgba(0, 0, 0, 0.3);
+      padding: 3px;
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+    }
+
+    .view-mode-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .view-mode-btn.active {
+      background-color: var(--border-color-light);
+      color: var(--text-main);
+    }
+
+    .toolbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .tool-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tool-btn:hover {
+      color: var(--text-main);
+      border-color: var(--border-color-light);
+    }
+
+    /* TIMELINE + TERMINAL SPLIT CONTAINER */
+    .split-container {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* TIMELINE SECTION */
+    .timeline-wrapper {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      scroll-behavior: smooth;
+    }
+
+    .timeline-wrapper::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .timeline-wrapper::-webkit-scrollbar-thumb {
+      background: var(--border-color);
+      border-radius: 3px;
+    }
+
+    /* TIMELINE ITEM CARD */
+    .step-card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      animation: fadeIn 0.25s ease-out forwards;
+      position: relative;
+    }
+
+    .step-card:hover {
+      border-color: var(--border-color-light);
+    }
+
+    .step-card.running {
+      border-color: rgba(6, 182, 212, 0.5);
+      box-shadow: 0 0 12px rgba(6, 182, 212, 0.1);
+    }
+
+    .step-card.error {
+      border-color: rgba(239, 68, 68, 0.5);
+      box-shadow: 0 0 12px rgba(239, 68, 68, 0.1);
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .step-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .step-main-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .step-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+
+    .step-icon.search { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); }
+    .step-icon.read { background: rgba(59, 130, 246, 0.15); color: var(--accent-blue); }
+    .step-icon.edit { background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald); }
+    .step-icon.cmd { background: rgba(245, 158, 11, 0.15); color: var(--accent-amber); }
+    .step-icon.test { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
+    .step-icon.thought { background: rgba(255, 255, 255, 0.1); color: var(--text-muted); }
+    .step-icon.error { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+
+    .step-desc {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .step-tool-pill {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      background-color: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 2px 8px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+
+    .step-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .step-duration {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    .status-badge.success { background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald); }
+    .status-badge.running { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); }
+    .status-badge.error { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+
+    .spinner-pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-cyan);
+      animation: pulse 1s infinite alternate;
+    }
+
+    @keyframes pulse {
+      from { opacity: 0.3; transform: scale(0.8); }
+      to { opacity: 1; transform: scale(1.2); }
+    }
+
+    /* COLLAPSIBLE DETAILS */
+    .collapsible-trigger {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-muted);
+      cursor: pointer;
+      user-select: none;
+      margin-top: 2px;
+      width: fit-content;
+    }
+
+    .collapsible-trigger:hover {
+      color: var(--accent-cyan);
+    }
+
+    .collapsible-content {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 6px;
+      border-top: 1px dashed var(--border-color);
+      padding-top: 10px;
+    }
+
+    .collapsible-content.expanded {
+      display: flex;
+    }
+
+    .code-block {
+      background-color: #080c14;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #cbd5e1;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      max-height: 260px;
+    }
+
+    /* DIFF VIEWER */
+    .diff-container {
+      background-color: #070a10;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      overflow: hidden;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    .diff-header {
+      background-color: #0f172a;
+      padding: 6px 12px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
+      font-weight: 600;
+      font-size: 11px;
+    }
+
+    .diff-line {
+      padding: 2px 12px;
+      white-space: pre-wrap;
+      display: flex;
+    }
+
+    .diff-line.add { background-color: rgba(16, 185, 129, 0.12); color: #4ade80; }
+    .diff-line.del { background-color: rgba(239, 68, 68, 0.12); color: #f87171; }
+    .diff-line.hunk { background-color: rgba(59, 130, 246, 0.1); color: #60a5fa; font-weight: 600; }
+
+    /* AGENT ASSISTANT MESSAGE CARD */
+    .msg-card {
+      background: linear-gradient(135deg, rgba(13, 17, 26, 0.9), rgba(19, 26, 39, 0.9));
+      border: 1px solid rgba(6, 182, 212, 0.25);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      gap: 12px;
+    }
+
+    .msg-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 14px;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    .msg-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--text-main);
+    }
+
+    .msg-body code {
+      font-family: var(--font-mono);
+      background-color: rgba(255, 255, 255, 0.08);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+      color: var(--accent-cyan);
+    }
+
+    /* PTY TERMINAL OVERLAY / SIDE PANEL */
+    .terminal-container {
+      width: 50%;
+      height: 100%;
+      background-color: #05070b;
+      border-left: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .terminal-header {
+      height: 32px;
+      background-color: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    #term {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      padding: 4px;
+    }
+
+    /* TAB CONTENTS FOR ISSUES, PRs, GISTS */
+    .tab-pane-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .pane-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .issue-card, .pr-card, .gist-card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      transition: all 0.15s ease;
+    }
+
+    .issue-card:hover, .pr-card:hover, .gist-card:hover {
+      border-color: var(--border-color-light);
+      background-color: var(--bg-card-hover);
+    }
+
+    .issue-left {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .issue-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .issue-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 12px;
+    }
+
+    .priority-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+
+    .priority-high { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+    .priority-med { background: rgba(245, 158, 11, 0.2); color: var(--accent-amber); }
+    .priority-low { background: rgba(59, 130, 246, 0.2); color: var(--accent-blue); }
+
+    .action-btn {
+      background: linear-gradient(135deg, var(--accent-cyan), #0284c7);
+      color: #fff;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .action-btn:hover {
+      opacity: 0.9;
+    }
+
+    /* --- BOTTOM INPUT & INSTRUCTION BAR --- */
+    .input-bar-container {
+      background-color: var(--bg-panel);
+      border-top: 1px solid var(--border-color);
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .input-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background-color: var(--bg-main);
+      border: 1px solid var(--border-color-light);
+      border-radius: 8px;
+      padding: 8px 14px;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .input-row:focus-within {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 10px var(--accent-cyan-glow);
+    }
+
+    .prompt-symbol {
+      color: var(--accent-cyan);
+      font-weight: 700;
+      font-size: 14px;
+      font-family: var(--font-mono);
+    }
+
+    .instruction-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      font-size: 13.5px;
+      font-family: var(--font-sans);
+      outline: none;
+    }
+
+    .instruction-input::placeholder {
+      color: var(--text-dim);
+    }
+
+    .send-btn {
+      background-color: var(--accent-cyan);
+      color: #07090e;
+      border: none;
+      padding: 6px 16px;
+      border-radius: 6px;
+      font-weight: 700;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .send-btn:hover {
+      background-color: #22d3ee;
+    }
+
+    .input-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .mode-toggles {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .mode-chip {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 11px;
+    }
+
+    .mode-chip.active {
+      background: var(--accent-purple-glow);
+      border-color: var(--accent-purple);
+      color: var(--accent-purple);
+      font-weight: 600;
+    }
+
+    /* --- BOTTOM STATUS BAR --- */
+    .status-bar {
+      height: 28px;
+      background-color: #05070b;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+    }
+
+    .status-left, .status-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .indicator-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background-color: var(--accent-emerald);
+      box-shadow: 0 0 6px var(--accent-emerald);
+    }
   </style>
 </head>
 <body>
-  <div id="term"></div>
+
+  <!-- TOP HEADER BAR WITH TABS -->
+  <header class="header-bar">
+    <div class="brand-section">
+      <div class="brand-badge">
+        <span class="brand-icon">⚡</span>
+        ANAMNESIC HARNESS
+      </div>
+      <div class="header-meta">
+        <span class="meta-pill branch">git: main</span>
+        <span class="meta-pill">nemotron-3-nano</span>
+        <span class="meta-pill auto">Auto Mode</span>
+      </div>
+    </div>
+
+    <!-- MAIN TOP TABS -->
+    <nav class="top-tabs">
+      <button class="tab-btn active" onclick="switchTab('session')">
+        💬 Session <span class="tab-badge" id="session-count">Live</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('issues')">
+        🎯 Issues <span class="tab-badge">3</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('pull-requests')">
+        🔀 Pull Requests <span class="tab-badge">1</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('gists')">
+        📝 Gists <span class="tab-badge">5</span>
+      </button>
+    </nav>
+  </header>
+
+  <!-- MAIN CONTENT CONTAINER -->
+  <main class="main-container">
+
+    <!-- TAB 1: SESSION TIMELINE & TERMINAL -->
+    <div id="tab-session" class="tab-content active">
+      <!-- VIEW TOOLBAR -->
+      <div class="view-toolbar">
+        <div class="view-modes">
+          <button class="view-mode-btn active" id="btn-view-timeline" onclick="setViewMode('timeline')">Timeline View</button>
+          <button class="view-mode-btn" id="btn-view-split" onclick="setViewMode('split')">Split View</button>
+          <button class="view-mode-btn" id="btn-view-terminal" onclick="setViewMode('terminal')">PTY Terminal</button>
+        </div>
+
+        <div class="toolbar-actions">
+          <button class="tool-btn" onclick="toggleAllCollapsibles()">
+            <span>↕</span> Expand/Collapse Details
+          </button>
+          <button class="tool-btn" onclick="clearTimeline()">
+            <span>🧹</span> Clear Timeline
+          </button>
+        </div>
+      </div>
+
+      <!-- SPLIT CONTAINER (TIMELINE + PTY) -->
+      <div class="split-container">
+        <!-- CHRONOLOGICAL TIMELINE VIEW -->
+        <div class="timeline-wrapper" id="timeline-container">
+          
+          <!-- INITIAL WELCOME CARD -->
+          <div class="msg-card">
+            <div class="msg-avatar">A</div>
+            <div class="msg-body">
+              <strong>Anamnesic Coding Agent Ready</strong>
+              <p>Session started in <code>/workspace</code>. Auto mode active. Send instructions below or select an issue from the <strong>Issues</strong> tab.</p>
+            </div>
+          </div>
+
+          <!-- EXAMPLE DEMO STEP CARDS TO WOW THE USER IMMEDIATELY -->
+          <div class="step-card">
+            <div class="step-header">
+              <div class="step-main-info">
+                <div class="step-icon search">🔍</div>
+                <span class="step-desc">Inspecting directory structure to map workspace entry points</span>
+                <span class="step-tool-pill">list_dir</span>
+              </div>
+              <div class="step-meta">
+                <span class="step-duration">18ms</span>
+                <span class="status-badge success">✓ Success</span>
+              </div>
+            </div>
+            <div class="collapsible-trigger" onclick="toggleCollapsible(this)">
+              <span>▶</span> Show output (7 files found)
+            </div>
+            <div class="collapsible-content">
+              <div class="code-block">src/
+  agent/
+  ui/
+    mod.rs
+  terminal/
+    server.rs
+    index.html
+Cargo.toml</div>
+            </div>
+          </div>
+
+          <div class="step-card">
+            <div class="step-header">
+              <div class="step-main-info">
+                <div class="step-icon edit">✏️</div>
+                <span class="step-desc">Redesigning Harness UI layout in src/terminal/index.html</span>
+                <span class="step-tool-pill">replace_file_content</span>
+              </div>
+              <div class="step-meta">
+                <span class="step-duration">42ms</span>
+                <span class="status-badge success">✓ Success</span>
+              </div>
+            </div>
+            <div class="collapsible-trigger" onclick="toggleCollapsible(this)">
+              <span>▶</span> Show code diff (+184 / -12 lines)
+            </div>
+            <div class="collapsible-content">
+              <div class="diff-container">
+                <div class="diff-header">diff --git a/src/terminal/index.html b/src/terminal/index.html</div>
+                <div class="diff-line hunk">@@ -1,15 +1,48 @@</div>
+                <div class="diff-line del">- &lt;title&gt;anamnesic - terminal&lt;/title&gt;</div>
+                <div class="diff-line add">+ &lt;title&gt;Anamnesic Harness — AI Coding Agent&lt;/title&gt;</div>
+                <div class="diff-line add">+ &lt;header class="header-bar"&gt;</div>
+                <div class="diff-line add">+   &lt;nav class="top-tabs"&gt;...&lt;/nav&gt;</div>
+                <div class="diff-line add">+ &lt;/header&gt;</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="step-card">
+            <div class="step-header">
+              <div class="step-main-info">
+                <div class="step-icon cmd">⚡</div>
+                <span class="step-desc">Running verification check suite</span>
+                <span class="step-tool-pill">cargo check</span>
+              </div>
+              <div class="step-meta">
+                <span class="step-duration">380ms</span>
+                <span class="status-badge success">✓ Success</span>
+              </div>
+            </div>
+            <div class="collapsible-trigger" onclick="toggleCollapsible(this)">
+              <span>▶</span> View compilation log
+            </div>
+            <div class="collapsible-content">
+              <div class="code-block">    Checking anamnesic-coder v0.1.0 (C:\Users\luann\Documents\GitHub\anamnesic-coder)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s</div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- PTY TERMINAL OVERLAY / PANEL -->
+        <div class="terminal-container" id="terminal-panel" style="display: none;">
+          <div class="terminal-header">
+            <span>INTERACTIVE PTY SESSION</span>
+            <span>xterm.js @ WebSocket /ws</span>
+          </div>
+          <div id="term"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: ISSUES -->
+    <div id="tab-issues" class="tab-content">
+      <div class="tab-pane-container">
+        <div class="pane-header">
+          <h2 class="pane-title">🎯 Workspace Issues & Tasks</h2>
+          <span class="meta-pill">3 Open Issues</span>
+        </div>
+
+        <div class="issue-card">
+          <div class="issue-left">
+            <div class="issue-title">
+              <span>Redesign Harness UI layout with modern dark theme</span>
+              <span class="priority-badge priority-high">High Priority</span>
+            </div>
+            <div class="issue-meta">
+              <span>Target: src/terminal/index.html</span>
+              <span>Updated: 2 mins ago</span>
+            </div>
+          </div>
+          <button class="action-btn" onclick="assignIssueToAgent('Redesign Harness UI to feature modern dark theme, timeline execution, top tab bar and status bar.')">
+            🤖 Assign to Agent
+          </button>
+        </div>
+
+        <div class="issue-card">
+          <div class="issue-left">
+            <div class="issue-title">
+              <span>Add collapsible blocks for command logs and diffs</span>
+              <span class="priority-badge priority-med">Medium</span>
+            </div>
+            <div class="issue-meta">
+              <span>Target: src/ui/mod.rs</span>
+              <span>Updated: 15 mins ago</span>
+            </div>
+          </div>
+          <button class="action-btn" onclick="assignIssueToAgent('Implement collapsible blocks for logs, commands and outputs in the agent timeline execution.')">
+            🤖 Assign to Agent
+          </button>
+        </div>
+
+        <div class="issue-card">
+          <div class="issue-left">
+            <div class="issue-title">
+              <span>Optimize session token usage tracking & speed metrics</span>
+              <span class="priority-badge priority-low">Low</span>
+            </div>
+            <div class="issue-meta">
+              <span>Target: src/llm/router.rs</span>
+              <span>Updated: 1 hour ago</span>
+            </div>
+          </div>
+          <button class="action-btn" onclick="assignIssueToAgent('Add real-time session token breakdown and cost estimation to the status bar.')">
+            🤖 Assign to Agent
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: PULL REQUESTS -->
+    <div id="tab-pull-requests" class="tab-content">
+      <div class="tab-pane-container">
+        <div class="pane-header">
+          <h2 class="pane-title">🔀 Pull Requests & Code Reviews</h2>
+          <span class="meta-pill">1 Active PR</span>
+        </div>
+
+        <div class="pr-card">
+          <div class="issue-left">
+            <div class="issue-title">
+              <span>PR #14: Harness UI Modernization & Timeline Execution Redesign</span>
+              <span class="status-badge success">In Review</span>
+            </div>
+            <div class="issue-meta">
+              <span>Branch: <code>feature/harness-redesign</code> ➔ <code>main</code></span>
+              <span>+342 / -45 lines</span>
+              <span>4 files changed</span>
+            </div>
+          </div>
+          <button class="action-btn" onclick="switchTab('session')">
+            🔍 Inspect Diffs
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: GISTS -->
+    <div id="tab-gists" class="tab-content">
+      <div class="tab-pane-container">
+        <div class="pane-header">
+          <h2 class="pane-title">📝 Session Gists & Transcripts</h2>
+          <span class="meta-pill">5 Saved Gists</span>
+        </div>
+
+        <div class="gist-card">
+          <div class="issue-left">
+            <div class="issue-title">
+              <span>Session Transcript - 2026-08-05 Harness Redesign</span>
+            </div>
+            <div class="issue-meta">
+              <span>Size: 14 KB</span>
+              <span>Format: JSONL / Markdown</span>
+            </div>
+          </div>
+          <button class="action-btn" onclick="alert('Exporting session transcript...')">
+            📥 Download Log
+          </button>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- BOTTOM INSTRUCTION & INPUT BAR -->
+  <footer class="input-bar-container">
+    <div class="input-row">
+      <span class="prompt-symbol">❯</span>
+      <input type="text" id="instruction-input" class="instruction-input" placeholder="Type instructions for the agent... (e.g., 'Refactor memory module', 'Add tests for router')" onkeydown="handleInputKey(event)" />
+      <button class="send-btn" onclick="submitInstruction()">Send ↵</button>
+    </div>
+
+    <div class="input-controls">
+      <div class="mode-toggles">
+        <span class="mode-chip active" id="chip-auto" onclick="toggleMode('auto')">⚡ Auto Mode</span>
+        <span class="mode-chip" id="chip-plan" onclick="toggleMode('plan')">📋 Plan Mode</span>
+      </div>
+      <div>
+        Press <kbd style="background:rgba(255,255,255,0.1);padding:1px 5px;border-radius:3px;font-size:10px;">Enter</kbd> to execute instruction · <kbd style="background:rgba(255,255,255,0.1);padding:1px 5px;border-radius:3px;font-size:10px;">Esc</kbd> interrupt
+      </div>
+    </div>
+  </footer>
+
+  <!-- BOTTOM STATUS BAR -->
+  <div class="status-bar">
+    <div class="status-left">
+      <div class="status-item">
+        <span class="indicator-dot"></span>
+        <span>Connected</span>
+      </div>
+      <div class="status-item">
+        <span>Branch:</span>
+        <strong style="color:var(--accent-emerald);">main</strong>
+      </div>
+      <div class="status-item">
+        <span>Mode:</span>
+        <strong style="color:var(--accent-purple);">Auto</strong>
+      </div>
+    </div>
+
+    <div class="status-right">
+      <div class="status-item">
+        <span>Session Tokens:</span>
+        <strong style="color:var(--text-main);">18,420 (In: 12k | Out: 6.4k)</strong>
+      </div>
+      <div class="status-item">
+        <span>Speed:</span>
+        <strong style="color:var(--accent-cyan);">64.2 tok/s</strong>
+      </div>
+      <div class="status-item">
+        <span>Cost:</span>
+        <strong style="color:var(--accent-amber);">$0.0034</strong>
+      </div>
+    </div>
+  </div>
+
   <script>
-    const term = new Terminal({
-      fontFamily: 'Consolas, Menlo, monospace',
-      fontSize: 14,
-      cursorBlink: true,
-      allowTransparency: true,
-      theme: { background: '#1e1e1e' },
-    });
-    const fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open(document.getElementById('term'));
-    fit.fit();
+    /* --- TAB NAVIGATION --- */
+    function switchTab(tabId) {
+      document.querySelectorAll('.top-tabs .tab-btn').forEach(btn => btn.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
 
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.binaryType = 'arraybuffer';
+      const activeBtn = Array.from(document.querySelectorAll('.top-tabs .tab-btn'))
+        .find(btn => btn.getAttribute('onclick').includes(tabId));
+      if (activeBtn) activeBtn.classList.add('active');
 
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
-    };
-    ws.onmessage = (e) => {
-      if (typeof e.data === 'string') {
-        term.write(e.data);
-      } else {
-        term.write(new Uint8Array(e.data));
+      const targetPane = document.getElementById('tab-' + tabId);
+      if (targetPane) targetPane.classList.add('active');
+
+      if (tabId === 'session' && currentViewMode === 'terminal') {
+        fitTerminal();
       }
-    };
-    ws.onclose = () => term.write('\r\n\x1b[31m[connection closed]\x1b[0m\r\n');
+    }
 
-    term.onData((data) => ws.send(data));
-    term.onResize(({ cols, rows }) => {
-      ws.send(JSON.stringify({ resize: { cols, rows } }));
-    });
+    /* --- VIEW MODE SWITCHER (Timeline / Split / Terminal) --- */
+    let currentViewMode = 'timeline';
 
-    window.addEventListener('resize', () => {
-      fit.fit();
-      ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
-    });
+    function setViewMode(mode) {
+      currentViewMode = mode;
+      document.querySelectorAll('.view-mode-btn').forEach(btn => btn.classList.remove('active'));
+      document.getElementById('btn-view-' + mode).classList.add('active');
+
+      const timeline = document.getElementById('timeline-container');
+      const terminal = document.getElementById('terminal-panel');
+
+      if (mode === 'timeline') {
+        timeline.style.display = 'flex';
+        timeline.style.width = '100%';
+        terminal.style.display = 'none';
+      } else if (mode === 'split') {
+        timeline.style.display = 'flex';
+        timeline.style.width = '50%';
+        terminal.style.display = 'flex';
+        terminal.style.width = '50%';
+        fitTerminal();
+      } else if (mode === 'terminal') {
+        timeline.style.display = 'none';
+        terminal.style.display = 'flex';
+        terminal.style.width = '100%';
+        fitTerminal();
+      }
+    }
+
+    /* --- COLLAPSIBLE SECTIONS --- */
+    function toggleCollapsible(triggerEl) {
+      const content = triggerEl.nextElementSibling;
+      if (content) {
+        content.classList.toggle('expanded');
+        const isExpanded = content.classList.contains('expanded');
+        triggerEl.querySelector('span').textContent = isExpanded ? '▼' : '▶';
+      }
+    }
+
+    function toggleAllCollapsibles() {
+      const contents = document.querySelectorAll('.collapsible-content');
+      const anyCollapsed = Array.from(contents).some(c => !c.classList.contains('expanded'));
+      contents.forEach(c => {
+        if (anyCollapsed) {
+          c.classList.add('expanded');
+          if (c.previousElementSibling) c.previousElementSibling.querySelector('span').textContent = '▼';
+        } else {
+          c.classList.remove('expanded');
+          if (c.previousElementSibling) c.previousElementSibling.querySelector('span').textContent = '▶';
+        }
+      });
+    }
+
+    function clearTimeline() {
+      const container = document.getElementById('timeline-container');
+      container.innerHTML = `
+        <div class="msg-card">
+          <div class="msg-avatar">A</div>
+          <div class="msg-body">
+            <strong>Timeline Cleared</strong>
+            <p>Ready for new instructions.</p>
+          </div>
+        </div>
+      `;
+    }
+
+    /* --- MODE TOGGLE (Auto vs Plan) --- */
+    let currentMode = 'auto';
+    function toggleMode(mode) {
+      currentMode = mode;
+      document.getElementById('chip-auto').classList.toggle('active', mode === 'auto');
+      document.getElementById('chip-plan').classList.toggle('active', mode === 'plan');
+    }
+
+    /* --- ASSIGN ISSUE TO AGENT --- */
+    function assignIssueToAgent(text) {
+      switchTab('session');
+      const input = document.getElementById('instruction-input');
+      input.value = text;
+      input.focus();
+    }
+
+    /* --- SUBMIT INSTRUCTION --- */
+    function handleInputKey(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        submitInstruction();
+      }
+    }
+
+    function submitInstruction() {
+      const input = document.getElementById('instruction-input');
+      const val = input.value.trim();
+      if (!val) return;
+
+      addTimelineUserStep(val);
+      input.value = '';
+
+      // Simulate real-time agent execution step additions
+      setTimeout(() => {
+        addTimelineAgentStep('Executing instruction: ' + val, 'agent_loop', 'run_command', '142ms', 'Success');
+      }, 400);
+    }
+
+    function addTimelineUserStep(text) {
+      const container = document.getElementById('timeline-container');
+      const div = document.createElement('div');
+      div.className = 'msg-card';
+      div.innerHTML = `
+        <div class="msg-avatar" style="background:#3b82f6;">U</div>
+        <div class="msg-body">
+          <strong>User Instruction</strong>
+          <p>${escapeHtml(text)}</p>
+        </div>
+      `;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function addTimelineAgentStep(desc, tool, cmd, duration, status) {
+      const container = document.getElementById('timeline-container');
+      const div = document.createElement('div');
+      div.className = 'step-card';
+      div.innerHTML = `
+        <div class="step-header">
+          <div class="step-main-info">
+            <div class="step-icon cmd">⚡</div>
+            <span class="step-desc">${escapeHtml(desc)}</span>
+            <span class="step-tool-pill">${escapeHtml(tool)}</span>
+          </div>
+          <div class="step-meta">
+            <span class="step-duration">${duration}</span>
+            <span class="status-badge success">✓ ${status}</span>
+          </div>
+        </div>
+        <div class="collapsible-trigger" onclick="toggleCollapsible(this)">
+          <span>▶</span> View command execution log
+        </div>
+        <div class="collapsible-content">
+          <div class="code-block">$ ${escapeHtml(cmd)}\nCommand completed successfully.</div>
+        </div>
+      `;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    /* --- XTERM.JS PTY INTEGRATION --- */
+    let term, fitAddon, ws;
+
+    function initTerminal() {
+      term = new Terminal({
+        fontFamily: 'JetBrains Mono, Consolas, monospace',
+        fontSize: 13,
+        cursorBlink: true,
+        allowTransparency: true,
+        theme: {
+          background: '#05070b',
+          foreground: '#f1f5f9',
+          cursor: '#06b6d4'
+        }
+      });
+
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('term'));
+
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
+      };
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          term.write(e.data);
+        } else {
+          term.write(new Uint8Array(e.data));
+        }
+      };
+      ws.onclose = () => term.write('\r\n\x1b[31m[PTY connection closed]\x1b[0m\r\n');
+
+      term.onData((data) => ws.send(data));
+      term.onResize(({ cols, rows }) => {
+        ws.send(JSON.stringify({ resize: { cols, rows } }));
+      });
+    }
+
+    function fitTerminal() {
+      if (fitAddon && term) {
+        setTimeout(() => {
+          fitAddon.fit();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
+          }
+        }, 50);
+      }
+    }
+
+    window.addEventListener('resize', fitTerminal);
+    window.addEventListener('DOMContentLoaded', initTerminal);
   </script>
 </body>
 </html>
