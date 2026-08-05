@@ -365,9 +365,6 @@ impl App {
     /// Returns true if a streaming message was finalized (callers should not
     /// push the final message again).
     pub fn end_streaming(&mut self, final_content: Option<&str>) -> bool {
-        if !self.streaming_assistant {
-            return false;
-        }
         // Close any open reasoning accumulation before finalizing content.
         // Insert remaining reasoning before the Assistant message so the
         // transcript reads Thinking → Assistant, not Assistant → Thinking.
@@ -386,11 +383,29 @@ impl App {
                 }
             }
         }
+        if !self.streaming_assistant {
+            return false;
+        }
         if let Some(content) = final_content {
             match self.messages.last_mut() {
                 Some((role, _)) if role == "Assistant" => {
                     if let Some((_, last)) = self.messages.last_mut() {
                         *last = content.to_string();
+                    }
+                }
+                Some((role, _)) if role == "Thinking" => {
+                    // Interleaved case: the last message is a Thinking
+                    // flush from a recent feed_reasoning_delta call,
+                    // and there's a partial Assistant message before it.
+                    // Remove the partial Assistant, then push Thinking
+                    // and Assistant in the correct order.
+                    let tail = self.messages.pop().map(|(_, t)| t);
+                    let partial = self.messages.pop();
+                    if let Some(tail) = tail {
+                        self.messages.push(("Thinking".to_string(), tail));
+                    }
+                    if let Some((_, _)) = partial {
+                        self.messages.push(("Assistant".to_string(), content.to_string()));
                     }
                 }
                 _ => {
