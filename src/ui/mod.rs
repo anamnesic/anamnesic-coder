@@ -1880,18 +1880,17 @@ fn draw<B: ratatui::backend::Backend>(
             f.set_cursor_position((page[1].x + _c + 1, page[1].y + r + 1));
         } else {
         let messages_lines = flatten_messages(app);
-        let area_width = page[1].width as usize;
         let view_height = page[1].height as usize;
-        let total_wrapped = count_wrapped_lines(&messages_lines, area_width);
+        let widget = Paragraph::new(messages_lines).wrap(Wrap { trim: true });
+        // Ratatui's own WordWrapper drives both the render and the scroll
+        // math, so the visible window always matches the wrapped layout.
+        let total_wrapped = widget.line_count(page[1].width);
         let offset = if app.follow {
             total_wrapped.saturating_sub(view_height)
         } else {
             app.scroll_offset.min(total_wrapped.saturating_sub(view_height))
         };
-        let widget = Paragraph::new(messages_lines)
-            .wrap(Wrap { trim: true })
-            .scroll((offset as u16, 0));
-        f.render_widget(widget, page[1]);
+        f.render_widget(widget.scroll((offset as u16, 0)), page[1]);
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
@@ -2139,37 +2138,17 @@ fn display_role(role: &str) -> String {
 /// Count the number of visual lines produced when wrapping `lines` to
 /// `width` cells. Used for scroll-offset math so that `scroll_offset`
 /// tracks visual rows, not logical `Line` entries.
+/// Number of visual rows a set of lines occupies once wrapped at `width`.
+/// Delegates to ratatui's own `Paragraph::line_count` so the count always
+/// matches how the widget will actually render (WordWrapper, trim, spans
+/// concatenated without separators).
 fn count_wrapped_lines(lines: &[Line<'static>], width: usize) -> usize {
     if width == 0 {
         return lines.len();
     }
-    let mut total = 0usize;
-    for line in lines {
-        let mut row_width = 0usize;
-        for fragment in line.spans.iter() {
-            let text: &str = &fragment.content;
-            if text.is_empty() {
-                continue;
-            }
-            let dw = display_width(text);
-            if row_width == 0 {
-                row_width = dw;
-            } else if row_width + 1 + dw <= width {
-                row_width += 1 + dw;
-            } else {
-                total += 1;
-                row_width = dw;
-            }
-            // If the current row exceeds width (single fragment wider
-            // than the terminal), count it as wrapped and reset.
-            if row_width > width {
-                total += 1;
-                row_width = 0;
-            }
-        }
-        total += 1;
-    }
-    total
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: true })
+        .line_count(width as u16)
 }
 
 /// Flatten chat messages into renderable transcript lines (Codex-style):
@@ -3010,10 +2989,33 @@ mod tests {
     fn count_wrapped_lines_counts_visual_rows() {
         use ratatui::text::Line;
         use ratatui::text::Span;
-        // A single line that is 100 chars wide wraps into 2 visual rows
-        // at width 80 (1 space + 19 chars = 20 per row, 100/20 = 5).
+        // A 100-char unbroken run wraps to 2 visual rows at width 80
+        // (80 chars on the first row, the remaining 20 on the second).
         let lines = vec![Line::from(Span::raw("x".repeat(100)))];
         assert_eq!(count_wrapped_lines(&lines, 80), 2);
+    }
+
+    #[test]
+    fn count_wrapped_lines_matches_ratatui_for_prefixed_lines() {
+        use ratatui::text::Line;
+        use ratatui::text::Span;
+        // Prefix span + content span are concatenated WITHOUT a separator,
+        // so "• " + 78 chars is exactly one visual row at width 80. A
+        // hand-rolled counter inserting a virtual space would count 2.
+        let exact = Line::from(vec![Span::raw("• "), Span::raw("x".repeat(78))]);
+        assert_eq!(count_wrapped_lines(&[exact], 80), 1);
+
+        // Multi-word content wraps by words, not by whole-span units.
+        let words: String = "hello world ".repeat(20);
+        let content = words.trim_end().to_string();
+        let line = Line::from(vec![Span::raw("• "), Span::raw(content)]);
+        let lines = vec![line];
+        let width = 80;
+        let expected = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: true })
+            .line_count(width as u16);
+        assert_eq!(count_wrapped_lines(&lines, width), expected);
+        assert!(expected >= 3);
     }
 
     #[test]
