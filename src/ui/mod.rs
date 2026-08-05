@@ -1856,14 +1856,26 @@ fn draw<B: ratatui::backend::Backend>(
                 app.editor_scroll
             };
             let end = std::cmp::min(scroll + area_height, total_lines);
-            let visible = app.editor_lines[scroll..end].join("\n");
-            let editor =
-                Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
+            let line_num_width = total_lines.to_string().len();
+            let visible: Vec<Line<'static>> = app.editor_lines[scroll..end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let num = scroll + i + 1;
+                    let prefix = format!("{:>width$} │ ", num, width = line_num_width);
+                    Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                        Span::styled(line.clone(), Style::default()),
+                    ])
+                })
+                .collect();
+            let editor = Paragraph::new(visible)
+                .block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(editor, page[1]);
             // set cursor in editor area relative to scroll
             let r = (app.editor_row.saturating_sub(scroll)) as u16;
-            let c = app.editor_col as u16;
-            f.set_cursor_position((page[1].x + c + 1, page[1].y + r + 1));
+            let _c = app.editor_col as u16 + line_num_width as u16 + 3; // offset for line numbers
+            f.set_cursor_position((page[1].x + _c + 1, page[1].y + r + 1));
         } else {
         let messages_lines = flatten_messages(app);
         let area_width = page[1].width as usize;
