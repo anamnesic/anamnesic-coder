@@ -387,30 +387,22 @@ impl App {
             return false;
         }
         if let Some(content) = final_content {
-            match self.messages.last_mut() {
-                Some((role, _)) if role == "Assistant" => {
-                    if let Some((_, last)) = self.messages.last_mut() {
-                        *last = content.to_string();
-                    }
+            // If the last message is a Thinking flush (interleaved case
+            // where feed_reasoning_delta flushed right before end_streaming),
+            // pop it, finalize the Assistant below it, then re-insert
+            // Thinking before the Assistant so the order is
+            // ... Thinking → Assistant(final).
+            if self.messages.last_mut().map_or(false, |(r, _)| r == "Thinking") {
+                let thinking = self.messages.pop().map(|(_, t)| t);
+                if let Some((_, last)) = self.messages.last_mut() {
+                    *last = content.to_string();
                 }
-                Some((role, _)) if role == "Thinking" => {
-                    // Interleaved case: the last message is a Thinking
-                    // flush from a recent feed_reasoning_delta call,
-                    // and there's a partial Assistant message before it.
-                    // Remove the partial Assistant, then push Thinking
-                    // and Assistant in the correct order.
-                    let tail = self.messages.pop().map(|(_, t)| t);
-                    let partial = self.messages.pop();
-                    if let Some(tail) = tail {
-                        self.messages.push(("Thinking".to_string(), tail));
-                    }
-                    if let Some((_, _)) = partial {
-                        self.messages.push(("Assistant".to_string(), content.to_string()));
-                    }
+                if let Some(t) = thinking {
+                    let idx = self.messages.len().saturating_sub(1);
+                    self.messages.insert(idx, ("Thinking".to_string(), t));
                 }
-                _ => {
-                    self.messages.push(("Assistant".to_string(), content.to_string()));
-                }
+            } else if let Some((_, last)) = self.messages.last_mut() {
+                *last = content.to_string();
             }
         }
         self.streaming_assistant = false;
@@ -2736,5 +2728,102 @@ mod tests {
         });
         let captured = events.lock().unwrap();
         assert_eq!(captured.len(), 1);
+    }
+
+    #[test]
+    fn feed_reasoning_delta_flushes_at_threshold() {
+        let mut app = App::new("model", "off");
+        let chunk = "x".repeat(120);
+        app.feed_reasoning_delta(&chunk);
+        assert_eq!(app.reasoning.len(), 0);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, chunk);
+    }
+
+    #[test]
+    fn feed_reasoning_delta_accumulates_below_threshold() {
+        let mut app = App::new("model", "off");
+        app.feed_reasoning_delta("hello ");
+        app.feed_reasoning_delta("world");
+        assert_eq!(app.reasoning, "hello world");
+        assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn end_streaming_inserts_reasoning_tail_before_assistant() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
+        app.reasoning.push_str("tail reasoning");
+        let finalized = app.end_streaming(Some("final content"));
+        assert!(finalized);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "tail reasoning");
+        assert_eq!(app.messages[1].0, "Assistant");
+        assert_eq!(app.messages[1].1, "final content");
+    }
+
+    #[test]
+    fn end_streaming_appends_to_existing_thinking() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
+        app.messages.push(("Thinking".to_string(), "existing thinking".to_string()));
+        app.reasoning.push_str(" more tail");
+        let finalized = app.end_streaming(Some("final content"));
+        assert!(finalized);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "existing thinking more tail");
+        assert_eq!(app.messages[1].0, "Assistant");
+        assert_eq!(app.messages[1].1, "final content");
+    }
+
+    #[test]
+    fn end_streaming_no_content_only_flushes_reasoning() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
+        app.reasoning.push_str("tail reasoning");
+        let finalized = app.end_streaming(None);
+        assert!(finalized);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "tail reasoning");
+        assert_eq!(app.messages[1].0, "Assistant");
+        assert_eq!(app.messages[1].1, "streamed partial");
+    }
+
+    #[test]
+    fn reset_reasoning_flushes_tail() {
+        let mut app = App::new("model", "off");
+        app.reasoning.push_str("small tail");
+        app.reset_reasoning();
+        assert!(app.reasoning.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "small tail");
+    }
+
+    #[test]
+    fn reset_reasoning_no_op_when_empty() {
+        let mut app = App::new("model", "off");
+        app.reset_reasoning();
+        assert!(app.reasoning.is_empty());
+        assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn end_streaming_early_return_does_not_lose_reasoning() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = false;
+        app.reasoning.push_str("orphaned tail");
+        let finalized = app.end_streaming(Some("final content"));
+        assert!(!finalized);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "orphaned tail");
     }
 }
