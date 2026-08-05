@@ -56,6 +56,10 @@ pub enum AgentEvent {
         completion_tokens: usize,
         total_tokens: usize,
     },
+    /// Reasoning content delta from thinking models (GLM-5.2, deepseek-r1, etc.).
+    ReasoningDelta {
+        text: String,
+    },
     Done {
         message: String,
     },
@@ -106,6 +110,15 @@ impl AgentHooks {
     pub fn text_delta(&self, text: &str) {
         if let Some(f) = &self.on_text_delta {
             f(text);
+        }
+    }
+
+    /// Forward a reasoning content delta to the UI, if any.
+    pub fn reasoning_delta(&self, text: &str) {
+        if let Some(f) = &self.on_event {
+            f(AgentEvent::ReasoningDelta {
+                text: text.to_string(),
+            });
         }
     }
 
@@ -359,6 +372,7 @@ async fn run_tool_use_iteration(
         };
         let tool_list = tools.to_vec();
         let mut stream_token = |token: &str| hooks.text_delta(token);
+        let mut stream_reasoning = |token: &str| hooks.reasoning_delta(token);
         let completion = tokio::select! {
             res = client.chat_meta_stream_with_fallback(
                 model,
@@ -367,6 +381,7 @@ async fn run_tool_use_iteration(
                 Some(&tool_choice),
                 None,
                 &mut stream_token,
+                Some(&mut stream_reasoning),
             ) => match res {
                 Ok(c) => c,
                 Err(e) => {

@@ -68,6 +68,7 @@ pub struct TokenUsage {
 #[derive(Clone, Debug)]
 pub struct ChatCompletion {
     pub content: String,
+    pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     pub usage: Option<TokenUsage>,
@@ -151,6 +152,8 @@ struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -194,6 +197,8 @@ struct CloudChoice {
 #[derive(Deserialize)]
 struct CloudMessage {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -433,6 +438,7 @@ impl LlmClient {
                     .map_err(|e| anyhow::anyhow!("Local inference error: {}", e))?;
                 Ok(ChatCompletion {
                     content,
+                    reasoning_content: String::new(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
                     usage: None,
@@ -442,10 +448,8 @@ impl LlmClient {
     }
 
     /// Stream a conversation response, invoking `on_token` for each content
-    /// delta while returning the same normalized [`ChatCompletion`] as
-    /// [`Self::chat_meta`]. Only the cloud backend streams incrementally; the
-    /// Ollama and local backends fall back to a non-streaming completion and
-    /// emit the whole text through `on_token`.
+    /// delta and `on_reasoning` for each reasoning delta while returning the
+    /// same normalized [`ChatCompletion`] as [`Self::chat_meta`].
     pub async fn chat_meta_stream(
         &self,
         model: &str,
@@ -454,28 +458,49 @@ impl LlmClient {
         tool_choice: Option<&ToolChoice>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        on_reasoning: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ChatCompletion> {
         match self {
             LlmClient::Cloud(c) => {
-                c.stream_chat_meta(model, messages, tools, tool_choice, response_format, on_token)
+                c.stream_chat_meta(model, messages, tools, tool_choice, response_format, on_token, on_reasoning)
                     .await
             }
             LlmClient::Ollama(c) => {
-                let completion =
-                    c.chat_meta(model, messages, tools, tool_choice, response_format).await?;
-                if !completion.content.is_empty() {
-                    on_token(&completion.content);
-                }
-                Ok(completion)
+                c.chat_meta_stream(
+                    model,
+                    messages,
+                    tools,
+                    tool_choice,
+                    response_format,
+                    on_token,
+                    on_reasoning,
+                )
+                .await
             }
-            LlmClient::Local(_eng) => {
-                let completion = self
-                    .chat_meta(model, messages, tools, tool_choice, response_format)
-                    .await?;
-                if !completion.content.is_empty() {
-                    on_token(&completion.content);
+            LlmClient::Local(eng) => {
+                let prompt = messages
+                    .iter()
+                    .filter_map(|m| {
+                        let role = m.get("role")?.as_str()?;
+                        let content = m.get("content")?.as_str()?;
+                        Some(format!("{}: {}", role, content))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut eng = eng.lock().unwrap();
+                let text = eng
+                    .generate(&prompt, 512, 0.8, 40)
+                    .map_err(|e| anyhow::anyhow!("Local inference error: {}", e))?;
+                if !text.is_empty() {
+                    on_token(&text);
                 }
-                Ok(completion)
+                Ok(ChatCompletion {
+                    content: text,
+                    reasoning_content: String::new(),
+                    tool_calls: Vec::new(),
+                    finish_reason: None,
+                    usage: None,
+                })
             }
         }
     }
@@ -619,6 +644,7 @@ impl OllamaClient {
 
         Ok(ChatCompletion {
             content: data.message.content.unwrap_or_default(),
+            reasoning_content: data.message.reasoning_content.unwrap_or_default(),
             tool_calls,
             finish_reason,
             usage,
@@ -720,6 +746,161 @@ impl OllamaClient {
             }
         }
         Ok(full)
+    }
+
+    /// Stream a chat completion via Ollama's /api/chat SSE endpoint,
+    /// feeding content and reasoning deltas to `on_token`.
+    pub async fn chat_meta_stream(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        _response_format: Option<&ResponseFormat>,
+        on_token: &mut dyn FnMut(&str),
+        mut on_reasoning: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<ChatCompletion> {
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            max_tokens: 16384,
+            tools: tools.cloned(),
+            tool_choice: tool_choice.cloned(),
+        };
+
+        let mut resp = self
+            .client
+            .post(format!("{}/api/chat", self.host))
+            .json(&body)
+            .send()
+            .await
+            .context("Ollama stream request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Ollama stream request failed: HTTP {status} {text}");
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut reasoning_content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        loop {
+            let Some(chunk) = resp.chunk().await.context("Ollama stream read failed")? else {
+                break;
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line).trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(msg) = v.get("message").and_then(|m| m.as_object()) {
+                        if let Some(chunk_text) = msg
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .filter(|c| !c.is_empty())
+                        {
+                            on_token(chunk_text);
+                            content.push_str(chunk_text);
+                        }
+                        if let Some(reasoning) = msg
+                            .get("reasoning_content")
+                            .or_else(|| msg.get("thinking"))
+                            .and_then(|r| r.as_str())
+                            .filter(|r| !r.is_empty())
+                        {
+                            if let Some(on_reasoning) = on_reasoning.as_deref_mut() {
+                                on_reasoning(reasoning);
+                            }
+                            reasoning_content.push_str(reasoning);
+                        }
+                        if let Some(tcs) = msg
+                            .get("tool_calls")
+                            .and_then(|t| t.as_array())
+                        {
+                            for tc in tcs {
+                                let index = tc
+                                    .get("index")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as usize;
+                                while tool_calls.len() <= index {
+                                    tool_calls.push(ToolCall {
+                                        id: String::new(),
+                                        r#type: function_call_type(),
+                                        function: ToolCallFunction {
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        },
+                                    });
+                                }
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        tool_calls[index].id = id.to_string();
+                                    }
+                                }
+                                if let Some(name) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    if !name.is_empty() {
+                                        tool_calls[index].function.name = name.to_string();
+                                    }
+                                }
+                                if let Some(args) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    if !args.is_empty() {
+                                        tool_calls[index].function.arguments.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(reason) = v
+                        .get("done_reason")
+                        .and_then(|r| r.as_str())
+                        .filter(|r| !r.is_empty())
+                    {
+                        finish_reason = Some(reason.to_string());
+                    }
+                    if let Some(p) = v.get("prompt_eval_count").and_then(|v| v.as_u64()) {
+                        prompt_tokens = p as usize;
+                    }
+                    if let Some(e) = v.get("eval_count").and_then(|v| v.as_u64()) {
+                        completion_tokens = e as usize;
+                    }
+                    if v.get("done").and_then(|v| v.as_bool()) == Some(true) {
+                        break;
+                    }
+                }
+            }
+        }
+        let usage = if prompt_tokens > 0 || completion_tokens > 0 {
+            Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            })
+        } else {
+            None
+        };
+        Ok(ChatCompletion {
+            content,
+            reasoning_content,
+            tool_calls,
+            finish_reason,
+            usage,
+        })
     }
 }
 
@@ -890,6 +1071,7 @@ impl CloudClient {
                 });
                 return Ok(ChatCompletion {
                     content: choice.message.content.unwrap_or_default(),
+                    reasoning_content: choice.message.reasoning_content.unwrap_or_default(),
                     tool_calls,
                     finish_reason: choice.finish_reason,
                     usage,
@@ -1028,6 +1210,7 @@ impl CloudClient {
         tool_choice: Option<&ToolChoice>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        mut on_reasoning: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ChatCompletion> {
         let mut body = CloudStreamRequest {
             model: model.to_string(),
@@ -1058,6 +1241,7 @@ impl CloudClient {
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
@@ -1095,6 +1279,18 @@ impl CloudClient {
                                 if !chunk.is_empty() {
                                     on_token(chunk);
                                     content.push_str(chunk);
+                                }
+                            }
+                            if let Some(reasoning) = delta
+                                .get("reasoning_content")
+                                .or_else(|| delta.get("reasoning"))
+                                .and_then(|r| r.as_str())
+                            {
+                                if !reasoning.is_empty() {
+                                    if let Some(on_reasoning) = on_reasoning.as_deref_mut() {
+                                        on_reasoning(reasoning);
+                                    }
+                                    reasoning_content.push_str(reasoning);
                                 }
                             }
                             if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1164,6 +1360,7 @@ impl CloudClient {
         }
         Ok(ChatCompletion {
             content,
+            reasoning_content,
             tool_calls,
             finish_reason,
             usage,
@@ -1342,6 +1539,7 @@ mod tests {
                 None,
                 None,
                 &mut |t| tokens.push(t.to_string()),
+                None,
             )
             .await;
 
@@ -1373,6 +1571,7 @@ mod tests {
                 None,
                 None,
                 &mut |t| tokens.push(t.to_string()),
+                None,
             )
             .await;
 
@@ -1404,6 +1603,7 @@ mod tests {
                 None,
                 None,
                 &mut |t| tokens.push(t.to_string()),
+                None,
             )
             .await;
 
@@ -1435,6 +1635,7 @@ mod tests {
                 None,
                 None,
                 &mut |t| tokens.push(t.to_string()),
+                None,
             )
             .await;
 

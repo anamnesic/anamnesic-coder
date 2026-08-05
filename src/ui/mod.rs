@@ -935,6 +935,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         let command = command.unwrap_or_else(|| "auto-detect".into());
                         a.add_message("Verify", &format!("[{status}] {command} — {summary}"));
                     }
+                    AgentEvent::ReasoningDelta { text } => {
+                        a.add_message("Thinking", &text);
+                    }
                     AgentEvent::Done { message } => {
                         if !a.end_streaming(Some(&message)) {
                             a.add_message("Assistant", &message);

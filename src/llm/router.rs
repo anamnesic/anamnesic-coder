@@ -363,6 +363,7 @@ impl LlmRouter {
         tool_choice: Option<&ToolChoice>,
         response_format: Option<&ResponseFormat>,
         on_token: &mut dyn FnMut(&str),
+        on_reasoning: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ChatCompletion> {
         let client = self.client_for(model)?;
         let (_, api_id) = self.resolve(model);
@@ -374,6 +375,7 @@ impl LlmRouter {
                 tool_choice,
                 response_format,
                 on_token,
+                on_reasoning,
             )
             .await
         {
@@ -392,6 +394,7 @@ impl LlmRouter {
                         tool_choice,
                         response_format,
                         on_token,
+                        None,
                     )
                     .await
                     .map_err(|fb_err| {
