@@ -205,6 +205,8 @@ pub struct App {
     pub reasoning: String,
     /// Active top tab: 0 = Session, 1 = Issues, 2 = Pull Requests, 3 = Gists
     pub active_tab: usize,
+    /// Number of background tasks enqueued and currently running.
+    pub pending_tasks: usize,
 }
 
 /// Byte offset of the `char_index`-th character of `s`. Clamped to `s.len()`
@@ -302,6 +304,7 @@ model: model.to_string(),
             info_popup: false,
             reasoning: String::new(),
             active_tab: 0,
+            pending_tasks: 0,
         }
     }
 
@@ -863,10 +866,7 @@ fn run_input(
     app: &mut App,
     state: &Arc<Mutex<AgentState>>,
     client: &LlmRouter,
-    interrupt: &Arc<AtomicBool>,
-    agent_tx: &mpsc::Sender<AgentEvent>,
-    approval_tx: &mpsc::Sender<ApprovalRequest>,
-    approval_rx: &Arc<Mutex<mpsc::Receiver<ApprovalDecision>>>,
+    task_tx: &mpsc::Sender<(String, AgentMode)>,
     start: &mut Instant,
     input: &str,
 ) {
@@ -879,51 +879,15 @@ fn run_input(
     app.history_index = None;
     app.loading = true;
     app.follow = true;
-    app.status = "Working… (Esc to interrupt)".into();
-    interrupt.store(false, Ordering::Relaxed);
+    app.pending_tasks += 1;
+    if app.pending_tasks > 1 {
+        app.status = format!("Working… ({} background tasks queued)", app.pending_tasks);
+    } else {
+        app.status = "Working… (Esc to interrupt)".into();
+    }
     *start = Instant::now();
     app.elapsed = Duration::ZERO;
-    let input_clone = input.to_string();
-    let client_clone = client.clone();
-    let state_clone = Arc::clone(state);
-    let interrupt_clone = Arc::clone(interrupt);
-    let agent_tx_clone = agent_tx.clone();
-    let agent_tx_text = agent_tx.clone();
-    let approval_tx_clone = approval_tx.clone();
-    let approval_rx_clone = Arc::clone(approval_rx);
-    let agent_mode = app.agent_mode;
-    thread::spawn(move || {
-        let hooks = AgentHooks {
-            on_event: Some(Arc::new(move |ev| {
-                let _ = agent_tx_clone.send(ev);
-            })),
-            on_tool_call_delta: None,
-            on_text_delta: Some(Arc::new(move |text| {
-                let _ = agent_tx_text.send(AgentEvent::TextDelta {
-                    text: text.to_string(),
-                });
-            })),
-            on_approval: Some(Arc::new(move |request| {
-                if approval_tx_clone.send(request).is_err() {
-                    return ApprovalDecision::Deny;
-                }
-                approval_rx_clone
-                    .lock()
-                    .map(|rx| rx.recv().unwrap_or(ApprovalDecision::Deny))
-                    .unwrap_or(ApprovalDecision::Deny)
-            })),
-            interrupt: Some(interrupt_clone),
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut st = state_clone.lock().unwrap();
-        rt.block_on(crate::agent::agent_loop::run_agent_loop_with_hooks(
-            &client_clone,
-            &mut st,
-            &input_clone,
-            &hooks,
-            agent_mode,
-        ));
-    });
+    let _ = task_tx.send((input.to_string(), app.agent_mode));
     app.clear_input();
 }
 
@@ -981,7 +945,63 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     let (decision_tx, decision_rx) = mpsc::channel::<ApprovalDecision>();
     let decision_rx = Arc::new(Mutex::new(decision_rx));
     let interrupt = Arc::new(AtomicBool::new(false));
+    let (task_tx, task_rx) = mpsc::channel::<(String, AgentMode)>();
+    let task_rx = Arc::new(Mutex::new(task_rx));
     let mut start = Instant::now();
+
+    // Spawn worker thread loop to execute background tasks continuously
+    {
+        let client_worker = client.clone();
+        let state_worker = Arc::clone(&state);
+        let interrupt_worker = Arc::clone(&interrupt);
+        let agent_tx_worker = agent_tx.clone();
+        let approval_tx_worker = approval_tx.clone();
+        let decision_rx_worker = Arc::clone(&decision_rx);
+        let task_rx_worker = Arc::clone(&task_rx);
+
+        thread::spawn(move || {
+            while let Ok((input_text, agent_mode)) = task_rx_worker.lock().unwrap().recv() {
+                interrupt_worker.store(false, Ordering::Relaxed);
+                let agent_tx_clone = agent_tx_worker.clone();
+                let agent_tx_text = agent_tx_worker.clone();
+                let approval_tx_clone = approval_tx_worker.clone();
+                let approval_rx_clone = Arc::clone(&decision_rx_worker);
+                let interrupt_clone = Arc::clone(&interrupt_worker);
+
+                let hooks = AgentHooks {
+                    on_event: Some(Arc::new(move |ev| {
+                        let _ = agent_tx_clone.send(ev);
+                    })),
+                    on_tool_call_delta: None,
+                    on_text_delta: Some(Arc::new(move |text| {
+                        let _ = agent_tx_text.send(AgentEvent::TextDelta {
+                            text: text.to_string(),
+                        });
+                    })),
+                    on_approval: Some(Arc::new(move |request| {
+                        if approval_tx_clone.send(request).is_err() {
+                            return ApprovalDecision::Deny;
+                        }
+                        approval_rx_clone
+                            .lock()
+                            .map(|rx| rx.recv().unwrap_or(ApprovalDecision::Deny))
+                            .unwrap_or(ApprovalDecision::Deny)
+                    })),
+                    interrupt: Some(interrupt_clone),
+                };
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let mut st = state_worker.lock().unwrap();
+                rt.block_on(crate::agent::agent_loop::run_agent_loop_with_hooks(
+                    &client_worker,
+                    &mut st,
+                    &input_text,
+                    &hooks,
+                    agent_mode,
+                ));
+            }
+        });
+    }
 
     // Spawn input handling thread
     thread::spawn(move || {
@@ -1045,10 +1065,15 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         if !a.end_streaming(Some(&message)) {
                             a.add_message("Assistant", &message);
                         }
-                        a.loading = false;
-                        a.status =
-                            "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
-                                .into();
+                        a.pending_tasks = a.pending_tasks.saturating_sub(1);
+                        if a.pending_tasks == 0 {
+                            a.loading = false;
+                            a.status =
+                                "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
+                                    .into();
+                        } else {
+                            a.status = format!("Working… ({} background tasks queued)", a.pending_tasks);
+                        }
                     }
                     AgentEvent::Transaction { action, summary } => {
                         a.add_message("Workspace", &format!("[{action}] {summary}"));
@@ -1275,19 +1300,14 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     .map(|(c, _)| c.clone())
                                     .unwrap_or_else(|| guard.input.trim().to_string());
                                 guard.command_menu = false;
-                                if !guard.loading {
-                                    run_input(
-                                        &mut guard,
-                                        &state,
-                                        &client,
-                                        &interrupt,
-                                        &agent_tx,
-                                        &approval_tx,
-                                        &decision_rx,
-                                        &mut start,
-                                        &text,
-                                    );
-                                }
+                                run_input(
+                                    &mut guard,
+                                    &state,
+                                    &client,
+                                    &task_tx,
+                                    &mut start,
+                                    &text,
+                                );
                             } else if guard.model_selector {
                                 let name = guard
                                     .model_items
@@ -1418,9 +1438,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_row < guard.editor_scroll {
                                 guard.editor_scroll = guard.editor_row;
                             }
-                        } else if guard.focus == Focus::Input && !guard.loading {
+                        } else if guard.focus == Focus::Input {
                             guard.previous_input();
-                        } else if !guard.loading {
+                        } else {
                             guard.scroll_offset = guard.scroll_offset.saturating_sub(3);
                             guard.follow = false;
                         }
@@ -1442,18 +1462,15 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             if guard.editor_col > line_len {
                                 guard.editor_col = line_len;
                             }
-                        } else if guard.focus == Focus::Input && !guard.loading {
+                        } else if guard.focus == Focus::Input {
                             guard.next_input();
-                        } else if !guard.loading {
+                        } else {
                             guard.scroll_offset += 3;
                         }
                     }
                     KeyCode::Enter => {
                         match guard.focus {
                             Focus::Input | Focus::Messages => {
-                                if guard.loading {
-                                    continue;
-                                }
                                 let input = guard.input.trim().to_string();
                                 if !input.is_empty() {
                                     guard.command_menu = false;
@@ -1462,10 +1479,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                         &mut guard,
                                         &state,
                                         &client,
-                                        &interrupt,
-                                        &agent_tx,
-                                        &approval_tx,
-                                        &decision_rx,
+                                        &task_tx,
                                         &mut start,
                                         &input,
                                     );
@@ -1503,9 +1517,6 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Char(c) => {
-                        if guard.loading {
-                            continue;
-                        }
                         if guard.focus == Focus::Editor {
                             // insert char into editor at cursor
                             if guard.editor_row >= guard.editor_lines.len() {
@@ -1530,9 +1541,6 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     KeyCode::Backspace => {
-                        if guard.loading {
-                            continue;
-                        }
                         if guard.focus == Focus::Editor {
                             let row = guard.editor_row;
                             let col = guard.editor_col;
@@ -2430,54 +2438,24 @@ fn user_message_lines(content: &str) -> Vec<Line<'static>> {
 /// Codex-style assistant cell: markdown rendered, first line prefixed with
 /// `• ` (dim), continuation lines with two spaces.
 fn assistant_message_lines(content: &str) -> Vec<Line<'static>> {
-    let raw_spans = match render_markdown_lines(content) {
+    let md_lines = render_markdown_lines(content)
+        .map(expand_multiline_spans)
+        .map(collapse_consecutive_blanks)
+        .filter(|spans| !spans.is_empty());
+    let spans: Vec<Span<'static>> = match md_lines {
         Some(spans) => spans,
         None => vec![Span::styled(content.to_string(), Style::default().fg(Color::Gray))],
     };
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_line_spans: Vec<Span<'static>> = Vec::new();
-    let mut is_first_line = true;
-
-    for span in raw_spans {
-        let text = span.content.as_ref();
-        if text.contains('\n') {
-            let parts: Vec<&str> = text.split('\n').collect();
-            for (idx, part) in parts.iter().enumerate() {
-                if !part.is_empty() {
-                    let mut s = span.clone();
-                    s.content = (*part).to_string().into();
-                    current_line_spans.push(s);
-                }
-                if idx < parts.len() - 1 {
-                    let prefix = if is_first_line {
-                        is_first_line = false;
-                        Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
-                    } else {
-                        Span::styled("  ", Style::default())
-                    };
-                    let mut line_spans = vec![prefix];
-                    line_spans.append(&mut current_line_spans);
-                    lines.push(Line::from(line_spans));
-                }
-            }
-        } else {
-            current_line_spans.push(span);
-        }
-    }
-
-    if !current_line_spans.is_empty() || lines.is_empty() {
-        let prefix = if is_first_line {
+    let mut out = Vec::new();
+    for (i, span) in spans.into_iter().enumerate() {
+        let prefix = if i == 0 {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::styled("  ", Style::default())
         };
-        let mut line_spans = vec![prefix];
-        line_spans.append(&mut current_line_spans);
-        lines.push(Line::from(line_spans));
+        out.push(Line::from(vec![prefix, span]));
     }
-
-    lines
+    out
 }
 
 /// Merge runs of consecutive blank spans (a lone `\n` splits into two empty
@@ -2634,8 +2612,8 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             }
             Event::Code(t) => {
                 spans.push(Span::styled(
-                    t.as_ref().to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    format!(" {} ", t.as_ref()),
+                    Style::default().fg(Color::Yellow).bg(Color::Gray),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -2648,7 +2626,7 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
                     if !spans.is_empty() && !in_code {
-                        spans.push(Span::raw("\n\n".to_string()));
+                        spans.push(Span::raw("\n".to_string()));
                     }
                 }
                 Tag::CodeBlock(_) => {
