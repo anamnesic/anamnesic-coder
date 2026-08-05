@@ -1832,22 +1832,18 @@ fn draw<B: ratatui::backend::Backend>(
             f.set_cursor_position((page[1].x + c + 1, page[1].y + r + 1));
         } else {
         let messages_lines = flatten_messages(app);
+        let area_width = page[1].width as usize;
         let view_height = page[1].height as usize;
-        let total = messages_lines.len();
+        let total_wrapped = count_wrapped_lines(&messages_lines, area_width);
         let offset = if app.follow {
-            total.saturating_sub(view_height)
+            total_wrapped.saturating_sub(view_height)
         } else {
-            let max = total.saturating_sub(1);
-            app.scroll_offset.min(max)
+            app.scroll_offset.min(total_wrapped.saturating_sub(view_height))
         };
-        let visible = if total <= view_height {
-            messages_lines
-        } else {
-            let start = offset.min(total - view_height);
-            messages_lines[start..start + view_height].to_vec()
-        };
-        let messages_widget = Paragraph::new(visible);
-        f.render_widget(messages_widget, page[1]);
+        let widget = Paragraph::new(messages_lines)
+            .wrap(Wrap { trim: true })
+            .scroll((offset as u16, 0));
+        f.render_widget(widget, page[1]);
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
@@ -2090,6 +2086,42 @@ fn display_role(role: &str) -> String {
         "assistant" => "Assistant".into(),
         _ => role.to_string(),
     }
+}
+
+/// Count the number of visual lines produced when wrapping `lines` to
+/// `width` cells. Used for scroll-offset math so that `scroll_offset`
+/// tracks visual rows, not logical `Line` entries.
+fn count_wrapped_lines(lines: &[Line<'static>], width: usize) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    let mut total = 0usize;
+    for line in lines {
+        let mut row_width = 0usize;
+        for fragment in line.spans.iter() {
+            let text: &str = &fragment.content;
+            if text.is_empty() {
+                continue;
+            }
+            let dw = display_width(text);
+            if row_width == 0 {
+                row_width = dw;
+            } else if row_width + 1 + dw <= width {
+                row_width += 1 + dw;
+            } else {
+                total += 1;
+                row_width = dw;
+            }
+            // If the current row exceeds width (single fragment wider
+            // than the terminal), count it as wrapped and reset.
+            if row_width > width {
+                total += 1;
+                row_width = 0;
+            }
+        }
+        total += 1;
+    }
+    total
 }
 
 /// Flatten chat messages into renderable transcript lines (Codex-style):
@@ -2913,5 +2945,65 @@ mod tests {
         app.previous_input();
         assert_eq!(app.input, "o que é");
         assert_eq!(app.cursor_position, "o que é".chars().count());
+    }
+
+    #[test]
+    fn count_wrapped_lines_counts_visual_rows() {
+        use ratatui::text::Line;
+        use ratatui::text::Span;
+        // A single line that is 100 chars wide wraps into 2 visual rows
+        // at width 80 (1 space + 19 chars = 20 per row, 100/20 = 5).
+        let lines = vec![Line::from(Span::raw("x".repeat(100)))];
+        assert_eq!(count_wrapped_lines(&lines, 80), 2);
+    }
+
+    #[test]
+    fn count_wrapped_lines_counts_multiple_lines() {
+        use ratatui::text::Line;
+        use ratatui::text::Span;
+        let lines = vec![
+            Line::from(Span::raw("x".repeat(80))),
+            Line::from(Span::raw("y".repeat(80))),
+        ];
+        assert_eq!(count_wrapped_lines(&lines, 80), 2);
+    }
+
+    #[test]
+    fn reflow_renders_long_line_within_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = false;
+        app.messages.push(("Assistant".to_string(), "x".repeat(200)));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.size();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(3)])
+                    .split(area);
+                let messages_lines = flatten_messages(&app);
+                let widget = Paragraph::new(messages_lines).wrap(Wrap { trim: true });
+                f.render_widget(widget, chunks[0]);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // The long line should be reflowed, not cut off at column 40.
+        // At least one row beyond the first should contain 'x'.
+        let mut found_x_beyond_row0 = false;
+        for y in 1..10 {
+            for x in 0..40 {
+                if buf.get(x, y).symbol() == "x" {
+                    found_x_beyond_row0 = true;
+                    break;
+                }
+            }
+            if found_x_beyond_row0 {
+                break;
+            }
+        }
+        assert!(found_x_beyond_row0, "reflow did not wrap long line");
     }
 }
