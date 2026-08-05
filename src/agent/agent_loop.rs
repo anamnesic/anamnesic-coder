@@ -116,6 +116,19 @@ impl AgentHooks {
         }
     }
 
+    /// Stream a text chunk to the UI, or to stdout when no UI is attached.
+    /// Unlike [`Self::text_delta`], this keeps the CLI streaming behavior of
+    /// callers that previously wrote straight to the terminal.
+    pub fn stream_text(&self, text: &str) {
+        if let Some(f) = &self.on_text_delta {
+            f(text);
+        } else {
+            use std::io::Write;
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
     /// Forward a reasoning content delta to the UI, if any.
     pub fn reasoning_delta(&self, text: &str) {
         if let Some(f) = &self.on_event {
@@ -276,7 +289,7 @@ fn context_compact_threshold(state: &AgentState) -> usize {
     state.config.max_context_tokens.saturating_mul(4) / 5
 }
 
-async fn maybe_compact(client: &LlmRouter, state: &mut AgentState) {
+async fn maybe_compact(client: &LlmRouter, state: &mut AgentState, hooks: &AgentHooks) {
     if state.session.estimated_tokens() < context_compact_threshold(state) {
         return;
     }
@@ -292,7 +305,7 @@ async fn maybe_compact(client: &LlmRouter, state: &mut AgentState) {
         let summary = summary.trim();
         if !summary.is_empty() {
             state.session.compact(summary.to_string());
-            eprintln!("  [context compacted — history summarized]");
+            hooks.warn("  [context compacted — history summarized]");
         }
     }
 }
@@ -629,12 +642,12 @@ fn tool_effect(name: &str) -> ToolEffect {
     }
 }
 
-fn connect_mcp_clients(state: &mut AgentState) {
+fn connect_mcp_clients(state: &mut AgentState, hooks: &AgentHooks) {
     let configs = state.config.mcp_servers.clone();
     for config in configs {
         match crate::mcp::McpClient::connect(&config) {
             Ok(client) => state.mcp_clients.push(client),
-            Err(err) => eprintln!("[mcp] failed to connect to {}: {err}", config.command),
+            Err(err) => hooks.warn(&format!("[mcp] failed to connect to {}: {err}", config.command)),
         }
     }
 }
@@ -1431,8 +1444,8 @@ pub async fn run_agent_loop_with_hooks(
     hooks.note(&format!("[Planning] {task}"));
     state.session.add_message("user", task);
 
-    connect_mcp_clients(state);
-    maybe_compact(client, state).await;
+    connect_mcp_clients(state, hooks);
+    maybe_compact(client, state, hooks).await;
 
     if hooks.interrupted() {
         finalize_transaction(state, hooks, false);

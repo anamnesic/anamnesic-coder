@@ -6,12 +6,11 @@ use crate::llm::router::LlmRouter;
 use crate::tools::shell;
 use crate::tools::test;
 use crate::types::plan::PlanStep;
-use std::io::Write;
 
 /// How many fix rounds to run after a `.rs` file fails `cargo check`.
 const MAX_FILE_FIX_ATTEMPTS: usize = 2;
 
-fn compress_output(output: &str, label: &str) -> String {
+fn compress_output(output: &str, label: &str, hooks: &AgentHooks) -> String {
     if output.len() < 200 {
         return output.to_string();
     }
@@ -26,11 +25,11 @@ fn compress_output(output: &str, label: &str) -> String {
             0
         };
         if label == "command" {
-            eprintln!(
+            hooks.warn(&format!(
                 "  [NTK-L1: {} lines ({}% saved)]",
                 result.output.lines().count(),
                 pct
-            );
+            ));
         }
     }
     result.output
@@ -182,7 +181,7 @@ async fn write_with_verification<F>(
         &format!("write {filename}"),
         "workspace mutation (revertible within this turn)",
     ) {
-        eprintln!("  ✗ {message}");
+        hooks.warn(&format!("  ✗ {message}"));
         state.record_blocked_action(format!("write {filename}: {message}"));
         return;
     }
@@ -200,15 +199,15 @@ async fn write_with_verification<F>(
         };
         let code = extract_code_block(&content);
         if code.trim().is_empty() {
-            eprintln!("  ✗ model returned empty content for {}", filename);
+            hooks.warn(&format!("  ✗ model returned empty content for {}", filename));
             return;
         }
         if let Err(e) = state.files.write_file(filename, &code) {
-            eprintln!("  ✗ write failed for {}: {e}", filename);
+            hooks.warn(&format!("  ✗ write failed for {}: {e}", filename));
             return;
         }
         state.mark_changed(filename);
-        println!("  {} {}", verbose_label, filename);
+        hooks.note(&format!("  {} {}", verbose_label, filename));
 
         if filename.ends_with(".rs") {
             if let Err(message) = hooks.require_approval(
@@ -217,23 +216,29 @@ async fn write_with_verification<F>(
                 "cargo check --message-format short",
                 "compiles the workspace",
             ) {
-                eprintln!("  ! {message}");
+                hooks.warn(&format!("  ! {message}"));
                 return;
             }
             match verify_cargo(state) {
                 None => {
-                    println!("  ✓ cargo check passed");
+                    hooks.note("  ✓ cargo check passed");
                     return;
                 }
                 Some(err) if attempt < MAX_FILE_FIX_ATTEMPTS => {
-                    eprintln!("  cargo check failed (attempt {}); fixing...", attempt + 1);
+                    hooks.warn(&format!(
+                        "  cargo check failed (attempt {}); fixing...",
+                        attempt + 1
+                    ));
                     extra = format!(
                         "Your previous output failed `cargo check`. Fix the errors below and return the COMPLETE corrected file in a single code block:\n```\n{}\n```",
                         err
                     );
                 }
                 Some(err) => {
-                    eprintln!("  ✗ cargo check still failing after retries:\n{}", err);
+                    hooks.warn(&format!(
+                        "  ✗ cargo check still failing after retries:\n{}",
+                        err
+                    ));
                     return;
                 }
             }
@@ -295,7 +300,7 @@ async fn execute_step_inner(
                 .clone()
                 .or_else(|| extract_path(&step.description))
             {
-                println!("  Generating [{}]...", filename);
+                hooks.note(&format!("  Generating [{}]...", filename));
                 let context = grep_context(state);
                 let fname = filename.clone();
                 let description = step.description.clone();
@@ -310,7 +315,7 @@ async fn execute_step_inner(
                     )
                 }, "Created", hooks).await;
             } else {
-                println!("  ✗ create_file step is missing a filename");
+                hooks.warn("  ✗ create_file step is missing a filename");
             }
         }
         "edit_file" => {
@@ -321,10 +326,10 @@ async fn execute_step_inner(
             {
                 let content = state.files.read_file(&filename).unwrap_or_default();
                 if content.is_empty() {
-                    println!("  File {} not found", filename);
+                    hooks.warn(&format!("  File {} not found", filename));
                     return;
                 }
-                println!("  Editing [{}]...", filename);
+                hooks.note(&format!("  Editing [{}]...", filename));
                 let fname = filename.clone();
                 let file_content = content;
                 let description = step.description.clone();
@@ -348,32 +353,29 @@ async fn execute_step_inner(
             {
                 match state.files.read_file(&filename) {
                     Some(content) => {
-                        let compressed = compress_output(&content, "file");
+                        let compressed = compress_output(&content, "file", hooks);
                         let truncated: String = compressed.chars().take(3000).collect();
-                        println!("{}", truncated);
+                        hooks.note(&truncated);
                         if content.len() > 3000 {
-                            println!("  ...({} more chars)", content.len() - 3000);
+                            hooks.note(&format!("  ...({} more chars)", content.len() - 3000));
                         }
                     }
-                    None => println!("  File {} not found", filename),
+                    None => hooks.warn(&format!("  File {} not found", filename)),
                 }
             } else {
                 let results = search_code(state, &step.description);
-                println!("{}", compress_output(&results, "search"));
+                hooks.note(&compress_output(&results, "search", hooks));
             }
         }
         "search_code" => {
             let pattern = step.pattern.as_deref().unwrap_or(&step.description);
             let results = search_code(state, pattern);
-            let compressed = compress_output(&results, "search");
-            println!(
-                "{}",
-                if compressed.is_empty() {
-                    "  No results".into()
-                } else {
-                    compressed
-                }
-            );
+            let compressed = compress_output(&results, "search", hooks);
+            hooks.note(&if compressed.is_empty() {
+                "  No results".into()
+            } else {
+                compressed
+            });
         }
         "run_command" => {
             let cmd = step
@@ -387,15 +389,15 @@ async fn execute_step_inner(
                     &cmd,
                     "runs an allowlisted process in the workspace",
                 ) {
-                    eprintln!("  ✗ {message}");
+                    hooks.warn(&format!("  ✗ {message}"));
                     state.record_blocked_action(format!("run_command {cmd}: {message}"));
                     return;
                 }
-                println!("  Running: {}", cmd);
+                hooks.note(&format!("  Running: {}", cmd));
                 let result = shell::run_command(&cmd, &state.config);
-                let compressed = compress_output(&result, "command");
+                let compressed = compress_output(&result, "command", hooks);
                 let truncated: String = compressed.chars().take(2000).collect();
-                println!("{}", truncated);
+                hooks.note(&truncated);
             }
         }
         "run_tests" => {
@@ -418,9 +420,9 @@ async fn execute_step_inner(
             };
             let output = verification.output.clone();
             state.record_verification(verification);
-            let compressed = compress_output(&output, "test");
+            let compressed = compress_output(&output, "test", hooks);
             let truncated: String = compressed.chars().take(2000).collect();
-            println!("{}", truncated);
+            hooks.note(&truncated);
         }
         "answer" => {
             let context = grep_context(state);
@@ -429,16 +431,14 @@ async fn execute_step_inner(
                 "{}\n\nContext:\n{}\n\nTask:\n{}",
                 system, context, step.description
             );
-            let mut out = std::io::stdout();
             let result = client
                 .stream(&state.config.coder_model, &prompt, None, None, &mut |tok| {
-                    let _ = write!(out, "{}", tok);
-                    let _ = out.flush();
+                    hooks.stream_text(tok);
                 }, &mut |_, _, _| {})
                 .await;
-            println!();
+            hooks.stream_text("\n");
             if let Err(e) = result {
-                eprintln!("  ✗ answer failed: {e}");
+                hooks.warn(&format!("  ✗ answer failed: {e}"));
             }
         }
         "git_init" => {
@@ -448,7 +448,7 @@ async fn execute_step_inner(
                 "initialize a git repository and stage all files",
                 "repository mutation",
             ) {
-                eprintln!("  ✗ {message}");
+                hooks.warn(&format!("  ✗ {message}"));
                 state.record_blocked_action(format!("git_init: {message}"));
                 return;
             }
@@ -456,9 +456,9 @@ async fn execute_step_inner(
                 state.git.init();
                 state.git.branch("main");
                 state.git.add(".");
-                println!("  Git repo initialized");
+                hooks.note("  Git repo initialized");
             } else {
-                println!("  Git repo already exists");
+                hooks.note("  Git repo already exists");
             }
         }
         "git_commit" => {
@@ -468,21 +468,21 @@ async fn execute_step_inner(
                 &format!("commit staged changes: {}", step.description),
                 "repository mutation (not revertible by the turn rollback)",
             ) {
-                eprintln!("  ✗ {message}");
+                hooks.warn(&format!("  ✗ {message}"));
                 state.record_blocked_action(format!("git_commit: {message}"));
                 return;
             }
             state.git.add(".");
             let result = state.git.commit(&step.description);
-            println!("  {}", result);
+            hooks.note(&format!("  {}", result));
         }
         "git_status" => {
-            println!("{}", state.git.status());
+            hooks.note(&state.git.status());
         }
         "done" => {
-            println!("  Done: {}", step.description);
+            hooks.note(&format!("  Done: {}", step.description));
         }
-        _ => println!("  Unknown step type: {}", step.step_type),
+        _ => hooks.warn(&format!("  Unknown step type: {}", step.step_type)),
     }
 }
 

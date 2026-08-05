@@ -357,13 +357,12 @@ impl App {
         }
     }
 
-    /// Stop the live assistant message. If `final_content` is provided and the
-    /// last message is still the streaming one, replace it with the final text
-    /// so the transcript shows exactly one copy of the response.
-    /// If the last message is a reasoning message, it is closed first and the
-    /// final content is appended as a new assistant message.
-    /// Returns true if a streaming message was finalized (callers should not
-    /// push the final message again).
+    /// Stop the live assistant message. If `final_content` is provided, the
+    /// last streaming Assistant partial is replaced with the final text so the
+    /// transcript shows exactly one copy of the response; any trailing
+    /// Thinking flushes are kept before it (Thinking → Assistant). Open
+    /// reasoning tails are flushed first. Returns true if a streaming message
+    /// was finalized (callers should not push the final message again).
     pub fn end_streaming(&mut self, final_content: Option<&str>) -> bool {
         // Close any open reasoning accumulation before finalizing content.
         // Insert remaining reasoning before the Assistant message so the
@@ -387,22 +386,18 @@ impl App {
             return false;
         }
         if let Some(content) = final_content {
-            // If the last message is a Thinking flush (interleaved case
-            // where feed_reasoning_delta flushed right before end_streaming),
-            // pop it, finalize the Assistant below it, then re-insert
-            // Thinking before the Assistant so the order is
-            // ... Thinking → Assistant(final).
-            if self.messages.last_mut().map_or(false, |(r, _)| r == "Thinking") {
-                let thinking = self.messages.pop().map(|(_, t)| t);
-                if let Some((_, last)) = self.messages.last_mut() {
-                    *last = content.to_string();
-                }
-                if let Some(t) = thinking {
-                    let idx = self.messages.len().saturating_sub(1);
-                    self.messages.insert(idx, ("Thinking".to_string(), t));
-                }
-            } else if let Some((_, last)) = self.messages.last_mut() {
-                *last = content.to_string();
+            // Replace the last streaming Assistant partial with the final
+            // content and keep any trailing Thinking flushes (one or several,
+            // e.g. interleaved reasoning) BEFORE it, so the transcript always
+            // reads ... Thinking → Assistant(final).
+            if let Some(idx) = self.messages.iter().rposition(|(r, _)| r == "Assistant") {
+                let mut tail = self.messages.split_off(idx);
+                let mut assistant = tail.remove(0);
+                assistant.1 = content.to_string();
+                self.messages.extend(tail);
+                self.messages.push(assistant);
+            } else {
+                self.messages.push(("Assistant".to_string(), content.to_string()));
             }
         }
         self.streaming_assistant = false;
@@ -2825,5 +2820,37 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].0, "Thinking");
         assert_eq!(app.messages[0].1, "orphaned tail");
+    }
+
+    #[test]
+    fn end_streaming_handles_multiple_thinking_flushes_after_partial() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
+        app.messages.push(("Thinking".to_string(), "flush A".to_string()));
+        app.messages.push(("Thinking".to_string(), "flush B".to_string()));
+        let finalized = app.end_streaming(Some("final content"));
+        assert!(finalized);
+        assert_eq!(app.messages.len(), 3);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "flush A");
+        assert_eq!(app.messages[1].0, "Thinking");
+        assert_eq!(app.messages[1].1, "flush B");
+        assert_eq!(app.messages[2].0, "Assistant");
+        assert_eq!(app.messages[2].1, "final content");
+    }
+
+    #[test]
+    fn end_streaming_without_assistant_pushes_final_content() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.messages.push(("Thinking".to_string(), "reasoning only".to_string()));
+        let finalized = app.end_streaming(Some("final content"));
+        assert!(finalized);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].0, "Thinking");
+        assert_eq!(app.messages[0].1, "reasoning only");
+        assert_eq!(app.messages[1].0, "Assistant");
+        assert_eq!(app.messages[1].1, "final content");
     }
 }
