@@ -102,7 +102,7 @@ pub struct TodoItem {
 pub struct InfoPanelSection {
     pub title: &'static str,
     pub open: bool,
-    pub lines: Vec<String>,
+    pub lines: Vec<Span<'static>>,
 }
 
 impl InfoPanelSection {
@@ -118,7 +118,7 @@ impl InfoPanelSection {
         Self::new(title)
     }
 
-    pub fn open(title: &'static str, lines: Vec<String>) -> Self {
+    pub fn open(title: &'static str, lines: Vec<Span<'static>>) -> Self {
         Self { title, open: true, lines }
     }
 }
@@ -185,6 +185,8 @@ pub struct App {
     /// True while the model is streaming assistant text; the last message is
     /// the live, still-growing response. Reset on Done/Failed/Interrupted.
     pub streaming_assistant: bool,
+    /// Unified diff content for modified files (+green / -red).
+    pub diff_content: Vec<String>,
     /// Fuzzy file-search overlay state (Ctrl+P): query, ranking and selection.
     pub file_search: bool,
     pub file_search_query: String,
@@ -265,7 +267,7 @@ impl App {
             memory_enabled: false,
             indexing_enabled: false,
             info_sections: vec![
-                InfoPanelSection::open("Context", vec!["Loading…".into()]),
+                InfoPanelSection::open("Context", vec![Span::styled("Loading…", Style::default())]),
                 InfoPanelSection::closed("Token Usage"),
                 InfoPanelSection::closed("Models"),
                 InfoPanelSection::closed("Code Indexing"),
@@ -280,6 +282,7 @@ impl App {
             resume_selected: 0,
             last_delta_line: None,
             streaming_assistant: false,
+            diff_content: Vec::new(),
             file_search: false,
             file_search_query: String::new(),
             file_search_selected: 0,
@@ -1071,6 +1074,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 } else {
                     diff
                 };
+                a.diff_content = st.last_diff.diff_content.clone();
                 update_info_sections(&mut a, &st);
             }
             if a.loading {
@@ -1631,67 +1635,88 @@ fn update_info_sections(app: &mut App, _state: &AgentState) {
     let cost = app.context_cost;
 
     app.info_sections[0] = InfoPanelSection::open("Context", vec![
-        format!("{} tokens", used),
-        format!("{:.0}% used", pct),
-        format!("${:.4} spent", cost),
+        Span::styled(format!("{} tokens", used), Style::default()),
+        Span::styled(format!("{:.0}% used", pct), Style::default()),
+        Span::styled(format!("${:.4} spent", cost), Style::default()),
     ]);
 
     let tb = &app.token_breakdown;
     app.info_sections[1] = InfoPanelSection::open("Token Usage", vec![
-        format!("Input: {}", tb.input),
-        format!("Output: {}", tb.output),
-        format!("Reasoning: {}", tb.reasoning),
-        format!("Cache read: {}", tb.cache_read),
-        format!("Cache write: {}", tb.cache_write),
-        format!("Cache rate: {:.1}%", tb.cache_rate),
-        format!("Speed: {:.1} tok/s", tb.generation_speed),
-        format!("Cost: ${:.4}", cost),
+        Span::styled(format!("Input: {}", tb.input), Style::default()),
+        Span::styled(format!("Output: {}", tb.output), Style::default()),
+        Span::styled(format!("Reasoning: {}", tb.reasoning), Style::default()),
+        Span::styled(format!("Cache read: {}", tb.cache_read), Style::default()),
+        Span::styled(format!("Cache write: {}", tb.cache_write), Style::default()),
+        Span::styled(format!("Cache rate: {:.1}%", tb.cache_rate), Style::default()),
+        Span::styled(format!("Speed: {:.1} tok/s", tb.generation_speed), Style::default()),
+        Span::styled(format!("Cost: ${:.4}", cost), Style::default()),
     ]);
 
     app.info_sections[2] = InfoPanelSection::open("Models", {
         let mut lines = app
             .models
             .iter()
-            .map(|m| format!("{} — {}", m.provider, m.name))
+            .map(|m| Span::styled(format!("{} — {}", m.provider, m.name), Style::default()))
             .collect::<Vec<_>>();
         if lines.is_empty() {
-            lines.push("No models loaded".into());
+            lines.push(Span::styled("No models loaded", Style::default()));
         }
         lines
     });
 
-    app.info_sections[3] = InfoPanelSection::open("Code Indexing", vec![if app.indexing_enabled {
-        "Enabled".into()
-    } else {
-        "Disabled".into()
-    }]);
+    app.info_sections[3] = InfoPanelSection::open("Code Indexing", vec![
+        Span::styled(
+            if app.indexing_enabled { "Enabled" } else { "Disabled" },
+            Style::default(),
+        ),
+    ]);
 
     app.info_sections[4] = InfoPanelSection::open("Todo", {
         let mut lines = Vec::new();
         if app.todo_items.is_empty() {
-            lines.push("No active tasks".into());
+            lines.push(Span::styled("No active tasks", Style::default()));
         } else {
             for item in &app.todo_items {
                 let mark = if item.done { "[x]" } else { "[ ]" };
-                lines.push(format!("{} {}", mark, item.text));
+                lines.push(Span::styled(format!("{} {}", mark, item.text), Style::default()));
             }
         }
         lines
     });
 
     app.info_sections[5] = InfoPanelSection::open("Modified Files", {
-        if app.modified_files.is_empty() {
-            vec!["No changes".into()]
+        if app.diff_content.is_empty() {
+            if app.modified_files.is_empty() {
+                vec![Span::styled("No changes", Style::default())]
+            } else {
+                app.modified_files
+                    .iter()
+                    .map(|f| Span::styled(f.clone(), Style::default().fg(Color::DarkGray)))
+                    .collect()
+            }
         } else {
-            app.modified_files.clone()
+            app.diff_content
+                .iter()
+                .map(|line| {
+                    let style = if line.starts_with('+') {
+                        Style::default().fg(Color::Green)
+                    } else if line.starts_with('-') {
+                        Style::default().fg(Color::Red)
+                    } else if line.starts_with("@@") {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Span::styled(line.clone(), style)
+                })
+                .collect()
         }
     });
 
-    app.info_sections[6] = InfoPanelSection::open("Memory", vec![if app.memory_enabled {
-        "Enabled".into()
-    } else {
-        "Disabled".into()
-    }]);
+    app.info_sections[6] = InfoPanelSection::open("Memory", vec![Span::styled(
+        if app.memory_enabled { "Enabled" } else { "Disabled" },
+        Style::default(),
+    )]);
 }
 
 fn draw<B: ratatui::backend::Backend>(
@@ -1964,10 +1989,10 @@ fn draw<B: ratatui::backend::Backend>(
                 spans.push(Span::styled(format!("{} {}", arrow, section.title), style));
                 panel_lines.push(Line::from(spans));
                 if section.open {
-                    for line in &section.lines {
+                    for span in &section.lines {
                         panel_lines.push(Line::from(vec![
                             Span::styled("    ", Style::default()),
-                            Span::styled(line.clone(), Style::default().fg(Color::Gray)),
+                            Span::styled(&*span.content, Style::default().fg(Color::Gray)),
                         ]));
                     }
                 }

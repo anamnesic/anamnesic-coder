@@ -9,6 +9,8 @@ pub struct WorkspaceDiff {
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+    /// Unified diff output for modified files (additions in green, deletions in red).
+    pub diff_content: Vec<String>,
 }
 
 impl WorkspaceDiff {
@@ -71,7 +73,12 @@ impl WorkspaceTransaction {
         for (path, bytes) in &current {
             match self.baseline.get(path) {
                 None => diff.added.push(display_path(path)),
-                Some(original) if original != bytes => diff.modified.push(display_path(path)),
+                Some(original) if original != bytes => {
+                    diff.modified.push(display_path(path));
+                    if let Ok(Some(patch)) = self.diff_for_file(&display_path(path)) {
+                        diff.diff_content.push(patch);
+                    }
+                }
                 Some(_) => {}
             }
         }
