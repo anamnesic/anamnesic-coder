@@ -197,6 +197,15 @@ pub struct App {
     pub reasoning: String,
 }
 
+/// Byte offset of the `char_index`-th character of `s`. Clamped to `s.len()`
+/// when the index is at/past the end, so it is safe to use with `insert`.
+fn char_index_to_byte_index(s: &str, char_index: usize) -> usize {
+    s.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(s.len())
+}
+
 impl App {
     pub fn new(model: &str, caveman: &str) -> Self {
         Self {
@@ -463,7 +472,7 @@ impl App {
             .unwrap_or(self.input_history.len())
             .saturating_sub(1);
         self.input = self.input_history[index].clone();
-        self.cursor_position = self.input.len();
+        self.cursor_position = self.input.chars().count();
         self.history_index = Some(index);
     }
 
@@ -473,7 +482,7 @@ impl App {
         };
         if index + 1 < self.input_history.len() {
             self.input = self.input_history[index + 1].clone();
-            self.cursor_position = self.input.len();
+            self.cursor_position = self.input.chars().count();
             self.history_index = Some(index + 1);
         } else {
             self.clear_input();
@@ -1422,8 +1431,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     } else {
                                         String::new()
                                     };
-                                    let (left, right) =
-                                        line.split_at(guard.editor_col.min(line.len()));
+                                    let byte = char_index_to_byte_index(&line, guard.editor_col);
+                                    let (left, right) = line.split_at(byte);
                                     let row = guard.editor_row;
                                     if row < guard.editor_lines.len() {
                                         guard.editor_lines[row] = left.to_string();
@@ -1449,9 +1458,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                 guard.editor_lines.push(String::new());
                             }
                             let row = guard.editor_row;
-                            let col = guard.editor_col;
+                            let col_char = guard.editor_col;
                             let line = &mut guard.editor_lines[row];
-                            if col <= line.len() {
+                            let col = char_index_to_byte_index(line, col_char);
+                            if col_char <= line.chars().count() {
                                 line.insert(col, c);
                             } else {
                                 line.push(c);
@@ -1459,7 +1469,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             guard.editor_col += 1;
                             guard.editor_dirty = true;
                         } else {
-                            let pos = guard.cursor_position;
+                            let pos = char_index_to_byte_index(&guard.input, guard.cursor_position);
                             guard.input.insert(pos, c);
                             guard.cursor_position += 1;
                             refresh_command_menu(&mut guard);
@@ -1474,11 +1484,13 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             let col = guard.editor_col;
                             if row < guard.editor_lines.len() {
                                 if col > 0 {
-                                    guard.editor_lines[row].remove(col - 1);
+                                    let byte =
+                                        char_index_to_byte_index(&guard.editor_lines[row], col - 1);
+                                    guard.editor_lines[row].remove(byte);
                                     guard.editor_col -= 1;
                                 } else if row > 0 {
                                     // join with previous line
-                                    let prev_len = guard.editor_lines[row - 1].len();
+                                    let prev_len = guard.editor_lines[row - 1].chars().count();
                                     let cur = guard.editor_lines.remove(row);
                                     guard.editor_row -= 1;
                                     guard.editor_col = prev_len;
@@ -1487,9 +1499,12 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             }
                             guard.editor_dirty = true;
                         } else {
-                            let pos = guard.cursor_position;
-                            if pos > 0 {
-                                guard.input.remove(pos - 1);
+                            if guard.cursor_position > 0 {
+                                let pos = char_index_to_byte_index(
+                                    &guard.input,
+                                    guard.cursor_position - 1,
+                                );
+                                guard.input.remove(pos);
                                 guard.cursor_position -= 1;
                                 refresh_command_menu(&mut guard);
                             }
@@ -1502,7 +1517,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             } else if guard.editor_row > 0 {
                                 guard.editor_row -= 1;
                                 let row = guard.editor_row;
-                                guard.editor_col = guard.editor_lines[row].len();
+                                guard.editor_col = guard.editor_lines[row].chars().count();
                             }
                         } else if guard.cursor_position > 0 {
                             guard.cursor_position -= 1;
@@ -1512,7 +1527,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         if guard.focus == Focus::Editor {
                             let row = guard.editor_row;
                             if row < guard.editor_lines.len() {
-                                let len = guard.editor_lines[row].len();
+                            let len = guard.editor_lines[row].chars().count();
                                 if guard.editor_col < len {
                                     guard.editor_col += 1;
                                 } else if row + 1 < guard.editor_lines.len() {
@@ -1520,7 +1535,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     guard.editor_col = 0;
                                 }
                             }
-                        } else if guard.cursor_position < guard.input.len() {
+                        } else if guard.cursor_position < guard.input.chars().count() {
                             guard.cursor_position += 1;
                         }
                     }
@@ -2852,5 +2867,51 @@ mod tests {
         assert_eq!(app.messages[0].1, "reasoning only");
         assert_eq!(app.messages[1].0, "Assistant");
         assert_eq!(app.messages[1].1, "final content");
+    }
+
+    #[test]
+    fn char_index_to_byte_index_maps_char_to_byte_offsets() {
+        let s = "o que é";
+        assert_eq!(char_index_to_byte_index(s, 0), 0);
+        assert_eq!(char_index_to_byte_index(s, 6), 6);
+        assert_eq!(char_index_to_byte_index(s, 7), s.len());
+        assert_eq!(char_index_to_byte_index("", 0), 0);
+    }
+
+    #[test]
+    fn insert_char_after_multibyte_uses_byte_offset() {
+        let mut input = String::new();
+        let mut cursor = 0usize;
+        for c in "o que é".chars() {
+            let pos = char_index_to_byte_index(&input, cursor);
+            input.insert(pos, c);
+            cursor += 1;
+        }
+        assert_eq!(input, "o que é");
+        assert_eq!(cursor, input.chars().count());
+
+        let pos = char_index_to_byte_index(&input, cursor);
+        input.insert(pos, '?');
+        assert_eq!(input, "o que é?");
+    }
+
+    #[test]
+    fn backspace_after_multibyte_removes_char_not_byte() {
+        let mut input = "o que é".to_string();
+        let mut cursor = input.chars().count();
+        let pos = char_index_to_byte_index(&input, cursor - 1);
+        input.remove(pos);
+        cursor -= 1;
+        assert_eq!(input, "o que ");
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn previous_input_cursor_at_char_count_for_multibyte() {
+        let mut app = App::new("model", "off");
+        app.input_history.push("o que é".to_string());
+        app.previous_input();
+        assert_eq!(app.input, "o que é");
+        assert_eq!(app.cursor_position, "o que é".chars().count());
     }
 }
