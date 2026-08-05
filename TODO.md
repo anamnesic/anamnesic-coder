@@ -289,6 +289,41 @@
 
 ---
 
+## P4 — Estrutura / Arquitetura (padrões Codex 2026)
+
+Recomendações da comparação com `codex-rs` (openai/codex). NÃO copiar o workspace inteiro (~140 crates) — adotar só a disciplina de fronteiras + config centralizada, em grau adequado para projeto single-crate.
+
+### S1. Upgrade edition 2021 → 2024
+- **File:** `Cargo.toml`
+- **Fix:** Bump `edition = "2024"`. Baixo esforço; alinha com o `workspace.package.edition = "2024"` do Codex.
+
+### S2. Criar `lib.rs` (hoje só existe `main.rs`)
+- **File:** `src/lib.rs` (novo), `src/main.rs`
+- **Fix:** Adicionar target `lib` para habilitar doc-tests e rustdoc. Pré-requisito/suporte para remover `#![allow(dead_code)]` (item 17) — hoje existe só porque é binário puro.
+
+### S3. Split seletivo em workspace pequeno (2–3 crates)
+- **Fix:** Fronteira de maior valor é `llm/infer` (gguf, engine, gpu, tokenizer, model, ops) — único subsistema auto-contido e pesado (CPU/GPU, isolável e testável). Espelha o Codex (`ollama`/`lmstudio`/`model-provider` separados do `cli`). `compressor` também é bom candidato (funções puras).
+- **Alvo:**
+  ```
+  Cargo.toml            (workspace)
+  crates/infer/         ← src/llm/infer
+  crates/compressor/    ← src/compressor
+  src/                  (harness do agente: agent, tools, repo, mcp, ui, etc.)
+  ```
+- **Não fatiar:** `agent` + `tools` + `ui` + `repo` (núcleo acoplado). Manter juntos.
+
+### S4. Adotar `workspace.package` / `workspace.dependencies` / `workspace.lints`
+- **Fix:** Centralizar edition/versão/licença e versões de deps em um lugar só. `workspace.lints` com lista curta de `deny` (ex: `unwrap_used`, `uninlined_format_args`, `needless_late_init`). Custo ~zero, maior ganho de padronização.
+
+### S5. Consistência de nomes (Codex usa nomes descritivos claros)
+- **Files:** `src/hw_recommend/`, `src/models_dev/`, `src/main.rs:84`
+- **Fix:** `hw_recommend` → `hardware`; `models_dev` → `catalog` (é um client do models.dev); alinhar `clap name = "slowcode"` com `anamnesic` (nome antigo residual).
+
+### S6. Testes de integração com mock provider
+- **Fix:** O Codex usa `wiremock` + crates de `test-support`. É a única lacuna de infra real do harness. Duplicado do item aberto "Integration tests with mock provider".
+
+---
+
 ## Status Summary (as of 2026-08-02)
 
 ### Fixed (from previous TODOs)
@@ -378,6 +413,12 @@
 | 30 | P2 | Make `get_cloud_models` data-driven | Code Quality | Baixo |
 | — | P2 | Integration tests with mock provider | Testing | Médio |
 | — | P2 | CI pipeline | Infra | Médio |
+| S1 | P3 | Upgrade edition 2021 → 2024 | Estrutura | Baixo |
+| S2 | P3 | Create `lib.rs` target | Estrutura | Baixo |
+| S3 | P3 | Workspace split: `crates/infer` + `crates/compressor` | Estrutura | Alto |
+| S4 | P3 | `workspace.package` / `workspace.dependencies` / `workspace.lints` | Estrutura | Médio |
+| S5 | P3 | Rename `hw_recommend`→`hardware`, `models_dev`→`catalog`, fix clap name | Estrutura | Baixo |
+| S6 | P3 | Mock provider integration tests | Testing | Médio |
 
 ### Recommended Sprint Order
 

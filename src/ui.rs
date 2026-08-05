@@ -26,6 +26,18 @@ use crate::agent::state::AgentState;
 use crate::config::settings::ApprovalPolicy;
 use crate::llm::router::{LlmRouter, DEFAULT_PROVIDER};
 
+mod diff_render;
+mod file_search;
+mod line_truncation;
+mod live_wrap;
+mod pager_overlay;
+mod width;
+
+use unicode_segmentation::UnicodeSegmentation;
+
+use file_search::FileMatch;
+use width::display_width;
+
 const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Available slash commands, shown in the interactive picker (modern-harness style).
@@ -42,6 +54,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Select cloud model provider (no arg = pick from list)",
     ),
     ("/reset", "Reset session"),
+    ("/resume", "Resume a saved session (picker)"),
+    ("/continue", "Continue the most recent session"),
 ];
 
 #[derive(PartialEq)]
@@ -159,9 +173,23 @@ pub struct App {
     pub indexing_enabled: bool,
     pub info_sections: Vec<InfoPanelSection>,
     pub info_selected: usize,
+    /// Resume session picker state.
+    pub resume_selector: bool,
+    pub resume_items: Vec<String>,
+    pub resume_ids: Vec<i64>,
+    pub resume_selected: usize,
     /// Tracks the in-flight streaming tool-call delta so chunks of the same
     /// call accumulate on one chat line instead of stacking new lines.
     pub last_delta_line: Option<(usize, String)>,
+    /// True while the model is streaming assistant text; the last message is
+    /// the live, still-growing response. Reset on Done/Failed/Interrupted.
+    pub streaming_assistant: bool,
+    /// Fuzzy file-search overlay state (Ctrl+P): query, ranking and selection.
+    pub file_search: bool,
+    pub file_search_query: String,
+    pub file_search_selected: usize,
+    pub file_search_results: Vec<FileMatch>,
+    pub file_search_paths: Vec<String>,
 }
 
 impl App {
@@ -232,7 +260,17 @@ impl App {
                 InfoPanelSection::closed("Memory"),
             ],
             info_selected: 0,
+            resume_selector: false,
+            resume_items: Vec::new(),
+            resume_ids: Vec::new(),
+            resume_selected: 0,
             last_delta_line: None,
+            streaming_assistant: false,
+            file_search: false,
+            file_search_query: String::new(),
+            file_search_selected: 0,
+            file_search_results: Vec::new(),
+            file_search_paths: Vec::new(),
         }
     }
 
@@ -267,11 +305,92 @@ impl App {
         self.last_delta_line = Some((index, text));
     }
 
+    /// Append streamed assistant text to a single live message. Creates the
+    /// message on the first delta of a turn, then accumulates onto it until a
+    /// terminal event (Done/Failed/Interrupted) calls `end_streaming`.
+    pub fn feed_text_delta(&mut self, text: &str) {
+        const MAX_STREAM_CHARS: usize = 20_000;
+        if self.streaming_assistant {
+            if let Some((_, last)) = self.messages.last_mut() {
+                if last.chars().count() < MAX_STREAM_CHARS {
+                    last.push_str(text);
+                }
+                return;
+            }
+            self.streaming_assistant = false;
+        }
+        self.messages.push(("Assistant".to_string(), text.to_string()));
+        self.streaming_assistant = true;
+    }
+
+    /// Stop the live assistant message. If `final_content` is provided and the
+    /// last message is still the streaming one, replace it with the final text
+    /// so the transcript shows exactly one copy of the response.
+    /// Returns true if a streaming message was finalized (callers should not
+    /// push the final message again).
+    pub fn end_streaming(&mut self, final_content: Option<&str>) -> bool {
+        if !self.streaming_assistant {
+            return false;
+        }
+        if let Some(content) = final_content {
+            if let Some((_, last)) = self.messages.last_mut() {
+                *last = content.to_string();
+            }
+        }
+        self.streaming_assistant = false;
+        true
+    }
+
+    /// Open the Ctrl+P overlay seeded with the workspace file list.
+    pub fn open_file_search(&mut self, paths: Vec<String>) {
+        self.file_search = true;
+        self.file_search_query.clear();
+        self.file_search_selected = 0;
+        self.file_search_paths = paths;
+        self.refresh_file_search();
+    }
+
+    /// Re-rank the file-search results for the current query.
+    pub fn refresh_file_search(&mut self) {
+        let limit = 100;
+        self.file_search_results =
+            file_search::search_files(&self.file_search_paths, &self.file_search_query, limit);
+        self.file_search_selected = self
+            .file_search_selected
+            .min(self.file_search_results.len().saturating_sub(1));
+    }
+
+    pub fn move_file_search_selection(&mut self, up: bool) {
+        let len = self.file_search_results.len();
+        if len == 0 {
+            return;
+        }
+        if up {
+            self.file_search_selected = self.file_search_selected.saturating_sub(1);
+        } else if self.file_search_selected + 1 < len {
+            self.file_search_selected += 1;
+        }
+    }
+
+    /// Load `path` (workspace-relative) into the built-in editor.
+    pub fn open_editor(&mut self, path: &str, content: Option<&str>) {
+        let lines: Vec<String> = content
+            .map(|c| c.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        self.editor_file = Some(path.to_string());
+        self.editor_lines = lines;
+        self.editor_row = 0;
+        self.editor_col = 0;
+        self.editor_dirty = false;
+        self.editor_scroll = 0;
+        self.focus = Focus::Editor;
+        self.status = format!("Editing {path} — Ctrl+S save · Esc close");
+    }
+
     pub fn clear_input(&mut self) {
         self.input.clear();
         self.cursor_position = 0;
     }
-
     fn previous_input(&mut self) {
         if self.input_history.is_empty() {
             return;
@@ -458,6 +577,50 @@ fn handle_slash_command(
             }
             true
         }
+        "/resume" => {
+            let st = state.lock().unwrap();
+            let workspace = st.config.workspace_dir.display().to_string();
+            let sessions = st.long_memory.list_sessions(&workspace, 20).unwrap_or_default();
+            drop(st);
+            if sessions.is_empty() {
+                app.add_message("System", "No saved sessions found.");
+            } else {
+                app.resume_items = sessions
+                    .iter()
+                    .map(|s| {
+                        let summary: String = s.summary.chars().take(50).collect();
+                        format!("{} — {} ({} msgs)", s.updated_at, summary, s.message_count)
+                    })
+                    .collect();
+                app.resume_ids = sessions.iter().map(|s| s.id).collect();
+                app.resume_selected = 0;
+                app.resume_selector = true;
+            }
+            true
+        }
+        "/continue" => {
+            let mut st = state.lock().unwrap();
+            let workspace = st.config.workspace_dir.display().to_string();
+            match st.long_memory.latest_session(&workspace) {
+                Ok(Some(id)) => {
+                    match st.load_session_into_state(id) {
+                        Ok(count) => {
+                            drop(st);
+                            app.messages.clear();
+                            let s = state.lock().unwrap();
+                            for (role, content) in s.session.history() {
+                                app.add_message(&display_role(&role), &content);
+                            }
+                            app.add_message("System", &format!("✓ Continued session {id} ({count} messages restored)"));
+                        }
+                        Err(e) => app.add_message("Error", &format!("Failed to load session: {e}")),
+                    }
+                }
+                Ok(None) => app.add_message("System", "No previous session found."),
+                Err(e) => app.add_message("Error", &format!("Failed to query sessions: {e}")),
+            }
+            true
+        }
         "/help" => {
             let cmds: Vec<&str> = SLASH_COMMANDS.iter().map(|(c, _)| *c).collect();
             app.add_message(
@@ -613,6 +776,7 @@ fn run_input(
     let state_clone = Arc::clone(state);
     let interrupt_clone = Arc::clone(interrupt);
     let agent_tx_clone = agent_tx.clone();
+    let agent_tx_text = agent_tx.clone();
     let approval_tx_clone = approval_tx.clone();
     let approval_rx_clone = Arc::clone(approval_rx);
     let agent_mode = app.agent_mode;
@@ -622,6 +786,11 @@ fn run_input(
                 let _ = agent_tx_clone.send(ev);
             })),
             on_tool_call_delta: None,
+            on_text_delta: Some(Arc::new(move |text| {
+                let _ = agent_tx_text.send(AgentEvent::TextDelta {
+                    text: text.to_string(),
+                });
+            })),
             on_approval: Some(Arc::new(move |request| {
                 if approval_tx_clone.send(request).is_err() {
                     return ApprovalDecision::Deny;
@@ -684,10 +853,12 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     let state = Arc::new(Mutex::new(state));
     // populate sidebar with workspace files
     {
-        let files = state.lock().unwrap().files.list_files("");
+        let st = state.lock().unwrap();
+        let files = st.files.list_files("");
+        let root = st.files.workspace_root().to_path_buf();
         let mut a = app.lock().unwrap();
         a.sidebar_items = files;
-        let st = state.lock().unwrap();
+        a.file_search_paths = file_search::walk_files(&root);
         update_info_sections(&mut a, &st);
     }
     let (tx, rx) = mpsc::channel();
@@ -753,7 +924,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.add_message("Verify", &format!("[{status}] {command} — {summary}"));
                     }
                     AgentEvent::Done { message } => {
-                        a.add_message("Assistant", &message);
+                        if !a.end_streaming(Some(&message)) {
+                            a.add_message("Assistant", &message);
+                        }
                         a.loading = false;
                         a.status =
                             "Ready · Enter to send · ↑/↓ history · PgUp/PgDn scroll · mouse wheel · Esc interrupt"
@@ -763,14 +936,30 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.add_message("Workspace", &format!("[{action}] {summary}"));
                     }
                     AgentEvent::Failed { message } => {
+                        a.end_streaming(None);
                         a.add_message("Error", &message);
                         a.loading = false;
                         a.status = "Failed · Enter to retry · Esc interrupt".into();
                     }
                     AgentEvent::Interrupted => {
+                        a.end_streaming(None);
                         a.add_message("System", "Turn interrupted by user.");
                         a.loading = false;
                         a.status = "Interrupted · Enter to send · Esc interrupt".into();
+                    }
+                    AgentEvent::TextDelta { text } => {
+                        a.feed_text_delta(&text);
+                    }
+                    AgentEvent::TokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                    } => {
+                        a.token_breakdown.input = prompt_tokens;
+                        a.token_breakdown.output = completion_tokens;
+                        a.tokens = total_tokens;
+                        a.context_cost = a.token_breakdown.input as f64 * 0.000003
+                            + a.token_breakdown.output as f64 * 0.000012;
                     }
                 }
             }
@@ -781,14 +970,20 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
             a.status = format!("Approval required: {} · a/s/d", request.tool);
             a.pending_approval = Some(request);
         }
-        // Refresh context budget + elapsed + spinner from shared state.
+        // Refresh context budget + workspace diff + elapsed + spinner from shared state.
         // Do not block rendering while the worker owns AgentState for a turn.
-        if let Ok(st) = state.try_lock() {
-            let mut a = app.lock().unwrap();
-            a.tokens = st.session.estimated_tokens();
-        }
         {
             let mut a = app.lock().unwrap();
+            if let Ok(st) = state.try_lock() {
+                a.tokens = st.session.estimated_tokens();
+                let diff = st.last_diff.paths();
+                a.modified_files = if diff.is_empty() {
+                    vec!["No changes".into()]
+                } else {
+                    diff
+                };
+                update_info_sections(&mut a, &st);
+            }
             if a.loading {
                 a.elapsed = start.elapsed();
                 a.spinner_frame = (a.spinner_frame + 1) % SPINNER.len();
@@ -847,9 +1042,55 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     continue;
                 }
+                // Ctrl+P: toggle the fuzzy file-search overlay.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+                    if guard.file_search {
+                        guard.file_search = false;
+                    } else {
+                        let paths = guard.file_search_paths.clone();
+                        guard.open_file_search(paths);
+                    }
+                    continue;
+                }
+                // The file-search overlay captures all keystrokes while open.
+                if guard.file_search {
+                    let mut handled = true;
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            guard.file_search_query.push(c);
+                            guard.refresh_file_search();
+                        }
+                        KeyCode::Backspace => {
+                            guard.file_search_query.pop();
+                            guard.refresh_file_search();
+                        }
+                        KeyCode::Up => guard.move_file_search_selection(true),
+                        KeyCode::Down => guard.move_file_search_selection(false),
+                        KeyCode::Enter => {
+                            if !guard.loading {
+                                if let Some(m) = guard
+                                    .file_search_results
+                                    .get(guard.file_search_selected)
+                                    .cloned()
+                                {
+                                    let path = m.path.clone();
+                                    guard.file_search = false;
+                                    let content =
+                                        state.lock().unwrap().files.read_file(&path);
+                                    guard.open_editor(&path, content.as_deref());
+                                }
+                            }
+                        }
+                        KeyCode::Esc => guard.file_search = false,
+                        _ => handled = false,
+                    }
+                    if handled {
+                        continue;
+                    }
+                }
                 // Modal pickers (slash-command menu / model selector) take over
                 // Up/Down/Enter/Esc while open.
-                if guard.command_menu || guard.model_selector || guard.provider_selector {
+                if guard.command_menu || guard.model_selector || guard.provider_selector || guard.resume_selector {
                     let mut handled = true;
                     match key.code {
                         KeyCode::Up => {
@@ -857,6 +1098,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                 guard.command_selected = guard.command_selected.saturating_sub(1);
                             } else if guard.model_selector {
                                 guard.model_selected = guard.model_selected.saturating_sub(1);
+                            } else if guard.resume_selector {
+                                guard.resume_selected = guard.resume_selected.saturating_sub(1);
                             } else {
                                 guard.provider_selected = guard.provider_selected.saturating_sub(1);
                             }
@@ -869,6 +1112,10 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                             } else if guard.model_selector {
                                 if guard.model_selected + 1 < guard.model_items.len() {
                                     guard.model_selected += 1;
+                                }
+                            } else if guard.resume_selector {
+                                if guard.resume_selected + 1 < guard.resume_items.len() {
+                                    guard.resume_selected += 1;
                                 }
                             } else if guard.provider_selected + 1 < guard.provider_items.len() {
                                 guard.provider_selected += 1;
@@ -919,16 +1166,34 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     let id = name.split(" — ").next().unwrap_or(&name).to_string();
                                     set_active_provider(&mut guard, &state, &client, &id);
                                 }
+                            } else if guard.resume_selector {
+                                if let Some(&session_id) = guard.resume_ids.get(guard.resume_selected) {
+                                    guard.resume_selector = false;
+                                    let mut st = state.lock().unwrap();
+                                    match st.load_session_into_state(session_id) {
+                                        Ok(count) => {
+                                            drop(st);
+                                            guard.messages.clear();
+                                            let s = state.lock().unwrap();
+                                            for (role, content) in s.session.history() {
+                                                guard.add_message(&display_role(&role), &content);
+                                            }
+                                            guard.add_message("System", &format!("✓ Resumed session {session_id} ({count} messages)"));
+                                        }
+                                        Err(e) => guard.add_message("Error", &format!("Failed: {e}")),
+                                    }
+                                }
                             }
                         }
                         KeyCode::Esc => {
                             guard.command_menu = false;
                             guard.model_selector = false;
                             guard.provider_selector = false;
+                            guard.resume_selector = false;
                         }
                         _ => handled = false,
                     }
-                    if handled || guard.model_selector || guard.provider_selector {
+                    if handled || guard.model_selector || guard.provider_selector || guard.resume_selector {
                         continue;
                     }
                 }
@@ -1500,7 +1765,7 @@ fn draw<B: ratatui::backend::Backend>(
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
-        if app.command_menu || app.model_selector || app.provider_selector {
+        if app.command_menu || app.model_selector || app.provider_selector || app.resume_selector {
             let (items, title, selected) = if app.command_menu {
                 let items = app
                     .command_items
@@ -1531,6 +1796,23 @@ fn draw<B: ratatui::backend::Backend>(
                 (
                     items,
                     " Select model — ↑/↓ · Enter set · Esc cancel ".to_string(),
+                    selected,
+                )
+            } else if app.resume_selector {
+                let items = app
+                    .resume_items
+                    .iter()
+                    .map(|s| {
+                        ListItem::new(Span::styled(
+                            s.clone(),
+                            Style::default().fg(Color::LightGreen),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let selected = app.resume_selected.min(items.len().saturating_sub(1));
+                (
+                    items,
+                    " Resume session — ↑/↓ · Enter resume · Esc cancel ".to_string(),
                     selected,
                 )
             } else {
@@ -1568,6 +1850,67 @@ fn draw<B: ratatui::backend::Backend>(
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
+        }
+
+        // Ctrl+P fuzzy file-search overlay.
+        if app.file_search {
+            let popup_w = 72.min(size.width.saturating_sub(4));
+            let max_h = size.height.saturating_sub(2).max(4);
+            let popup_h = (app.file_search_results.len() as u16 + 4).min(max_h);
+            let x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+            let y = size.y + (size.height.saturating_sub(popup_h)) / 3;
+            let area = Rect { x, y, width: popup_w, height: popup_h };
+            let title = format!(
+                " Open file · {} result{} · ↑/↓ · Enter open · Esc cancel ",
+                app.file_search_results.len(),
+                if app.file_search_results.len() == 1 { "" } else { "s" }
+            );
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "❯ ",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    app.file_search_query.clone(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            if app.file_search_results.is_empty() {
+                let hint = if app.file_search_query.is_empty() {
+                    "type to filter workspace files…"
+                } else {
+                    "no matches"
+                };
+                lines.push(Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for (i, m) in app.file_search_results.iter().enumerate() {
+                    let selected = i == app.file_search_selected;
+                    let mut spans: Vec<Span> = vec![Span::styled(
+                        if selected { "▶ " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    )];
+                    for (start, end, matched) in file_search::highlight_segments(&m.path, &m.indices) {
+                        let style = if matched {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else if selected {
+                            Style::default().fg(Color::White)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        spans.push(Span::styled(m.path[start..end].to_string(), style));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+            let para = Paragraph::new(lines)
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
         }
 
         // Approval modal (write/command policy set to `ask`).
@@ -1773,14 +2116,27 @@ fn expand_multiline_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     out
 }
 
+/// Truncate a string to at most `max` display columns, keeping the head and
+/// appending an ellipsis on overflow. Operates on grapheme clusters so
+/// combining marks and wide (CJK) characters never split mid-glyph.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().skip(s.chars().count() - max).collect();
-        out = format!("…{out}");
-        out
+    if max == 0 || display_width(s) <= max {
+        return s.to_string();
     }
+    let target = max.saturating_sub(1);
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (idx, grapheme) in s.grapheme_indices(true) {
+        let grapheme_width = display_width(grapheme);
+        if used + grapheme_width > target {
+            break;
+        }
+        used += grapheme_width;
+        end = idx + grapheme.len();
+    }
+    let mut out: String = s[..end].to_string();
+    out.push('…');
+    out
 }
 
 /// Collapse a status message to a single display line: newlines/carriage
@@ -1834,17 +2190,26 @@ mod tests {
     }
 
     #[test]
-    fn truncate_keeps_tail_and_prefixes_ellipsis() {
+    fn truncate_keeps_head_and_appends_ellipsis() {
         let out = truncate_str("abcdefghijklmnop", 5);
-        assert!(out.starts_with('…'));
-        assert_eq!(out.chars().count(), 6);
-        assert!(out.ends_with("mnop"));
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.starts_with("abcd"));
     }
 
     #[test]
     fn truncate_handles_unicode() {
         let out = truncate_str("olá mundo feliz", 6);
-        assert_eq!(out.chars().count(), 7);
+        assert_eq!(out.chars().count(), 6);
+        assert!(out.starts_with("olá m"));
+    }
+
+    #[test]
+    fn truncate_respects_display_width_of_wide_chars() {
+        // "界" occupies 2 columns: budget of 4 fits "a界" plus ellipsis.
+        let out = truncate_str("a界bc", 4);
+        assert_eq!(out, "a界…");
+        assert_eq!(display_width(&out), 4);
     }
 
     #[test]
@@ -1913,6 +2278,89 @@ mod tests {
         assert_eq!(app.messages.len(), 2);
         assert!(app.messages[0].1.starts_with("Δ read_file[0]"));
         assert!(app.messages[1].1.starts_with("Δ edit_file[1]"));
+    }
+
+    #[test]
+    fn feed_text_delta_accumulates_one_live_message() {
+        let mut app = App::new("model", "off");
+        app.feed_text_delta("Hello ");
+        app.feed_text_delta("world");
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "Assistant");
+        assert_eq!(app.messages[0].1, "Hello world");
+        assert!(app.streaming_assistant);
+    }
+
+    #[test]
+    fn feed_text_delta_recovers_from_stale_stream_flag() {
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = true;
+        app.feed_text_delta("fresh");
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].1, "fresh");
+    }
+
+    #[test]
+    fn end_streaming_replaces_live_message_once() {
+        let mut app = App::new("model", "off");
+        app.feed_text_delta("partial ");
+        app.feed_text_delta("text");
+        let replaced = app.end_streaming(Some("final answer"));
+        assert!(replaced);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].1, "final answer");
+        assert!(!app.streaming_assistant);
+        assert!(!app.end_streaming(Some("again")));
+    }
+
+    #[test]
+    fn end_streaming_without_stream_noops() {
+        let mut app = App::new("model", "off");
+        assert!(!app.end_streaming(Some("x")));
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn file_search_ranks_and_selects() {
+        let mut app = App::new("model", "off");
+        app.open_file_search(vec![
+            "src/main.rs".to_string(),
+            "tests/main_test.rs".to_string(),
+            "docs/README.md".to_string(),
+        ]);
+        assert!(app.file_search);
+        app.file_search_query.push_str("s");
+        app.refresh_file_search();
+        assert_eq!(app.file_search_results.len(), 3);
+        assert_eq!(app.file_search_results[0].path, "src/main.rs");
+        app.move_file_search_selection(false);
+        assert_eq!(app.file_search_selected, 1);
+        app.move_file_search_selection(false);
+        assert_eq!(app.file_search_selected, 2);
+        app.move_file_search_selection(false);
+        assert_eq!(app.file_search_selected, 2);
+        app.move_file_search_selection(true);
+        assert_eq!(app.file_search_selected, 1);
+    }
+
+    #[test]
+    fn open_editor_loads_lines_and_focus() {
+        let mut app = App::new("model", "off");
+        app.open_editor("src/main.rs", Some("fn main() {}\n// end"));
+        assert!(app.focus == Focus::Editor);
+        assert_eq!(app.editor_file.as_deref(), Some("src/main.rs"));
+        assert_eq!(app.editor_lines, vec!["fn main() {}", "// end"]);
+        assert_eq!(app.editor_row, 0);
+        assert_eq!(app.editor_col, 0);
+        assert!(!app.editor_dirty);
+    }
+
+    #[test]
+    fn open_editor_handles_missing_content() {
+        let mut app = App::new("model", "off");
+        app.open_editor("empty.txt", None);
+        assert!(app.focus == Focus::Editor);
+        assert!(app.editor_lines.is_empty());
     }
 
     #[test]
@@ -1987,6 +2435,7 @@ mod tests {
         let hooks = AgentHooks {
             on_event: Some(Arc::new(move |ev| captured.lock().unwrap().push(ev))),
             on_tool_call_delta: None,
+            on_text_delta: None,
             on_approval: None,
             interrupt: None,
         };

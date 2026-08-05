@@ -16,6 +16,7 @@ This file lists all the index.md files created in the src directory and its subd
  - [`src/repo/index.md`](src/repo/index.md) - Documentation for repository helpers
  - [`src/tools/index.md`](src/tools/index.md) - Documentation for tooling helpers
  - [`src/types/index.md`](src/types/index.md) - Documentation for shared types
+ - [`src/terminal/index.md`](src/terminal/index.md) - Documentation for the interactive PTY terminal module
 
 Each index.md file contains a list of files in that directory with brief descriptions of their purpose.
 

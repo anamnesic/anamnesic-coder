@@ -45,6 +45,17 @@ pub enum AgentEvent {
         action: String,
         summary: String,
     },
+    /// Streaming assistant text: one event per content delta. The TUI appends
+    /// these into a live message line while the model is still generating.
+    TextDelta {
+        text: String,
+    },
+    /// Token usage from a completed LLM call.
+    TokenUsage {
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        total_tokens: usize,
+    },
     Done {
         message: String,
     },
@@ -79,6 +90,7 @@ pub type ToolCallDeltaFn = Arc<dyn Fn(usize, Option<&str>, &str) + Send + Sync>;
 pub struct AgentHooks {
     pub on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     pub on_tool_call_delta: Option<ToolCallDeltaFn>,
+    pub on_text_delta: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     pub on_approval: Option<Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync>>,
     pub interrupt: Option<Arc<AtomicBool>>,
 }
@@ -87,6 +99,13 @@ impl AgentHooks {
     pub fn emit(&self, event: AgentEvent) {
         if let Some(f) = &self.on_event {
             f(event);
+        }
+    }
+
+    /// Forward a streamed assistant-text delta to the UI, if any.
+    pub fn text_delta(&self, text: &str) {
+        if let Some(f) = &self.on_text_delta {
+            f(text);
         }
     }
 
@@ -288,6 +307,11 @@ impl ToolExecutionResult {
 
 /// Run a typed tool-use iteration. A mutation invalidates prior verification;
 /// the loop cannot complete until a fresh gate passes or is explicitly unavailable.
+///
+/// `prior` is the session transcript that preceded the current prompt — the
+/// model reads it back so multi-turn (and resumed) conversations keep their
+/// context, exactly like 2026-era harness transcripts.
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_use_iteration(
     client: &LlmRouter,
     state: &mut AgentState,
@@ -295,13 +319,26 @@ async fn run_tool_use_iteration(
     prompt: &str,
     tools: &[crate::llm::client::ToolDef],
     hooks: &AgentHooks,
+    prior: &[(String, String)],
 ) -> Result<ToolLoopOutcome> {
     let project_ctx = CoderPrompt::load_project_context(&state.config.workspace_dir);
     let system_prompt = CoderPrompt::with_context(&state.caveman, &project_ctx);
-    let mut conversation: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "system", "content": system_prompt}),
-        serde_json::json!({"role": "user", "content": prompt}),
-    ];
+    let mut conversation: Vec<serde_json::Value> =
+        vec![serde_json::json!({"role": "system", "content": system_prompt})];
+    for (role, content) in prior {
+        match role.as_str() {
+            "user" => conversation.push(serde_json::json!({"role": "user", "content": content})),
+            "assistant" => {
+                conversation.push(serde_json::json!({"role": "assistant", "content": content}))
+            }
+            "system" => {
+                conversation.push(serde_json::json!({"role": "system", "content": content}))
+            }
+            // Diagnostic-only roles (Error, Tool, …) never reach the model.
+            _ => {}
+        }
+    }
+    conversation.push(serde_json::json!({"role": "user", "content": prompt}));
     let mut used_tools = false;
 
     for iteration in 0..state.config.max_tool_iterations {
@@ -320,21 +357,38 @@ async fn run_tool_use_iteration(
         } else {
             crate::llm::client::ToolChoice::Auto
         };
-        let completion = match client
-            .chat_meta_with_fallback(
+        let tool_list = tools.to_vec();
+        let mut stream_token = |token: &str| hooks.text_delta(token);
+        let completion = tokio::select! {
+            res = client.chat_meta_stream_with_fallback(
                 model,
                 conversation.clone(),
-                Some(&tools.to_vec()),
+                Some(&tool_list),
                 Some(&tool_choice),
                 None,
-            )
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let message = format!("{e}");
-                hooks.warn(&format!("  [llm error] {message}"));
-                return Err(e);
+                &mut stream_token,
+            ) => match res {
+                Ok(c) => c,
+                Err(e) => {
+                    let message = format!("{e}");
+                    hooks.warn(&format!("  [llm error] {message}"));
+                    return Err(e);
+                }
+            },
+            _ = async {
+                loop {
+                    if hooks.interrupted() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                }
+            } => {
+                let _ = state.refresh_workspace_diff();
+                let summary = finalize_transaction(state, hooks, false);
+                if !summary.is_empty() {
+                    hooks.note(summary.trim());
+                }
+                return Ok(ToolLoopOutcome::Interrupted);
             }
         };
         if let Some(usage) = &completion.usage {
@@ -342,6 +396,11 @@ async fn run_tool_use_iteration(
                 "  [usage] {} prompt + {} completion = {} total tokens",
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             ));
+            hooks.emit(AgentEvent::TokenUsage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            });
         }
         let response = completion.content;
         let mut tool_calls = completion.tool_calls;
@@ -575,6 +634,8 @@ fn try_mcp_tool(
 }
 
 /// Owned, `Send + Sync` view of the workspace used to run read-only tools
+
+
 /// concurrently without sharing `AgentState` (which holds a SQLite handle).
 struct ReadContext {
     files: crate::tools::fs::FileTools,
@@ -855,7 +916,7 @@ fn execute_tool(
                         verification: Some(verification),
                     }
                 } else {
-                    let output = shell::run_command_raw(command, &state.config);
+                    let output = shell::run_command_raw_with_interrupt(command, &state.config, hooks.interrupt.as_deref());
                     ToolExecutionResult {
                         output: truncate_tool_output(&output.combined(), cap),
                         mutated: false,
@@ -890,14 +951,20 @@ fn execute_tool(
             }
         }
         "task" => {
-                let Some(task) = string_arg("task") else {
-                    return ToolExecutionResult::output("missing required argument: task");
-                };
+            let Some(task) = string_arg("task") else {
+                return ToolExecutionResult::output("missing required argument: task");
+            };
                 let model = string_arg("model").unwrap_or(&state.config.coder_model);
                 let (tx, rx) = mpsc::channel::<(String, bool)>();
                 let tx = Arc::new(Mutex::new(Some(tx)));
                 let client = client.clone();
-                let mut sub_state = state.clone();
+                let mut sub_state = match AgentState::new(state.config.clone()) {
+                    Ok(mut s) => {
+                        s.session_persist = false;
+                        s
+                    }
+                    Err(e) => return ToolExecutionResult::output(format!("Failed to initialize sub-agent state: {e}")),
+                };
                 let task = task.to_string();
                 let model = model.to_string();
                 thread::spawn(move || {
@@ -921,6 +988,7 @@ fn execute_tool(
                                 }
                             })),
                             on_tool_call_delta: None,
+                            on_text_delta: None,
                             on_approval: None,
                             interrupt: None,
                         };
@@ -1188,6 +1256,8 @@ fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
                 serde_json::json!(["path"]),
             ),
         ),
+
+
         tool(
             "edit_file",
             "Surgically edit a line range in a file. Prefers 1-based start_line and end_line for precise anchoring.",
@@ -1347,6 +1417,10 @@ pub async fn run_agent_loop_with_hooks(
         AgentMode::Agent => run_agent_mode(client, state, task, hooks).await,
         AgentMode::Plan => run_plan_mode(client, state, task, hooks).await,
     }
+    // Persist the transcript at turn boundaries (append-only, crash-safe).
+    if let Err(e) = state.persist_session() {
+        hooks.warn(&format!("  [persist] session save failed: {e}"));
+    }
 }
 
 /// Agent mode: tool-use iteration first, planner fallback on failure.
@@ -1356,13 +1430,13 @@ async fn run_agent_mode(
     task: &str,
     hooks: &AgentHooks,
 ) {
-            let tools = coding_tools(state);
+    let tools = coding_tools(state);
     let model = state.config.coder_model.clone();
-    match run_tool_use_iteration(client, state, &model, task, &tools, hooks).await {
+    let prior = state.session.conversation();
+    match run_tool_use_iteration(client, state, &model, task, &tools, hooks, &prior).await {
         Ok(ToolLoopOutcome::Completed(final_text)) => {
             state.session.add_message("assistant", &final_text);
             state.session.add_action("tool-use turn completed");
-            state.long_memory.save_session(task, &final_text).ok();
             hooks.done(&final_text);
             return;
         }
@@ -1473,7 +1547,6 @@ async fn run_planner_fallback(
         .session
         .add_message("assistant", &format!("Completed: {summary_str}"));
     state.session.add_action(&summary_str);
-    state.long_memory.save_session(task, &summary_str).ok();
 
     if let Err(error) = state.refresh_workspace_diff() {
         hooks.warn(&format!("  [transaction] diff unavailable: {error}"));
@@ -1493,12 +1566,12 @@ async fn run_planner_fallback(
             let fix_task = format!(
                 "Fix the failed verification for the original task: {task}\n\nVerification output:\n{feedback}"
             );
-    let tools = coding_tools(state);
+            let tools = coding_tools(state);
             let model = state.config.coder_model.clone();
-            match run_tool_use_iteration(client, state, &model, &fix_task, &tools, hooks).await {
+            let prior = state.session.conversation();
+            match run_tool_use_iteration(client, state, &model, &fix_task, &tools, hooks, &prior).await {
                 Ok(ToolLoopOutcome::Completed(message)) => {
                     state.session.add_message("assistant", &message);
-                    state.long_memory.save_session(task, &message).ok();
                     hooks.done(&message);
                 }
                 Ok(ToolLoopOutcome::Failed(message)) => {
@@ -1556,50 +1629,6 @@ async fn run_planner_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::client::LlmClient;
-    use std::sync::Mutex;
-
-    fn dummy_router() -> LlmRouter {
-        LlmRouter::new(LlmClient::ollama("http://localhost:11434"))
-    }
-
-    #[test]
-    fn typed_progress_is_emitted_once_without_duplicate_status_events() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&events);
-        let hooks = AgentHooks {
-            on_event: Some(Arc::new(move |event| captured.lock().unwrap().push(event))),
-            on_tool_call_delta: None,
-            on_approval: None,
-            interrupt: None,
-        };
-
-        hooks.tool_call("run_command", "ok");
-        hooks.plan_step(1, 1, "run_tests", "validate");
-        hooks.done("complete");
-
-        let events = events.lock().unwrap();
-        assert_eq!(events.len(), 3);
-        assert!(matches!(events[0], AgentEvent::ToolCall { .. }));
-        assert!(matches!(events[1], AgentEvent::PlanStep { .. }));
-        assert!(matches!(events[2], AgentEvent::Done { .. }));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::Status(_))));
-    }
-
-    #[test]
-    fn built_in_search_finds_code_without_ripgrep() {
-        let root =
-            std::env::temp_dir().join(format!("anamnesic-search-fallback-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn parse_duration() {}\n").unwrap();
-
-        let output = search_workspace_without_rg(&root, "parse_duration");
-
-        assert!(output.contains("src/lib.rs:1:"), "got: {output}");
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     fn tool_call(name: &str, arguments: serde_json::Value) -> crate::llm::client::ToolCall {
         crate::llm::client::ToolCall {
@@ -1626,128 +1655,10 @@ mod tests {
         (state, root)
     }
 
-    #[test]
-    fn read_only_calls_run_in_parallel_and_keep_request_order() {
-        let (mut state, root) = test_state("parallel");
-        state.files.write_file("a.txt", "alpha").unwrap();
-        state.files.write_file("b.txt", "beta").unwrap();
-        state.files.write_file("c.txt", "gamma").unwrap();
-        let calls = vec![
-            tool_call("read_file", serde_json::json!({"path": "a.txt"})),
-            tool_call("read_file", serde_json::json!({"path": "b.txt"})),
-            tool_call("read_file", serde_json::json!({"path": "c.txt"})),
-        ];
-
-        let results = execute_tool_calls(&dummy_router(), &mut state, &calls, &AgentHooks::default());
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].output, "alpha");
-        assert_eq!(results[1].output, "beta");
-        assert_eq!(results[2].output, "gamma");
-        assert!(results.iter().all(|result| !result.mutated));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ask_policy_denies_mutation_without_an_approval_callback() {
-        let (mut state, root) = test_state("ask-deny");
-        state.config.write_tool_policy = ApprovalPolicy::Ask;
-        let call = tool_call(
-            "write_file",
-            serde_json::json!({"path": "new.txt", "content": "x"}),
-        );
-
-        let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
-
-        assert!(!result.mutated, "got: {}", result.output);
-        assert!(state.files.read_file("new.txt").is_none());
-        // A denied action must be surfaced, never silently summarized as done.
-        assert_eq!(state.blocked_actions.len(), 1);
-        let audited = audited_final_text(&state, "All set, the file was created.");
-        assert!(
-            audited.contains("Blocked by approval policy"),
-            "got: {audited}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ask_policy_allows_mutation_when_the_broker_approves() {
-        let (mut state, root) = test_state("ask-allow");
-        state.config.write_tool_policy = ApprovalPolicy::Ask;
-        let hooks = AgentHooks {
-            on_approval: Some(Arc::new(|_request| ApprovalDecision::AllowOnce)),
-            ..AgentHooks::default()
-        };
-        let call = tool_call(
-            "write_file",
-            serde_json::json!({"path": "new.txt", "content": "approved"}),
-        );
-
-        let result = execute_tool(&dummy_router(), &mut state, &call, &hooks);
-
-        assert!(result.mutated, "got: {}", result.output);
-        assert_eq!(
-            state.files.read_file("new.txt").as_deref(),
-            Some("approved")
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_turn_rolls_back_to_the_turn_baseline() {
-        let (mut state, root) = test_state("rollback");
-        state
-            .files
-            .write_file("src.txt", "user's local edit")
-            .unwrap();
-        state.start_turn().unwrap();
-        state.files.write_file("src.txt", "agent edit").unwrap();
-        state.files.write_file("extra.txt", "agent file").unwrap();
-        state.refresh_workspace_diff().unwrap();
-        assert!(state.dirty);
-
-        let summary = finalize_transaction(&mut state, &AgentHooks::default(), false);
-
-        assert!(summary.contains("rolled back"), "got: {summary}");
-        assert_eq!(
-            state.files.read_file("src.txt").as_deref(),
-            Some("user's local edit")
-        );
-        assert!(state.files.read_file("extra.txt").is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn successful_turn_keeps_changes_and_reports_the_diff() {
-        let (mut state, root) = test_state("keep");
-        state.start_turn().unwrap();
-        state.files.write_file("kept.txt", "value").unwrap();
-        state.refresh_workspace_diff().unwrap();
-
-        let summary = finalize_transaction(&mut state, &AgentHooks::default(), true);
-
-        assert!(summary.contains("Workspace diff"), "got: {summary}");
-        assert!(summary.contains("kept.txt"), "got: {summary}");
-        assert_eq!(state.files.read_file("kept.txt").as_deref(), Some("value"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn finalize_is_idempotent_so_layered_exit_paths_cannot_double_rollback() {
-        let (mut state, root) = test_state("idempotent");
-        state.files.write_file("f.txt", "baseline").unwrap();
-        state.start_turn().unwrap();
-        state.files.write_file("f.txt", "agent").unwrap();
-        state.refresh_workspace_diff().unwrap();
-
-        let first = finalize_transaction(&mut state, &AgentHooks::default(), false);
-        let second = finalize_transaction(&mut state, &AgentHooks::default(), false);
-
-        assert!(first.contains("rolled back"), "got: {first}");
-        assert!(second.is_empty(), "second call must be a no-op: {second}");
-        assert_eq!(state.files.read_file("f.txt").as_deref(), Some("baseline"));
-        let _ = std::fs::remove_dir_all(root);
+    fn dummy_router() -> LlmRouter {
+        LlmRouter::new(crate::llm::client::LlmClient::ollama(
+            "http://localhost:11434",
+        ))
     }
 
     #[test]

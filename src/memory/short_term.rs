@@ -2,11 +2,15 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct ShortTermMemory {
-    messages: VecDeque<(String, String)>,
+    /// Conversation messages as `(seq, role, content)`. `seq` is a per-session
+    /// monotonic id used to append persisted transcripts without duplication:
+    /// records beyond the last persisted watermark are written once.
+    messages: VecDeque<(u64, String, String)>,
     actions: Vec<String>,
     files: Vec<String>,
     summary: Option<String>,
     max_messages: usize,
+    next_seq: u64,
 }
 
 /// Calibrated BPE token estimator for code, prose, and JSON structures.
@@ -40,12 +44,52 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 impl ShortTermMemory {
     pub fn new(max_messages: usize) -> Self {
-        ShortTermMemory { messages: VecDeque::new(), actions: Vec::new(), files: Vec::new(), summary: None, max_messages }
+        ShortTermMemory { messages: VecDeque::new(), actions: Vec::new(), files: Vec::new(), summary: None, max_messages, next_seq: 0 }
     }
 
     pub fn add_message(&mut self, role: &str, content: &str) {
-        self.messages.push_back((role.to_string(), content.to_string()));
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.messages.push_back((seq, role.to_string(), content.to_string()));
         if self.messages.len() > self.max_messages { self.messages.pop_front(); }
+    }
+
+    /// Restore a persisted transcript (ordered `(seq, role, content)` records).
+    /// The next message added continues from the highest restored seq, so
+    /// resumed sessions keep appending to the same transcript without gaps.
+    pub fn load_records(&mut self, records: Vec<(u64, String, String)>) -> usize {
+        self.messages.clear();
+        self.next_seq = 0;
+        for (seq, role, content) in records {
+            if seq >= self.next_seq {
+                self.next_seq = seq + 1;
+            }
+            self.messages.push_back((seq, role, content));
+        }
+        self.messages.len()
+    }
+
+    /// Records that a persistent store has not seen yet: everything when
+    /// `last_seq` is `None` (nothing persisted), otherwise records with a seq
+    /// strictly above the watermark.
+    pub fn records_after(&self, last_seq: Option<u64>) -> Vec<(u64, String, String)> {
+        self.messages
+            .iter()
+            .filter(|(seq, _, _)| match last_seq {
+                None => true,
+                Some(watermark) => *seq > watermark,
+            })
+            .map(|(seq, role, content)| (*seq, role.clone(), content.clone()))
+            .collect()
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// The compaction summary, if the transcript was compacted.
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
     }
 
     pub fn add_action(&mut self, action: &str) { self.actions.push(action.to_string()); }
@@ -62,7 +106,7 @@ impl ShortTermMemory {
         if let Some(summary) = &self.summary {
             lines.push(format!("[Session summary so far] {}", summary));
         }
-        for (role, content) in &self.messages {
+        for (_, role, content) in &self.messages {
             lines.push(format!("{role}: {content}"));
         }
         lines.join("\n")
@@ -88,8 +132,8 @@ impl ShortTermMemory {
         if let Some(summary) = &self.summary {
             lines.push(format!("Session summary: {}", summary));
         }
-        if let Some(last) = self.messages.back() {
-            lines.push(format!("Last message ({}): {}", last.0, &last.1[..last.1.len().min(200)]));
+        if let Some((_, role, content)) = self.messages.back() {
+            lines.push(format!("Last message ({role}): {}", &content[..content.len().min(200)]));
         }
         if !self.actions.is_empty() {
             let recent: Vec<&str> = self.actions.iter().rev().take(5).map(|s| s.as_str()).collect();
@@ -104,14 +148,43 @@ impl ShortTermMemory {
 
     /// Messages in display order, for the interactive chat UI.
     pub fn history(&self) -> Vec<(String, String)> {
-        self.messages.iter().cloned().collect()
+        self.messages
+            .iter()
+            .map(|(_, role, content)| (role.clone(), content.clone()))
+            .collect()
+    }
+
+    /// Full conversation feed for the model: every message, with the compaction
+    /// summary (if any) materialized as a leading `system` record so resumed
+    /// and compacted transcripts keep their summarized context.
+    pub fn conversation(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .messages
+            .iter()
+            .map(|(_, role, content)| (role.clone(), content.clone()))
+            .collect();
+        if let Some(summary) = &self.summary {
+            let expected = format!("[Session summary so far] {summary}");
+            if !out.iter().any(|(role, content)| role == "system" && content == &expected) {
+                out.insert(0, ("system".into(), expected));
+            }
+        }
+        out
     }
 
     pub fn last_message(&self) -> Option<(String, String)> {
-        self.messages.back().cloned()
+        self.messages
+            .back()
+            .map(|(_, role, content)| (role.clone(), content.clone()))
     }
 
-    pub fn clear(&mut self) { self.messages.clear(); self.actions.clear(); self.files.clear(); self.summary = None; }
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.actions.clear();
+        self.files.clear();
+        self.summary = None;
+        self.next_seq = 0;
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +274,52 @@ mod tests {
         assert!(m.history().is_empty());
         assert!(m.get_context().is_empty());
         assert!(m.last_message().is_none());
+    }
+
+    #[test]
+    fn records_after_only_yields_unsaved_messages() {
+        let mut m = ShortTermMemory::new(20);
+        m.add_message("user", "a");
+        m.add_message("assistant", "b");
+        assert_eq!(m.records_after(None).len(), 2);
+        assert_eq!(m.records_after(Some(0)).len(), 1);
+        assert_eq!(m.records_after(Some(1)).len(), 0);
+    }
+
+    #[test]
+    fn load_records_preserves_order_and_continues_seq() {
+        let mut m = ShortTermMemory::new(20);
+        let records = vec![
+            (0u64, "user".to_string(), "hello".to_string()),
+            (1u64, "assistant".to_string(), "hi".to_string()),
+        ];
+        m.load_records(records);
+        assert_eq!(m.history().len(), 2);
+        assert_eq!(m.history()[1].1, "hi");
+        m.add_message("user", "more");
+        let new = m.records_after(Some(1));
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].0, 2);
+        assert_eq!(new[0].2, "more");
+        // A session with nothing persisted reports every record.
+        let mut empty = ShortTermMemory::new(20);
+        empty.add_message("system", "[Session summary so far] x");
+        assert_eq!(empty.records_after(None).len(), 1);
+    }
+
+    #[test]
+    fn conversation_materializes_summary_as_system_once() {
+        let mut m = ShortTermMemory::new(20);
+        m.add_message("user", "task");
+        m.add_message("assistant", "done");
+        m.compact("the summary".into());
+        let conv = m.conversation();
+        assert_eq!(conv[0].0, "system");
+        assert!(conv[0].1.starts_with("[Session summary so far]"));
+        // Materializing the summary as a record keeps it deduplicated.
+        m.add_message("system", &conv[0].1);
+        let conv2 = m.conversation();
+        let system_count = conv2.iter().filter(|(r, _)| r == "system").count();
+        assert_eq!(system_count, 1);
     }
 }

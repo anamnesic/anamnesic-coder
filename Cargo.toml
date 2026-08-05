@@ -33,3 +33,10 @@ rpassword = "7"
 rayon = "1"
     ocl = { version = "0.19", optional = true }
     pulldown-cmark = "0.12"
+axum = { version = "0.8", features = ["ws"] }
+portable-pty = "0.8"
+futures-util = "0.3"
+bytes = "1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+diffy = "0.4"

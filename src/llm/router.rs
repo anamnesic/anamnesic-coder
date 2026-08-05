@@ -349,6 +349,59 @@ impl LlmRouter {
             .stream(&api_id, prompt, tools, response_format, on_token, on_tool_call_delta)
             .await
     }
+
+    /// Stream a conversation response with the same same-tier fallback as
+    /// [`Self::chat_meta_with_fallback`]: `on_token` receives each content
+    /// delta while a normalized [`ChatCompletion`] is returned. The fallback
+    /// attempt re-streams from scratch, so a failed primary call never leaves
+    /// partial text behind in the final completion.
+    pub async fn chat_meta_stream_with_fallback(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        response_format: Option<&ResponseFormat>,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatCompletion> {
+        let client = self.client_for(model)?;
+        let (_, api_id) = self.resolve(model);
+        match client
+            .chat_meta_stream(
+                &api_id,
+                messages.clone(),
+                tools,
+                tool_choice,
+                response_format,
+                on_token,
+            )
+            .await
+        {
+            Ok(completion) => Ok(completion),
+            Err(primary_err) => {
+                let Some(fb_model) = self.resolve_fallback(model) else {
+                    return Err(primary_err);
+                };
+                let fb_client = self.client_for(&fb_model)?;
+                let (_, fb_api_id) = self.resolve(&fb_model);
+                fb_client
+                    .chat_meta_stream(
+                        &fb_api_id,
+                        messages,
+                        tools,
+                        tool_choice,
+                        response_format,
+                        on_token,
+                    )
+                    .await
+                    .map_err(|fb_err| {
+                        anyhow::anyhow!(
+                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
+                        )
+                    })
+            }
+        }
+    }
 }
 
 #[cfg(test)]

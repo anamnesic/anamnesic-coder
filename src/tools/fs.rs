@@ -224,6 +224,11 @@ impl FileTools {
         FileTools { workspace: ws }
     }
 
+    /// Canonicalized workspace root the tools operate inside.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace
+    }
+
     fn resolve(&self, path: &str) -> Option<PathBuf> {
         let raw = PathBuf::from(path);
         let joined = if raw.is_absolute() {

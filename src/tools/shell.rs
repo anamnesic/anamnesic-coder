@@ -96,7 +96,7 @@ pub fn run_command(cmd: &str, config: &Config) -> String {
             cmd
         );
     }
-    match run_command_inner(cmd, config) {
+    match run_command_inner(cmd, config, None) {
         Ok(out) => out.combined(),
         Err(e) => format!("Error: {e}"),
     }
@@ -105,6 +105,14 @@ pub fn run_command(cmd: &str, config: &Config) -> String {
 /// Run a command and return the raw `CommandOutput` (used by the verification gate).
 /// Also validates the allowlist and rejects shell metacharacters.
 pub fn run_command_raw(cmd: &str, config: &Config) -> CommandOutput {
+    run_command_raw_with_interrupt(cmd, config, None)
+}
+
+pub fn run_command_raw_with_interrupt(
+    cmd: &str,
+    config: &Config,
+    interrupt: Option<&std::sync::atomic::AtomicBool>,
+) -> CommandOutput {
     if !is_allowed(cmd, config) {
         return CommandOutput {
             code: None,
@@ -113,7 +121,7 @@ pub fn run_command_raw(cmd: &str, config: &Config) -> CommandOutput {
             timed_out: false,
         };
     }
-    run_command_inner(cmd, config).unwrap_or_else(|e| CommandOutput {
+    run_command_inner(cmd, config, interrupt).unwrap_or_else(|e| CommandOutput {
         code: None,
         stdout: String::new(),
         stderr: format!("Error: {e}"),
@@ -122,7 +130,11 @@ pub fn run_command_raw(cmd: &str, config: &Config) -> CommandOutput {
 }
 
 /// Internal helper: execute an allowlisted program directly and enforce a timeout.
-fn run_command_inner(cmd: &str, config: &Config) -> std::io::Result<CommandOutput> {
+fn run_command_inner(
+    cmd: &str,
+    config: &Config,
+    interrupt: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<CommandOutput> {
     let (executable, args) = parse_command(cmd)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid command"))?;
     let mut command = Command::new(executable);
@@ -144,6 +156,12 @@ fn run_command_inner(cmd: &str, config: &Config) -> std::io::Result<CommandOutpu
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
             break (status, false);
+        }
+        if let Some(flag) = interrupt {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                terminate_process(&mut child);
+                break (child.wait()?, false);
+            }
         }
         if started.elapsed() >= timeout {
             terminate_process(&mut child);

@@ -12,6 +12,10 @@ pub struct InferenceEngine {
     max_seq_len: usize,
     act: Vec<f32>,
     weights: Vec<f32>,
+    /// Reusable embedding row scratch buffer (`n_embd`), to avoid allocating a
+    /// fresh `Vec<f32>` on every `forward()` call when extracting a single
+    /// token's embedding row (TODO item 20).
+    emb_buf: Vec<f32>,
     #[cfg(feature = "gpu")]
     gpu: Option<super::gpu::GpuContext>,
 }
@@ -178,11 +182,15 @@ impl InferenceEngine {
         let max_tensor = model.tensors.values().map(|t| t.nelements() as usize).max().unwrap_or(1);
         let weights = vec![0.0f32; max_tensor];
 
+        // Reusable per-token embedding row scratch buffer — avoids a fresh
+        // heap allocation on every `forward()` token (TODO item 20).
+        let emb_buf = vec![0.0f32; model.n_embd as usize];
+
         let kv_cache_size = (model.n_layer * 2 * max_seq_len as i64 * model.n_embd) as usize;
         let kv_cache = vec![0.0f32; kv_cache_size];
 
         InferenceEngine {
-            model, tokenizer, kv_cache, n_past: 0, max_seq_len, act, weights,
+            model, tokenizer, kv_cache, n_past: 0, max_seq_len, act, weights, emb_buf,
             #[cfg(feature = "gpu")]
             gpu: None,
         }

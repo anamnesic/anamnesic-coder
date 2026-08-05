@@ -86,6 +86,56 @@ impl WorkspaceTransaction {
         Ok(diff)
     }
 
+    /// Baseline content (bytes at transaction start) for a relative path.
+    pub fn baseline_content(&self, path: &str) -> Option<Vec<u8>> {
+        self.baseline.get(Path::new(path)).cloned()
+    }
+
+    /// Unified diff for a single relative path, or `None` when the file is
+    /// unchanged or unknown. `added`/`deleted` files render as a full-file
+    /// hunk; `modified` files use a diffy Myers diff with `a/`/`b/` headers.
+    pub fn diff_for_file(&self, path: &str) -> anyhow::Result<Option<String>> {
+        let rel = Path::new(path);
+        let baseline = self.baseline.get(rel);
+        let current = fs::read(self.root.join(rel)).ok();
+
+        let header = format!("--- a/{path}\n+++ b/{path}\n");
+        match (baseline, current) {
+            (Some(old), Some(new)) if old == &new => Ok(None),
+            (Some(old), Some(new)) => {
+                let old_text = String::from_utf8_lossy(old);
+                let new_text = String::from_utf8_lossy(&new);
+                let patch = diffy::create_patch(&old_text, &new_text);
+                Ok(Some(format!("{header}{patch}")))
+            }
+            (None, Some(new)) => {
+                let text = String::from_utf8_lossy(&new);
+                let count = text.lines().count();
+                let body = text
+                    .lines()
+                    .map(|line| format!("+{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(Some(format!(
+                    "{header}@@ -0,0 +1,{count} @@\n{body}\n"
+                )))
+            }
+            (Some(old), None) => {
+                let text = String::from_utf8_lossy(old);
+                let count = text.lines().count();
+                let body = text
+                    .lines()
+                    .map(|line| format!("-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(Some(format!(
+                    "{header}@@ -1,{count} +0,0 @@\n{body}\n"
+                )))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
     pub fn rollback(&self) -> anyhow::Result<WorkspaceDiff> {
         let before = self.diff()?;
         let current = scan_workspace(&self.root, self.max_bytes)?;
@@ -174,6 +224,36 @@ mod tests {
         assert_eq!(diff.modified, vec!["src/a.rs"]);
         assert_eq!(diff.deleted, vec!["keep.txt"]);
         assert_eq!(diff.added, vec!["new.txt"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diff_for_file_returns_hunks_and_headers() {
+        let root = workspace("filediff");
+        fs::write(root.join("src/a.rs"), "one\ntwo\nthree\n").unwrap();
+        fs::write(root.join("src/b.rs"), "same\n").unwrap();
+        fs::write(root.join("keep.txt"), "keep\n").unwrap();
+        let transaction = WorkspaceTransaction::begin(root.clone(), 1_000_000).unwrap();
+        fs::write(root.join("src/a.rs"), "one\nTWO\nthree\nfour\n").unwrap();
+        fs::remove_file(root.join("src/b.rs")).unwrap();
+        fs::write(root.join("created.txt"), "new file\n").unwrap();
+
+        let modified = transaction.diff_for_file("src/a.rs").unwrap().unwrap();
+        assert!(modified.starts_with("--- a/src/a.rs\n+++ b/src/a.rs\n"));
+        assert!(modified.contains("@@ "));
+        assert!(modified.contains("+TWO"));
+        assert!(modified.contains("+four"));
+
+        let added = transaction.diff_for_file("created.txt").unwrap().unwrap();
+        assert!(added.contains("+new file"));
+        assert!(added.contains("@@ -0,0 +1,1 @@"));
+
+        let deleted = transaction.diff_for_file("src/b.rs").unwrap().unwrap();
+        assert!(deleted.contains("-same"));
+        assert!(deleted.contains("@@ -1,1 +0,0 @@"));
+
+        // Unchanged files return None.
+        assert!(transaction.diff_for_file("keep.txt").unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 

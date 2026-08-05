@@ -440,6 +440,45 @@ impl LlmClient {
             }
         }
     }
+
+    /// Stream a conversation response, invoking `on_token` for each content
+    /// delta while returning the same normalized [`ChatCompletion`] as
+    /// [`Self::chat_meta`]. Only the cloud backend streams incrementally; the
+    /// Ollama and local backends fall back to a non-streaming completion and
+    /// emit the whole text through `on_token`.
+    pub async fn chat_meta_stream(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        response_format: Option<&ResponseFormat>,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatCompletion> {
+        match self {
+            LlmClient::Cloud(c) => {
+                c.stream_chat_meta(model, messages, tools, tool_choice, response_format, on_token)
+                    .await
+            }
+            LlmClient::Ollama(c) => {
+                let completion =
+                    c.chat_meta(model, messages, tools, tool_choice, response_format).await?;
+                if !completion.content.is_empty() {
+                    on_token(&completion.content);
+                }
+                Ok(completion)
+            }
+            LlmClient::Local(_eng) => {
+                let completion = self
+                    .chat_meta(model, messages, tools, tool_choice, response_format)
+                    .await?;
+                if !completion.content.is_empty() {
+                    on_token(&completion.content);
+                }
+                Ok(completion)
+            }
+        }
+    }
 }
 
 impl OllamaClient {
@@ -974,6 +1013,161 @@ impl CloudClient {
             }
         }
         Ok(full)
+    }
+
+    /// Stream a chat completion (SSE) for the conversation API, feeding content
+    /// deltas to `on_token` while accumulating tool calls, finish reason and
+    /// usage into a normal [`ChatCompletion`]. Unlike [`Self::stream_chat`],
+    /// tool-call chunks are NOT echoed through `on_token` — the caller owns the
+    /// typed tool calls.
+    pub async fn stream_chat_meta(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: Option<&Vec<ToolDef>>,
+        tool_choice: Option<&ToolChoice>,
+        response_format: Option<&ResponseFormat>,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatCompletion> {
+        let mut body = CloudStreamRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            max_tokens: 16384,
+            tools: tools.cloned(),
+            tool_choice: tool_choice.cloned(),
+            response_format: None,
+        };
+        if let Some(rf) = response_format {
+            body.response_format = Some(rf.clone());
+        }
+
+        let mut resp = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .context("cloud stream request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("cloud stream request failed: HTTP {status} {text}");
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
+        loop {
+            let Some(chunk) = resp.chunk().await.context("cloud stream read failed")? else {
+                break;
+            };
+            buffer.extend_from_slice(&chunk);
+            let mut done = false;
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line).trim().to_string();
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(choice) = v["choices"][0].as_object() {
+                        if let Some(reason) = choice
+                            .get("finish_reason")
+                            .and_then(|r| r.as_str())
+                            .filter(|r| !r.is_empty())
+                        {
+                            finish_reason = Some(reason.to_string());
+                        }
+                        if let Some(delta) = choice.get("delta").and_then(|d| d.as_object()) {
+                            if let Some(chunk) = delta.get("content").and_then(|c| c.as_str()) {
+                                if !chunk.is_empty() {
+                                    on_token(chunk);
+                                    content.push_str(chunk);
+                                }
+                            }
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                for tc in tcs {
+                                    let index = tc
+                                        .get("index")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    while tool_calls.len() <= index {
+                                        tool_calls.push(ToolCall {
+                                            id: String::new(),
+                                            r#type: function_call_type(),
+                                            function: ToolCallFunction {
+                                                name: String::new(),
+                                                arguments: String::new(),
+                                            },
+                                        });
+                                    }
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        if !id.is_empty() {
+                                            tool_calls[index].id = id.to_string();
+                                        }
+                                    }
+                                    if let Some(name) = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !name.is_empty() {
+                                            tool_calls[index].function.name = name.to_string();
+                                        }
+                                    }
+                                    if let Some(args) = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !args.is_empty() {
+                                            tool_calls[index].function.arguments.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(u) = v.get("usage") {
+                        usage = Some(TokenUsage {
+                            prompt_tokens: u
+                                .get("prompt_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as usize,
+                            completion_tokens: u
+                                .get("completion_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as usize,
+                            total_tokens: u
+                                .get("total_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as usize,
+                        });
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        Ok(ChatCompletion {
+            content,
+            tool_calls,
+            finish_reason,
+            usage,
+        })
     }
 }
 

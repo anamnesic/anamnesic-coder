@@ -13,6 +13,7 @@ mod memory;
 mod models_dev;
 mod providers;
 mod repo;
+mod terminal;
 mod tools;
 mod types;
 mod ui;
@@ -111,6 +112,9 @@ struct Cli {
     /// Resume a previous session (lists saved sessions to pick from)
     #[arg(long)]
     resume: bool,
+    /// Continue the most recent session for this workspace without prompting
+    #[arg(long, alias = "continue")]
+    cont: bool,
     task: Option<String>,
 }
 
@@ -119,6 +123,15 @@ enum Commands {
     Check,
     /// Launch the terminal UI
     Tui,
+    /// Expose the TUI in the browser via xterm.js over WebSocket
+    Serve {
+        /// Listen address (default 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Listen port
+        #[arg(long, default_value = "7681")]
+        port: u16,
+    },
     Repl,
     /// List locally available models
     Models,
@@ -266,7 +279,9 @@ async fn main() -> Result<()> {
     let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
-    if cli.resume {
+    if cli.cont {
+        continue_latest_session(&mut state)?;
+    } else if cli.resume {
         resume_session(&mut state)?;
     }
 
@@ -321,6 +336,13 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Repl) => {
             repl(&client, &mut state).await?;
+        }
+        Some(Commands::Serve { port, host }) => {
+            let argv = vec![
+                std::env::current_exe()?.to_string_lossy().to_string(),
+                "tui".to_string(),
+            ];
+            terminal::server::serve(&host, port, argv, state.config.workspace_dir.clone()).await?;
         }
         None => {
             if let Some(task) = cli.task {
@@ -435,16 +457,24 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
 fn resume_session(state: &mut AgentState) -> Result<()> {
     use std::io::Write;
 
-    let sessions = state.long_memory.get_recent_sessions(10)?;
+    let workspace = state.config.workspace_dir.display().to_string();
+    let sessions = state.long_memory.list_sessions(&workspace, 10)?;
     if sessions.is_empty() {
         println!("  No saved sessions found.");
         return Ok(());
     }
     println!("\n  Recent sessions (memory.db):");
     println!("{}", "─".repeat(70));
-    for (i, (ts, summary)) in sessions.iter().enumerate() {
-        let s: String = summary.chars().take(80).collect();
-        println!("  [{}] {}  {}", i + 1, ts, s);
+    for (i, info) in sessions.iter().enumerate() {
+        let s: String = info.summary.chars().take(60).collect();
+        println!(
+            "  [{}] {}  {} ({} msgs, {})",
+            i + 1,
+            info.updated_at,
+            s,
+            info.message_count,
+            info.model
+        );
     }
     print!("  Resume session # (0 = skip): ");
     std::io::stdout().flush()?;
@@ -454,10 +484,24 @@ fn resume_session(state: &mut AgentState) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    if let Some((ts, summary)) = sessions.get(n.saturating_sub(1)) {
-        let task = format!("Continue previous session ({ts}): {summary}");
-        state.session.add_message("user", &task);
-        println!("  ✓ Resumed session from {ts}");
+    if let Some(info) = sessions.get(n.saturating_sub(1)) {
+        let count = state.load_session_into_state(info.id)?;
+        println!("  ✓ Resumed session {} ({count} messages restored)", info.id);
+    }
+    Ok(())
+}
+
+/// Continue the most recent session for this workspace without prompting.
+fn continue_latest_session(state: &mut AgentState) -> Result<()> {
+    let workspace = state.config.workspace_dir.display().to_string();
+    match state.long_memory.latest_session(&workspace)? {
+        Some(id) => {
+            let count = state.load_session_into_state(id)?;
+            println!("  ✓ Continuing session {id} ({count} messages restored)");
+        }
+        None => {
+            println!("  No previous session found for this workspace.");
+        }
     }
     Ok(())
 }
