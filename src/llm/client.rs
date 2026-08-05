@@ -60,6 +60,7 @@ pub struct ToolCallResult {
 pub struct TokenUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub reasoning_tokens: usize,
     pub total_tokens: usize,
 }
 
@@ -184,6 +185,8 @@ struct CloudUsage {
     prompt_tokens: usize,
     #[serde(default)]
     completion_tokens: usize,
+    #[serde(default)]
+    reasoning_tokens: usize,
     #[serde(default)]
     total_tokens: usize,
 }
@@ -636,6 +639,7 @@ impl OllamaClient {
             Some(TokenUsage {
                 prompt_tokens,
                 completion_tokens,
+                reasoning_tokens: 0,
                 total_tokens: prompt_tokens + completion_tokens,
             })
         } else {
@@ -889,6 +893,7 @@ impl OllamaClient {
             Some(TokenUsage {
                 prompt_tokens,
                 completion_tokens,
+                reasoning_tokens: 0,
                 total_tokens: prompt_tokens + completion_tokens,
             })
         } else {
@@ -1067,6 +1072,7 @@ impl CloudClient {
                 let usage = data.usage.map(|u| TokenUsage {
                     prompt_tokens: u.prompt_tokens,
                     completion_tokens: u.completion_tokens,
+                    reasoning_tokens: u.reasoning_tokens,
                     total_tokens: u.total_tokens,
                 });
                 return Ok(ChatCompletion {
@@ -1344,6 +1350,10 @@ impl CloudClient {
                                 .unwrap_or(0) as usize,
                             completion_tokens: u
                                 .get("completion_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as usize,
+                            reasoning_tokens: u
+                                .get("reasoning_tokens")
                                 .and_then(|x| x.as_u64())
                                 .unwrap_or(0) as usize,
                             total_tokens: u

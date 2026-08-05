@@ -54,6 +54,7 @@ pub enum AgentEvent {
     TokenUsage {
         prompt_tokens: usize,
         completion_tokens: usize,
+        reasoning_tokens: usize,
         total_tokens: usize,
     },
     /// Reasoning content delta from thinking models (GLM-5.2, deepseek-r1, etc.).
@@ -414,6 +415,7 @@ async fn run_tool_use_iteration(
             hooks.emit(AgentEvent::TokenUsage {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
                 total_tokens: usage.total_tokens,
             });
         }

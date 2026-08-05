@@ -193,6 +193,8 @@ pub struct App {
     pub file_search_paths: Vec<String>,
     /// /info overlay: full-screen view of the former left sidebar sections.
     pub info_popup: bool,
+    /// Accumulated reasoning content for thinking models (GLM-5.2, deepseek-r1).
+    pub reasoning: String,
 }
 
 impl App {
@@ -275,6 +277,7 @@ impl App {
             file_search_results: Vec::new(),
             file_search_paths: Vec::new(),
             info_popup: false,
+            reasoning: String::new(),
         }
     }
 
@@ -327,12 +330,29 @@ impl App {
         self.streaming_assistant = true;
     }
 
+    /// Accumulate reasoning content deltas into a single live message.
+    /// Unlike text deltas, reasoning content is displayed separately
+    /// (italic, subdued) and does not count as the assistant's response.
+    pub fn feed_reasoning_delta(&mut self, text: &str) {
+        const MAX_REASONING_CHARS: usize = 8_000;
+        if self.reasoning.len() < MAX_REASONING_CHARS {
+            self.reasoning.push_str(text);
+        }
+    }
+
     /// Stop the live assistant message. If `final_content` is provided and the
     /// last message is still the streaming one, replace it with the final text
     /// so the transcript shows exactly one copy of the response.
+    /// If the last message is a reasoning message, it is closed first and the
+    /// final content is appended as a new assistant message.
     /// Returns true if a streaming message was finalized (callers should not
     /// push the final message again).
     pub fn end_streaming(&mut self, final_content: Option<&str>) -> bool {
+        // Close any open reasoning accumulation before finalizing content.
+        if !self.reasoning.is_empty() {
+            self.messages.push(("Thinking".to_string(), self.reasoning.clone()));
+            self.reasoning.clear();
+        }
         if !self.streaming_assistant {
             return false;
         }
@@ -936,7 +956,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.add_message("Verify", &format!("[{status}] {command} — {summary}"));
                     }
                     AgentEvent::ReasoningDelta { text } => {
-                        a.add_message("Thinking", &text);
+                        a.feed_reasoning_delta(&text);
                     }
                     AgentEvent::Done { message } => {
                         if !a.end_streaming(Some(&message)) {
@@ -968,13 +988,16 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     AgentEvent::TokenUsage {
                         prompt_tokens,
                         completion_tokens,
+                        reasoning_tokens,
                         total_tokens,
                     } => {
                         a.token_breakdown.input = prompt_tokens;
                         a.token_breakdown.output = completion_tokens;
+                        a.token_breakdown.reasoning = reasoning_tokens;
                         a.tokens = total_tokens;
                         a.context_cost = a.token_breakdown.input as f64 * 0.000003
-                            + a.token_breakdown.output as f64 * 0.000012;
+                            + a.token_breakdown.output as f64 * 0.000012
+                            + a.token_breakdown.reasoning as f64 * 0.000001;
                     }
                 }
             }
