@@ -1818,10 +1818,12 @@ fn draw<B: ratatui::backend::Backend>(
         let bottom_left = format!(" {} · {}", truncate_str(&app.dir, 48), app.git_branch);
         let bottom_right = if app.loading {
             format!(
-                " {} {:<5}  (Esc interrupt) ",
+                " {} {:<5}  (Ctrl+C cancel) ",
                 SPINNER[app.spinner_frame],
                 format_elapsed(app.elapsed)
             )
+        } else if app.pending_approval.is_some() {
+            " a: allow once · s: allow session · d: deny ".into()
         } else {
             " Esc interrupt ".into()
         };
