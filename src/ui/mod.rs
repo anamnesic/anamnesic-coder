@@ -143,6 +143,7 @@ pub struct App {
     pub scroll_offset: usize,
     pub follow: bool,
     pub model: String,
+    pub auto_model: bool,
     pub caveman: String,
     pub dir: String,
     pub git_branch: String,
@@ -238,7 +239,8 @@ impl App {
                 .into(),
             scroll_offset: 0,
             follow: true,
-            model: model.to_string(),
+model: model.to_string(),
+            auto_model: false,
             caveman: caveman.to_string(),
             dir: String::new(),
             git_branch: String::new(),
@@ -627,12 +629,16 @@ let provider = app.provider.clone();
                          (ranked_model_order(&base), display)
                      })
                     .collect();
-                cloud_ranked.sort_by_key(|(rank, _)| *rank);
+cloud_ranked.sort_by_key(|(rank, _)| *rank);
                 let cloud: Vec<String> = cloud_ranked
                     .into_iter()
                     .map(|(_, name)| format!("{} [cloud]", name))
                     .collect();
+                // Add "auto" option for NVIDIA provider.
                 let mut items: Vec<String> = local.clone();
+                if provider == "nvidia" {
+                    items.push("auto".into());
+                }
                 items.extend(unique_model_ids(cloud));
                 items.dedup();
                 if items.is_empty() {
@@ -760,6 +766,23 @@ fn ranked_model_order(base_id: &str) -> usize {
 /// model so requests go to the right backend.
 fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmRouter, name: &str) {
     let clean = name.trim_end_matches(" [cloud]").to_string();
+    if clean == "auto" {
+        app.auto_model = true;
+        let best = "glm-5.2";
+        {
+            let mut st = state.lock().unwrap();
+            st.config.coder_model = best.to_string();
+            st.config.planner_model = best.to_string();
+            st.config.summarizer_model = best.to_string();
+        }
+        app.model = best.to_string();
+        router.set_model(best);
+        router.mark_cloud(best);
+        app.add_message("System", "Auto model enabled — GLM-5.2 (will fallback on failure)");
+        app.status = format!("Ready · model: {best} (auto) · Esc interrupt");
+        return;
+    }
+    app.auto_model = false;
     let mut is_cloud = name.ends_with(" [cloud]");
     if !is_cloud {
         // Typed names: resolve against the active provider's catalog so plain

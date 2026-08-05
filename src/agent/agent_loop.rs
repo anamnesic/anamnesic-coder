@@ -1497,10 +1497,60 @@ async fn run_agent_mode(
             );
         }
         Err(e) => {
-            state.session.add_message(
-                "Error",
-                &format!("  [tools] unavailable ({e}); using planner fallback"),
-            );
+            // Auto fallback: try the next model in the ranked list.
+            let fallback_models = [
+                "glm-5.2",
+                "qwen3.5-397b-a17b",
+                "deepseek-v4-pro",
+                "kimi-k2.6",
+                "minimax-m3",
+                "nemotron-3-ultra-550b-a55b",
+            ];
+            let current_idx = fallback_models.iter().position(|m| *m == model);
+            if let Some(next_idx) = current_idx.and_then(|i| fallback_models.get(i + 1)) {
+                hooks.warn(&format!(
+                    "  [auto] {model} failed ({e}), trying {next_idx}..."
+                ));
+                state.config.coder_model = next_idx.to_string();
+                state.config.planner_model = next_idx.to_string();
+                state.config.summarizer_model = next_idx.to_string();
+                let next_model = next_idx.to_string();
+                match run_tool_use_iteration(client, state, &next_model, task, &tools, hooks, &prior).await {
+                    Ok(ToolLoopOutcome::Completed(final_text)) => {
+                        state.session.add_message("assistant", &final_text);
+                        state.session.add_action("tool-use turn completed (auto-fallback)");
+                        hooks.done(&final_text);
+                        return;
+                    }
+                    Ok(ToolLoopOutcome::Failed(message)) => {
+                        state.session.add_message("Error", &message);
+                        hooks.failed(&message);
+                        return;
+                    }
+                    Ok(ToolLoopOutcome::Interrupted) => {
+                        finalize_transaction(state, hooks, false);
+                        hooks.emit(AgentEvent::Interrupted);
+                        return;
+                    }
+                    Ok(ToolLoopOutcome::NoTools) => {
+                        state.session.add_message(
+                            "Error",
+                            "  [tools] model did not request tools; using planner fallback",
+                        );
+                    }
+                    Err(e2) => {
+                        state.session.add_message(
+                            "Error",
+                            &format!("  [auto] {next_idx} also failed ({e2}); using planner fallback"),
+                        );
+                    }
+                }
+            } else {
+                state.session.add_message(
+                    "Error",
+                    &format!("  [tools] unavailable ({e}); using planner fallback"),
+                );
+            }
         }
     }
 
