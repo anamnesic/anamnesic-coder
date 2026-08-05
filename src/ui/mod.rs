@@ -2172,49 +2172,6 @@ fn count_wrapped_lines(lines: &[Line<'static>], width: usize) -> usize {
 /// Flatten chat messages into renderable transcript lines (Codex-style):
 /// user messages use a bold-dim `›` prefix, assistant messages render markdown
 /// with a dim `•` bullet, and status/tool messages stay compact and subdued.
-fn flatten_messages(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut tool_count = 0usize;
-    let mut tool_buffer = Vec::new();
-    for (role, content) in &app.messages {
-        match role.to_ascii_lowercase().as_str() {
-            "user" => {
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-                lines.extend(user_message_lines(content));
-            }
-            "assistant" => {
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-                lines.extend(assistant_message_lines(content));
-            }
-            "thinking" => {
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-                if app.reasoning_expanded {
-                    lines.extend(status_message_lines(role, content));
-                } else {
-                    let summary = format!("Thinking ({} chars)", content.len());
-                    lines.extend(status_message_lines("thinking", &summary));
-                }
-            }
-            "tool" => {
-                if app.tool_calls_expanded {
-                    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-                    lines.extend(status_message_lines(role, content));
-                } else {
-                    tool_count += 1;
-                    tool_buffer.push(content.clone());
-                }
-            }
-            _ => {
-                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-                lines.extend(status_message_lines(role, content));
-            }
-        }
-        lines.push(Line::from(""));
-    }
-    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
-    lines
-}
-
 /// Flush accumulated tool calls into a rollup summary or individual lines.
 fn flush_tool_rollup(
     app: &App,
@@ -2236,6 +2193,75 @@ fn flush_tool_rollup(
     }
     *count = 0;
     buffer.clear();
+}
+
+fn flatten_messages(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut tool_count = 0usize;
+    let mut tool_buffer = Vec::new();
+    let mut in_plan = false;
+    for (role, content) in &app.messages {
+        match role.to_ascii_lowercase().as_str() {
+            "user" => {
+                in_plan = false;
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(user_message_lines(content));
+            }
+            "assistant" => {
+                in_plan = false;
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(assistant_message_lines(content));
+            }
+            "thinking" => {
+                in_plan = false;
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                if app.reasoning_expanded {
+                    lines.extend(status_message_lines(role, content));
+                } else {
+                    let summary = format!("Thinking ({} chars)", content.len());
+                    lines.extend(status_message_lines("thinking", &summary));
+                }
+            }
+            "plan" => {
+                in_plan = true;
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(status_message_lines(role, content));
+            }
+            "tool" => {
+                if app.tool_calls_expanded {
+                    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                    if in_plan {
+                        lines.extend(plan_tool_message_lines(content));
+                    } else {
+                        lines.extend(status_message_lines(role, content));
+                    }
+                } else {
+                    tool_count += 1;
+                    tool_buffer.push(content.clone());
+                }
+            }
+            _ => {
+                in_plan = false;
+                flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+                lines.extend(status_message_lines(role, content));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    flush_tool_rollup(app, &mut tool_count, &mut tool_buffer, &mut lines);
+    lines
+}
+
+/// Render a tool message inside a plan step with ⎿ child indentation.
+fn plan_tool_message_lines(content: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let mut spans = Vec::new();
+        spans.push(Span::styled("⎿ ", Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Gray)));
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 /// Codex-style user cell: `› ` (bold dim) on the first line, `  ` continuation.
@@ -2317,7 +2343,7 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
             false,
         ),
         "plan" => (
-            "▶ ",
+            "⏺ ",
             Style::default()
                 .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
