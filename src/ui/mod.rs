@@ -42,6 +42,7 @@ const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Available slash commands, shown in the interactive picker (modern-harness style).
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/info", "Show workspace info (context, tokens, models, todo, files)"),
     ("/help", "Show help"),
     ("/status", "Show model, provider, directory, context tokens"),
     (
@@ -190,6 +191,8 @@ pub struct App {
     pub file_search_selected: usize,
     pub file_search_results: Vec<FileMatch>,
     pub file_search_paths: Vec<String>,
+    /// /info overlay: full-screen view of the former left sidebar sections.
+    pub info_popup: bool,
 }
 
 impl App {
@@ -271,6 +274,7 @@ impl App {
             file_search_selected: 0,
             file_search_results: Vec::new(),
             file_search_paths: Vec::new(),
+            info_popup: false,
         }
     }
 
@@ -491,6 +495,14 @@ fn handle_slash_command(
                 st.session.estimated_tokens()
             );
             app.add_message("System", &out);
+            true
+        }
+        "/info" => {
+            let st = state.lock().unwrap();
+            update_info_sections(app, &st);
+            drop(st);
+            app.info_popup = true;
+            app.status = "Workspace info — ↑/↓ navigate · Enter toggle · Esc close".into();
             true
         }
         "/provider" => {
@@ -1197,6 +1209,30 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         continue;
                     }
                 }
+                // /info overlay captures navigation keys while open.
+                if guard.info_popup {
+                    match key.code {
+                        KeyCode::Esc => guard.info_popup = false,
+                        KeyCode::Up => {
+                            if guard.info_selected > 0 {
+                                guard.info_selected -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if guard.info_selected + 1 < guard.info_sections.len() {
+                                guard.info_selected += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let idx = guard.info_selected;
+                            if let Some(section) = guard.info_sections.get_mut(idx) {
+                                section.open = !section.open;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::PageUp => {
                         guard.scroll_offset = guard.scroll_offset.saturating_sub(10);
@@ -1687,39 +1723,7 @@ fn draw<B: ratatui::backend::Backend>(
         ]));
         f.render_widget(bottom, page[4]);
 
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)].as_ref())
-            .split(page[1]);
-
-        // Left panel: collapsible info sections
-        let mut panel_lines: Vec<Line> = Vec::new();
-        for (idx, section) in app.info_sections.iter().enumerate() {
-            let arrow = if section.open { "▼" } else { "▶" };
-            let selected = idx == app.info_selected && app.focus == Focus::Sidebar;
-            let style = if selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            panel_lines.push(Line::from(vec![
-                Span::styled(format!("{} {}", arrow, section.title), style),
-            ]));
-            if section.open {
-                for line in &section.lines {
-                    panel_lines.push(Line::from(vec![
-                        Span::styled(format!("  {}", line), Style::default().fg(Color::Gray)),
-                    ]));
-                }
-            }
-        }
-        let panel_block = Block::default()
-            .title(" Workspace ")
-            .borders(Borders::ALL);
-        let panel = Paragraph::new(panel_lines).block(panel_block);
-        f.render_widget(panel, cols[0]);
-
-        // Right column: messages or editor (full height — input lives at the bottom bar).
+        // Full-width transcript (Codex-style single column — no sidebar).
         if let Some(editor_file) = app.editor_file.as_ref() {
             let title = format!(
                 "Editor - {}{}",
@@ -1727,7 +1731,7 @@ fn draw<B: ratatui::backend::Backend>(
                 if app.editor_dirty { " *" } else { "" }
             );
             // compute visible lines based on scroll and area height
-            let area_height = cols[1].height as usize - 2; // leave room for borders
+            let area_height = page[1].height as usize - 2; // leave room for borders
             let total_lines = app.editor_lines.len();
             let scroll = if app.editor_scroll + area_height > total_lines {
                 total_lines.saturating_sub(area_height)
@@ -1738,14 +1742,14 @@ fn draw<B: ratatui::backend::Backend>(
             let visible = app.editor_lines[scroll..end].join("\n");
             let editor =
                 Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL));
-            f.render_widget(editor, cols[1]);
+            f.render_widget(editor, page[1]);
             // set cursor in editor area relative to scroll
             let r = (app.editor_row.saturating_sub(scroll)) as u16;
             let c = app.editor_col as u16;
-            f.set_cursor_position((cols[1].x + c + 1, cols[1].y + r + 1));
+            f.set_cursor_position((page[1].x + c + 1, page[1].y + r + 1));
         } else {
         let messages_lines = flatten_messages(app);
-        let view_height = (cols[1].height as usize).saturating_sub(2); // borders
+        let view_height = page[1].height as usize;
         let total = messages_lines.len();
         let offset = if app.follow {
             total.saturating_sub(view_height)
@@ -1759,9 +1763,8 @@ fn draw<B: ratatui::backend::Backend>(
             let start = offset.min(total - view_height);
             messages_lines[start..start + view_height].to_vec()
         };
-        let messages_block = Block::default().title(" Chat ").borders(Borders::ALL);
-        let messages_widget = Paragraph::new(visible).block(messages_block);
-        f.render_widget(messages_widget, cols[1]);
+        let messages_widget = Paragraph::new(visible);
+        f.render_widget(messages_widget, page[1]);
         }
 
         // Overlays: slash-command picker / model selector (modal, like modern harness TUIs).
@@ -1850,6 +1853,51 @@ fn draw<B: ratatui::backend::Backend>(
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
+        }
+
+        // /info overlay: former left-sidebar sections, rendered full-screen.
+        if app.info_popup {
+            let popup_w = (size.width.saturating_sub(6)).max(30);
+            let popup_h = (size.height.saturating_sub(4)).max(10);
+            let x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+            let y = size.y + 2;
+            let area = Rect { x, y, width: popup_w, height: popup_h };
+            let mut panel_lines: Vec<Line> = Vec::new();
+            for (idx, section) in app.info_sections.iter().enumerate() {
+                let arrow = if section.open { "▼" } else { "▶" };
+                let selected = idx == app.info_selected;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let mut spans = Vec::new();
+                if selected {
+                    spans.push(Span::styled(
+                        "▶ ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled("  ", Style::default()));
+                }
+                spans.push(Span::styled(format!("{} {}", arrow, section.title), style));
+                panel_lines.push(Line::from(spans));
+                if section.open {
+                    for line in &section.lines {
+                        panel_lines.push(Line::from(vec![
+                            Span::styled("    ", Style::default()),
+                            Span::styled(line.clone(), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
+            }
+            let panel_block = Block::default()
+                .title(" Workspace info — ↑/↓ navigate · Enter toggle · Esc close ")
+                .borders(Borders::ALL);
+            let panel = Paragraph::new(panel_lines).block(panel_block).wrap(Wrap { trim: false });
+            f.render_widget(panel, area);
         }
 
         // Ctrl+P fuzzy file-search overlay.
@@ -1961,59 +2009,170 @@ fn display_role(role: &str) -> String {
     }
 }
 
-/// Flatten chat messages into renderable lines (handles multi-line content and
-/// adds role labels). Mirrors the HistoryCell transcript rendering of modern
-/// coding-agent TUIs.
+/// Flatten chat messages into renderable transcript lines (Codex-style):
+/// user messages use a bold-dim `›` prefix, assistant messages render markdown
+/// with a dim `•` bullet, and status/tool messages stay compact and subdued.
 fn flatten_messages(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (role, content) in &app.messages {
-        let style = match role.as_str() {
-            "User" => Style::default().fg(Color::Green),
-            "System" => Style::default().fg(Color::Yellow),
-            "Tool" => Style::default().fg(Color::Cyan),
-            "Plan" => Style::default().fg(Color::LightMagenta),
-            "Error" => Style::default().fg(Color::Red),
-            "File" => Style::default().fg(Color::Cyan),
-            _ => Style::default().fg(Color::Gray),
-        };
-        let label = format!("{role}: ");
-        let md_rendered = render_markdown_lines(content).map(expand_multiline_spans);
-        if let Some(md_lines) = md_rendered {
-            if !md_lines.is_empty() {
-                let mut md_iter = md_lines.into_iter();
-                if let Some(first_line) = md_iter.next() {
-                    lines.push(Line::from(vec![
-                        Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                        first_line,
-                    ]));
-                }
-                for line in md_iter {
-                    lines.push(Line::from(vec![
-                        Span::styled(" ".repeat(label.len()), Style::default().fg(Color::DarkGray)),
-                        line,
-                    ]));
-                }
-            }
-        } else {
-            let mut first = true;
-            for content_line in content.lines() {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                        Span::styled(content_line.to_string(), style),
-                    ]));
-                    first = false;
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(" ", style),
-                        Span::styled(content_line.to_string(), style),
-                    ]));
-                }
-            }
+        match role.to_ascii_lowercase().as_str() {
+            "user" => lines.extend(user_message_lines(content)),
+            "assistant" => lines.extend(assistant_message_lines(content)),
+            _ => lines.extend(status_message_lines(role, content)),
         }
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Codex-style user cell: `› ` (bold dim) on the first line, `  ` continuation.
+fn user_message_lines(content: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let style = Style::default().fg(Color::LightBlue);
+    let mut first = true;
+    for content_line in content.lines() {
+        let prefix = if first {
+            Span::styled(
+                "› ",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::DIM),
+            )
+        } else {
+            Span::styled("  ", Style::default())
+        };
+        first = false;
+        out.push(Line::from(vec![prefix, Span::styled(content_line.to_string(), style)]));
+    }
+    if first {
+        // Empty message: render the prompt prefix so the cell stays visible.
+        out.push(Line::from(vec![Span::styled(
+            "› ",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::DIM),
+        )]));
+    }
+    out
+}
+
+/// Codex-style assistant cell: markdown rendered, first line prefixed with
+/// `• ` (dim), continuation lines with two spaces.
+fn assistant_message_lines(content: &str) -> Vec<Line<'static>> {
+    let md_lines = render_markdown_lines(content)
+        .map(expand_multiline_spans)
+        .map(collapse_consecutive_blanks)
+        .filter(|spans| !spans.is_empty());
+    let spans: Vec<Span<'static>> = match md_lines {
+        Some(spans) => spans,
+        None => vec![Span::styled(content.to_string(), Style::default().fg(Color::Gray))],
+    };
+    let mut out = Vec::new();
+    for (i, span) in spans.into_iter().enumerate() {
+        let prefix = if i == 0 {
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
+        } else {
+            Span::styled("  ", Style::default())
+        };
+        out.push(Line::from(vec![prefix, span]));
+    }
+    out
+}
+
+/// Merge runs of consecutive blank spans (a lone `\n` splits into two empty
+/// pieces) so paragraphs are separated by exactly one blank line.
+fn collapse_consecutive_blanks(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let blank = span.content.trim().is_empty();
+        if blank && out.last().is_some_and(|last: &Span<'static>| last.content.trim().is_empty()) {
+            continue;
+        }
+        out.push(span);
+    }
+    out
+}
+
+/// Compact subdued cell for system/tool/plan/error/verify/workspace messages.
+fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
+    let lower = role.to_ascii_lowercase();
+    let (prefix, prefix_style, content_style, italic) = match lower.as_str() {
+        "error" => (
+            "✗ ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+            false,
+        ),
+        "plan" => (
+            "▶ ",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::LightMagenta),
+            false,
+        ),
+        "tool" => (
+            "↳ ",
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+            false,
+        ),
+        "file" => (
+            "↳ ",
+            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Cyan),
+            false,
+        ),
+        "verify" => (
+            "",
+            Style::default(),
+            Style::default().fg(Color::DarkGray),
+            false,
+        ),
+        "workspace" => (
+            "",
+            Style::default(),
+            Style::default().fg(Color::DarkGray),
+            false,
+        ),
+        "approval" => (
+            "",
+            Style::default(),
+            Style::default().fg(Color::Green),
+            false,
+        ),
+        "info" => ("", Style::default(), Style::default().fg(Color::Cyan), false),
+        _ => (
+            "",
+            Style::default(),
+            Style::default().fg(Color::DarkGray),
+            true,
+        ),
+    };
+    let mut out = Vec::new();
+    let mut first = true;
+    for content_line in content.lines() {
+        let mut spans = Vec::new();
+        if first {
+            if !prefix.is_empty() {
+                spans.push(Span::styled(prefix, prefix_style));
+            }
+        } else {
+            spans.push(Span::styled("  ", Style::default()));
+        }
+        first = false;
+        let style = if italic {
+            content_style.add_modifier(Modifier::ITALIC)
+        } else {
+            content_style
+        };
+        spans.push(Span::styled(content_line.to_string(), style));
+        out.push(Line::from(spans));
+    }
+    if first {
+        out.push(Line::from(""));
+    }
+    out
 }
 
 fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
@@ -2056,10 +2215,15 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
                 if in_code {
                     code_text.push('\n');
                 } else {
-                    spans.push(Span::raw(" ".to_string()));
+                    spans.push(Span::raw("\n".to_string()));
                 }
             }
             Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    if !spans.is_empty() && !in_code {
+                        spans.push(Span::raw("\n".to_string()));
+                    }
+                }
                 Tag::CodeBlock(_) => {
                     in_code = true;
                     code_text.clear();
@@ -2382,6 +2546,51 @@ mod tests {
             "http://localhost:11434",
         ));
         (app, state, router)
+    }
+
+    #[test]
+    fn flatten_messages_user_prefix_and_assistant_bullet() {
+        let mut app = App::new("model", "off");
+        app.add_message("User", "fix the bug");
+        app.add_message("Assistant", "Done.");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts[0].starts_with("› fix the bug"));
+        assert_eq!(texts[1], "");
+        assert!(texts[2].starts_with("• Done."));
+    }
+
+    #[test]
+    fn flatten_messages_status_cells_are_subdued() {
+        let mut app = App::new("model", "off");
+        app.add_message("System", "ready");
+        app.add_message("Error", "boom");
+        app.add_message("Tool", "edit_file — changed src/main.rs");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(texts[0], "ready");
+        assert!(texts[2].starts_with("✗ boom"));
+        assert!(texts[4].starts_with("↳ edit_file — changed src/main.rs"));
+    }
+
+    #[test]
+    fn markdown_paragraphs_split_into_separate_lines() {
+        let mut app = App::new("model", "off");
+        app.add_message("Assistant", "first para\n\nsecond para");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(texts[0], "• first para");
+        assert!(texts[1].trim().is_empty());
+        assert_eq!(texts[2], "  second para");
+    }
+
+    #[test]
+    fn info_command_opens_popup() {
+        let (mut app, state, router) = test_app_state_router();
+        let handled = handle_slash_command("/info", &mut app, &state, &router);
+        assert!(handled);
+        assert!(app.info_popup);
+        assert!(!app.info_sections.is_empty());
     }
 
     #[test]
