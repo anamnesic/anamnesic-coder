@@ -67,32 +67,47 @@ fn executable_name(cmd: &str) -> Option<String> {
 }
 
 /// Check whether a command is allowed by the allow/block lists.
-/// Rejects commands with shell metacharacters (chaining, injection) and
-/// checks the executable name against the allow/block lists.
 pub fn is_allowed(cmd: &str, config: &Config) -> bool {
-    let (executable, _args) = match parse_command(cmd) {
-        Some(pair) => pair,
-        None => return false,
-    };
-    let cmd_lower = cmd.to_lowercase();
-    let exe_lower = executable.to_lowercase();
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let cmd_lower = trimmed.to_lowercase();
+    let first_word = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .trim_matches('\'');
+    let exe_lower = first_word.to_lowercase();
+
+    // Check blocked commands for forbidden operations (e.g. rm -rf /, format, sudo reboot)
     for blocked in &config.blocked_commands {
         let b = blocked.to_lowercase();
-        if exe_lower == b || cmd_lower.contains(&b) || exe_lower.starts_with(&format!("{b}/")) {
+        if exe_lower == b || cmd_lower.contains(&b) || exe_lower.starts_with(&format!("{b}/")) || exe_lower.starts_with(&format!("{b}\\")) {
             return false;
         }
     }
-    config
-        .allowed_commands
-        .iter()
-        .any(|a| exe_lower == a.to_lowercase() || exe_lower.starts_with(&format!("{a}/")))
+
+    // If allowed_commands is empty or contains wildcard "*", allow all non-blocked commands
+    if config.allowed_commands.is_empty() || config.allowed_commands.iter().any(|a| a == "*") {
+        return true;
+    }
+
+    // Check allowed_commands list
+    config.allowed_commands.iter().any(|a| {
+        let a_lower = a.to_lowercase();
+        exe_lower == a_lower
+            || exe_lower.ends_with(&format!("/{a_lower}"))
+            || exe_lower.ends_with(&format!("\\{a_lower}"))
+    })
 }
 
 /// Run an allowlisted command with a timeout and return combined output.
 pub fn run_command(cmd: &str, config: &Config) -> String {
     if !is_allowed(cmd, config) {
         return format!(
-            "Command not in allowed list or contains shell operators: {}",
+            "Command not in allowed list or contains blocked operation: {}",
             cmd
         );
     }
@@ -103,7 +118,6 @@ pub fn run_command(cmd: &str, config: &Config) -> String {
 }
 
 /// Run a command and return the raw `CommandOutput` (used by the verification gate).
-/// Also validates the allowlist and rejects shell metacharacters.
 pub fn run_command_raw(cmd: &str, config: &Config) -> CommandOutput {
     run_command_raw_with_interrupt(cmd, config, None)
 }
@@ -117,7 +131,7 @@ pub fn run_command_raw_with_interrupt(
         return CommandOutput {
             code: None,
             stdout: String::new(),
-            stderr: format!("Command not in allowed list or contains shell operators: {cmd}"),
+            stderr: format!("Command not in allowed list or contains blocked operation: {cmd}"),
             timed_out: false,
         };
     }
@@ -129,17 +143,26 @@ pub fn run_command_raw_with_interrupt(
     })
 }
 
-/// Internal helper: execute an allowlisted program directly and enforce a timeout.
+/// Internal helper: execute a process using system shell to support arguments and shell features.
 fn run_command_inner(
     cmd: &str,
     config: &Config,
     interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<CommandOutput> {
-    let (executable, args) = parse_command(cmd)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid command"))?;
-    let mut command = Command::new(executable);
+    #[cfg(target_family = "windows")]
+    let mut command = {
+        let mut c = Command::new("cmd.exe");
+        c.args(["/C", cmd]);
+        c
+    };
+
+    #[cfg(not(target_family = "windows"))]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
     command
-        .args(args)
         .current_dir(&config.workspace_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -665,28 +665,7 @@ cloud_ranked.sort_by_key(|(rank, _)| *rank);
             }
             true
         }
-        "/resume" => {
-            let st = state.lock().unwrap();
-            let workspace = st.config.workspace_dir.display().to_string();
-            let sessions = st.long_memory.list_sessions(&workspace, 20).unwrap_or_default();
-            drop(st);
-            if sessions.is_empty() {
-                app.add_message("System", "No saved sessions found.");
-            } else {
-                app.resume_items = sessions
-                    .iter()
-                    .map(|s| {
-                        let summary: String = s.summary.chars().take(50).collect();
-                        format!("{} — {} ({} msgs)", s.updated_at, summary, s.message_count)
-                    })
-                    .collect();
-                app.resume_ids = sessions.iter().map(|s| s.id).collect();
-                app.resume_selected = 0;
-                app.resume_selector = true;
-            }
-            true
-        }
-        "/continue" => {
+        "/resume" | "/continue" => {
             let mut st = state.lock().unwrap();
             let workspace = st.config.workspace_dir.display().to_string();
             match st.long_memory.latest_session(&workspace) {
@@ -699,12 +678,12 @@ cloud_ranked.sort_by_key(|(rank, _)| *rank);
                             for (role, content) in s.session.history() {
                                 app.add_message(&display_role(&role), &content);
                             }
-                            app.add_message("System", &format!("✓ Continued session {id} ({count} messages restored)"));
+                            app.add_message("System", &format!("✓ Resumed session {id} ({count} messages restored)"));
                         }
                         Err(e) => app.add_message("Error", &format!("Failed to load session: {e}")),
                     }
                 }
-                Ok(None) => app.add_message("System", "No previous session found."),
+                Ok(None) => app.add_message("System", "No previous session found for this workspace."),
                 Err(e) => app.add_message("Error", &format!("Failed to query sessions: {e}")),
             }
             true
@@ -2451,24 +2430,54 @@ fn user_message_lines(content: &str) -> Vec<Line<'static>> {
 /// Codex-style assistant cell: markdown rendered, first line prefixed with
 /// `• ` (dim), continuation lines with two spaces.
 fn assistant_message_lines(content: &str) -> Vec<Line<'static>> {
-    let md_lines = render_markdown_lines(content)
-        .map(expand_multiline_spans)
-        .map(collapse_consecutive_blanks)
-        .filter(|spans| !spans.is_empty());
-    let spans: Vec<Span<'static>> = match md_lines {
+    let raw_spans = match render_markdown_lines(content) {
         Some(spans) => spans,
         None => vec![Span::styled(content.to_string(), Style::default().fg(Color::Gray))],
     };
-    let mut out = Vec::new();
-    for (i, span) in spans.into_iter().enumerate() {
-        let prefix = if i == 0 {
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_line_spans: Vec<Span<'static>> = Vec::new();
+    let mut is_first_line = true;
+
+    for span in raw_spans {
+        let text = span.content.as_ref();
+        if text.contains('\n') {
+            let parts: Vec<&str> = text.split('\n').collect();
+            for (idx, part) in parts.iter().enumerate() {
+                if !part.is_empty() {
+                    let mut s = span.clone();
+                    s.content = (*part).to_string().into();
+                    current_line_spans.push(s);
+                }
+                if idx < parts.len() - 1 {
+                    let prefix = if is_first_line {
+                        is_first_line = false;
+                        Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
+                    } else {
+                        Span::styled("  ", Style::default())
+                    };
+                    let mut line_spans = vec![prefix];
+                    line_spans.append(&mut current_line_spans);
+                    lines.push(Line::from(line_spans));
+                }
+            }
+        } else {
+            current_line_spans.push(span);
+        }
+    }
+
+    if !current_line_spans.is_empty() || lines.is_empty() {
+        let prefix = if is_first_line {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::styled("  ", Style::default())
         };
-        out.push(Line::from(vec![prefix, span]));
+        let mut line_spans = vec![prefix];
+        line_spans.append(&mut current_line_spans);
+        lines.push(Line::from(line_spans));
     }
-    out
+
+    lines
 }
 
 /// Merge runs of consecutive blank spans (a lone `\n` splits into two empty
@@ -2625,8 +2634,8 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             }
             Event::Code(t) => {
                 spans.push(Span::styled(
-                    format!(" {} ", t.as_ref()),
-                    Style::default().fg(Color::Yellow).bg(Color::Gray),
+                    t.as_ref().to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -2639,7 +2648,7 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
                     if !spans.is_empty() && !in_code {
-                        spans.push(Span::raw("\n".to_string()));
+                        spans.push(Span::raw("\n\n".to_string()));
                     }
                 }
                 Tag::CodeBlock(_) => {

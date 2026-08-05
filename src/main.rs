@@ -279,10 +279,8 @@ async fn main() -> Result<()> {
     let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
-    if cli.cont {
+    if cli.cont || cli.resume {
         continue_latest_session(&mut state)?;
-    } else if cli.resume {
-        resume_session(&mut state)?;
     }
 
     match cli.command {
@@ -454,50 +452,18 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
 }
 
 /// List saved sessions and (optionally) restore one into the session context.
+/// Resume/continue the most recent session for this workspace without prompting.
 fn resume_session(state: &mut AgentState) -> Result<()> {
-    use std::io::Write;
-
-    let workspace = state.config.workspace_dir.display().to_string();
-    let sessions = state.long_memory.list_sessions(&workspace, 10)?;
-    if sessions.is_empty() {
-        println!("  No saved sessions found.");
-        return Ok(());
-    }
-    println!("\n  Recent sessions (memory.db):");
-    println!("{}", "─".repeat(70));
-    for (i, info) in sessions.iter().enumerate() {
-        let s: String = info.summary.chars().take(60).collect();
-        println!(
-            "  [{}] {}  {} ({} msgs, {})",
-            i + 1,
-            info.updated_at,
-            s,
-            info.message_count,
-            info.model
-        );
-    }
-    print!("  Resume session # (0 = skip): ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let n: usize = input.trim().parse().unwrap_or(0);
-    if n == 0 {
-        return Ok(());
-    }
-    if let Some(info) = sessions.get(n.saturating_sub(1)) {
-        let count = state.load_session_into_state(info.id)?;
-        println!("  ✓ Resumed session {} ({count} messages restored)", info.id);
-    }
-    Ok(())
+    continue_latest_session(state)
 }
 
-/// Continue the most recent session for this workspace without prompting.
+/// Continue/resume the most recent session for this workspace without prompting.
 fn continue_latest_session(state: &mut AgentState) -> Result<()> {
     let workspace = state.config.workspace_dir.display().to_string();
     match state.long_memory.latest_session(&workspace)? {
         Some(id) => {
             let count = state.load_session_into_state(id)?;
-            println!("  ✓ Continuing session {id} ({count} messages restored)");
+            println!("  ✓ Resumed session {id} ({count} messages restored)");
         }
         None => {
             println!("  No previous session found for this workspace.");
