@@ -3040,7 +3040,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                let area = f.size();
+                let area = f.area();
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -3056,7 +3056,7 @@ mod tests {
         let mut found_x_beyond_row0 = false;
         for y in 1..10 {
             for x in 0..40 {
-                if buf.get(x, y).symbol() == "x" {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "x") {
                     found_x_beyond_row0 = true;
                     break;
                 }
