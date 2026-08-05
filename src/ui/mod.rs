@@ -349,8 +349,10 @@ impl App {
     /// Reset reasoning accumulation between tool iterations.
     /// Call at the start of each new assistant response to avoid
     /// concatenating reasoning from multiple iterations without a separator.
+    /// Any remaining tail (< 120 chars) is flushed to the transcript first.
     pub fn reset_reasoning(&mut self) {
         if !self.reasoning.is_empty() {
+            self.messages.push(("Thinking".to_string(), self.reasoning.clone()));
             self.reasoning.clear();
         }
     }
@@ -363,17 +365,37 @@ impl App {
     /// Returns true if a streaming message was finalized (callers should not
     /// push the final message again).
     pub fn end_streaming(&mut self, final_content: Option<&str>) -> bool {
-        // Close any open reasoning accumulation before finalizing content.
-        if !self.reasoning.is_empty() {
-            self.messages.push(("Thinking".to_string(), self.reasoning.clone()));
-            self.reasoning.clear();
-        }
         if !self.streaming_assistant {
             return false;
         }
+        // Close any open reasoning accumulation before finalizing content.
+        // Insert remaining reasoning before the Assistant message so the
+        // transcript reads Thinking → Assistant, not Assistant → Thinking.
+        if !self.reasoning.is_empty() {
+            let reasoning = std::mem::take(&mut self.reasoning);
+            match self.messages.last_mut() {
+                Some((role, _)) if role == "Assistant" => {
+                    let idx = self.messages.len().saturating_sub(1);
+                    self.messages.insert(idx, ("Thinking".to_string(), reasoning));
+                }
+                Some((_, last)) => {
+                    last.push_str(&reasoning);
+                }
+                None => {
+                    self.messages.push(("Thinking".to_string(), reasoning));
+                }
+            }
+        }
         if let Some(content) = final_content {
-            if let Some((_, last)) = self.messages.last_mut() {
-                *last = content.to_string();
+            match self.messages.last_mut() {
+                Some((role, _)) if role == "Assistant" => {
+                    if let Some((_, last)) = self.messages.last_mut() {
+                        *last = content.to_string();
+                    }
+                }
+                _ => {
+                    self.messages.push(("Assistant".to_string(), content.to_string()));
+                }
             }
         }
         self.streaming_assistant = false;
