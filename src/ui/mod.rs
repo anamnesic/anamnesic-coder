@@ -38,7 +38,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use file_search::FileMatch;
 use width::display_width;
 
-const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// Available slash commands, shown in the interactive picker (modern-harness style).
 const SLASH_COMMANDS: &[(&str, &str)] = &[
