@@ -187,6 +187,9 @@ pub struct App {
     pub streaming_assistant: bool,
     /// Unified diff content for modified files (+green / -red).
     pub diff_content: Vec<String>,
+    /// Whether the reasoning panel is expanded (showing full content)
+    /// or collapsed (showing only a summary).
+    pub reasoning_expanded: bool,
     /// Fuzzy file-search overlay state (Ctrl+P): query, ranking and selection.
     pub file_search: bool,
     pub file_search_query: String,
@@ -283,6 +286,7 @@ impl App {
             last_delta_line: None,
             streaming_assistant: false,
             diff_content: Vec::new(),
+            reasoning_expanded: true,
             file_search: false,
             file_search_query: String::new(),
             file_search_selected: 0,
@@ -1143,6 +1147,11 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         let paths = guard.file_search_paths.clone();
                         guard.open_file_search(paths);
                     }
+                    continue;
+                }
+                // Ctrl+T: toggle reasoning panel expand/collapse.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                    guard.reasoning_expanded = !guard.reasoning_expanded;
                     continue;
                 }
                 // The file-search overlay captures all keystrokes while open.
@@ -2158,6 +2167,14 @@ fn flatten_messages(app: &App) -> Vec<Line<'static>> {
         match role.to_ascii_lowercase().as_str() {
             "user" => lines.extend(user_message_lines(content)),
             "assistant" => lines.extend(assistant_message_lines(content)),
+            "thinking" => {
+                if app.reasoning_expanded {
+                    lines.extend(status_message_lines(role, content));
+                } else {
+                    let summary = format!("Thinking ({} chars)", content.len());
+                    lines.extend(status_message_lines("thinking", &summary));
+                }
+            }
             _ => lines.extend(status_message_lines(role, content)),
         }
         lines.push(Line::from(""));
