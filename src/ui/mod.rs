@@ -318,11 +318,11 @@ impl App {
     pub fn feed_text_delta(&mut self, text: &str) {
         const MAX_STREAM_CHARS: usize = 20_000;
         if self.streaming_assistant {
-            if let Some((_, last)) = self.messages.last_mut() {
-                if last.chars().count() < MAX_STREAM_CHARS {
+            if let Some((role, last)) = self.messages.last_mut() {
+                if role == "Assistant" && last.chars().count() < MAX_STREAM_CHARS {
                     last.push_str(text);
+                    return;
                 }
-                return;
             }
             self.streaming_assistant = false;
         }
@@ -333,10 +333,25 @@ impl App {
     /// Accumulate reasoning content deltas into a single live message.
     /// Unlike text deltas, reasoning content is displayed separately
     /// (italic, subdued) and does not count as the assistant's response.
+    /// Flushes to the transcript periodically so thinking appears live.
     pub fn feed_reasoning_delta(&mut self, text: &str) {
         const MAX_REASONING_CHARS: usize = 8_000;
+        const FLUSH_THRESHOLD: usize = 120;
         if self.reasoning.len() < MAX_REASONING_CHARS {
             self.reasoning.push_str(text);
+        }
+        if self.reasoning.len() >= FLUSH_THRESHOLD {
+            self.messages.push(("Thinking".to_string(), self.reasoning.clone()));
+            self.reasoning.clear();
+        }
+    }
+
+    /// Reset reasoning accumulation between tool iterations.
+    /// Call at the start of each new assistant response to avoid
+    /// concatenating reasoning from multiple iterations without a separator.
+    pub fn reset_reasoning(&mut self) {
+        if !self.reasoning.is_empty() {
+            self.reasoning.clear();
         }
     }
 
@@ -957,6 +972,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     }
                     AgentEvent::ReasoningDelta { text } => {
                         a.feed_reasoning_delta(&text);
+                    }
+                    AgentEvent::ResetReasoning => {
+                        a.reset_reasoning();
                     }
                     AgentEvent::Done { message } => {
                         if !a.end_streaming(Some(&message)) {

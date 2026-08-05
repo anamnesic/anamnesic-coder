@@ -61,6 +61,8 @@ pub enum AgentEvent {
     ReasoningDelta {
         text: String,
     },
+    /// Reset reasoning accumulation between tool iterations.
+    ResetReasoning,
     Done {
         message: String,
     },
@@ -120,6 +122,13 @@ impl AgentHooks {
             f(AgentEvent::ReasoningDelta {
                 text: text.to_string(),
             });
+        }
+    }
+
+    /// Reset reasoning accumulation between tool iterations.
+    pub fn reset_reasoning(&self) {
+        if let Some(f) = &self.on_event {
+            f(AgentEvent::ResetReasoning);
         }
     }
 
@@ -356,6 +365,7 @@ async fn run_tool_use_iteration(
     let mut used_tools = false;
 
     for iteration in 0..state.config.max_tool_iterations {
+        hooks.reset_reasoning();
         if hooks.interrupted() {
             let _ = state.refresh_workspace_diff();
             let summary = finalize_transaction(state, hooks, false);
