@@ -1700,7 +1700,7 @@ fn update_info_sections(app: &mut App, _state: &AgentState) {
             } else {
                 app.modified_files
                     .iter()
-                    .map(|f| Span::styled(f.clone(), Style::default().fg(Color::DarkGray)))
+                    .map(|f| Span::styled(f.clone(), Style::default().fg(Color::Gray)))
                     .collect()
             }
         } else {
@@ -1714,7 +1714,7 @@ fn update_info_sections(app: &mut App, _state: &AgentState) {
                     } else if line.starts_with("@@") {
                         Style::default().fg(Color::Cyan)
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(Color::Gray)
                     };
                     Span::styled(line.clone(), style)
                 })
@@ -1772,9 +1772,9 @@ fn draw<B: ratatui::backend::Backend>(
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(left_txt, Style::default().fg(Color::DarkGray)),
+            Span::styled(left_txt, Style::default().fg(Color::Gray)),
             Span::styled(" ".repeat(pad), Style::default()),
-            Span::styled(right_txt, Style::default().fg(Color::DarkGray)),
+            Span::styled(right_txt, Style::default().fg(Color::Gray)),
         ]));
         f.render_widget(header, page[0]);
         // Fixed status line: shows current status text (warnings, planning, retries)
@@ -1793,7 +1793,7 @@ fn draw<B: ratatui::backend::Backend>(
                 format!("{prompt} "),
                 Style::default()
                     .fg(if app.loading {
-                        Color::DarkGray
+                        Color::Gray
                     } else {
                         Color::Green
                     })
@@ -1832,12 +1832,12 @@ fn draw<B: ratatui::backend::Backend>(
         let bottom = Paragraph::new(Line::from(vec![
             Span::styled(
                 bottom_left,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
             Span::styled(" ".repeat(bottom_pad), Style::default()),
             Span::styled(
                 bottom_right,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ]));
         f.render_widget(bottom, page[4]);
@@ -1866,7 +1866,7 @@ fn draw<B: ratatui::backend::Backend>(
                     let num = scroll + i + 1;
                     let prefix = format!("{:>width$} │ ", num, width = line_num_width);
                     Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                        Span::styled(prefix, Style::default().fg(Color::Gray)),
                         Span::styled(line.clone(), Style::default()),
                     ])
                 })
@@ -1908,7 +1908,7 @@ fn draw<B: ratatui::backend::Backend>(
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!("  {desc}"), Style::default().fg(Color::Gray)),
                         ]))
                     })
                     .collect::<Vec<_>>();
@@ -1977,7 +1977,7 @@ fn draw<B: ratatui::backend::Backend>(
             list_state.select(Some(selected));
             let list = List::new(items)
                 .block(Block::default().title(title).borders(Borders::ALL))
-                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_style(Style::default().bg(Color::Gray))
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
         }
@@ -2060,7 +2060,7 @@ fn draw<B: ratatui::backend::Backend>(
                 };
                 lines.push(Line::from(Span::styled(
                     hint,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )));
             } else {
                 for (i, m) in app.file_search_results.iter().enumerate() {
@@ -2108,7 +2108,7 @@ fn draw<B: ratatui::backend::Backend>(
                 Line::from(Span::raw(request.summary.clone())),
                 Line::from(Span::styled(
                     request.risk.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )),
                 Line::from(Span::styled(
                     "a: allow once   s: allow for session   d/Esc: deny",
@@ -2284,8 +2284,8 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
         ),
         "tool" => (
             "↳ ",
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Gray),
             false,
         ),
         "file" => (
@@ -2297,13 +2297,13 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
         "verify" => (
             "",
             Style::default(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
             false,
         ),
         "workspace" => (
             "",
             Style::default(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
             false,
         ),
         "approval" => (
@@ -2316,7 +2316,7 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
         _ => (
             "",
             Style::default(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
             true,
         ),
     };
@@ -2379,7 +2379,7 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             Event::Code(t) => {
                 spans.push(Span::styled(
                     format!(" {} ", t.as_ref()),
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                    Style::default().fg(Color::Yellow).bg(Color::Gray),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -2423,7 +2423,7 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
                 _ => {}
             },
             Event::Rule => {
-                spans.push(Span::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled("─".repeat(40), Style::default().fg(Color::Gray)));
             }
             _ => {}
         }
