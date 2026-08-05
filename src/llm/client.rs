@@ -1319,4 +1319,127 @@ mod tests {
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["tools"][0]["function"]["name"], "run_command");
     }
+
+#[tokio::test]
+    async fn stream_chat_meta_parses_sse_content_deltas() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\r\ndata: [DONE]\r\n",
+                ))
+            .mount(&mock)
+            .await;
+
+        let client = CloudClient::new(&mock.uri(), "k");
+        let mut tokens = Vec::new();
+        let result = client
+            .stream_chat_meta(
+                "glm-5.2",
+                vec![serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                None,
+                &mut |t| tokens.push(t.to_string()),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let completion = result.unwrap();
+        assert_eq!(completion.content, "Hello");
+        assert_eq!(tokens, vec!["Hello"]);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_meta_parses_sse_tool_call_deltas() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"}}]}}]}\r\ndata: [DONE]\r\n",
+                ))
+            .mount(&mock)
+            .await;
+
+        let client = CloudClient::new(&mock.uri(), "k");
+        let mut tokens = Vec::new();
+        let result = client
+            .stream_chat_meta(
+                "glm-5.2",
+                vec![serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                None,
+                &mut |t| tokens.push(t.to_string()),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let completion = result.unwrap();
+        assert!(completion.content.is_empty());
+        assert!(tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_meta_returns_usage_from_sse() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\r\ndata: [DONE]\r\n",
+                ))
+            .mount(&mock)
+            .await;
+
+        let client = CloudClient::new(&mock.uri(), "k");
+        let mut tokens = Vec::new();
+        let result = client
+            .stream_chat_meta(
+                "glm-5.2",
+                vec![serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                None,
+                &mut |t| tokens.push(t.to_string()),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let completion = result.unwrap();
+        assert_eq!(completion.content, "ok");
+        assert_eq!(tokens, vec!["ok"]);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_meta_emits_token_usage_event() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\r\ndata: [DONE]\r\n",
+                ))
+            .mount(&mock)
+            .await;
+
+        let client = CloudClient::new(&mock.uri(), "k");
+        let mut tokens = Vec::new();
+        let result = client
+            .stream_chat_meta(
+                "glm-5.2",
+                vec![serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                None,
+                &mut |t| tokens.push(t.to_string()),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let completion = result.unwrap();
+        assert_eq!(completion.content, "done");
+    }
 }
