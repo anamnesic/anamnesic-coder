@@ -378,9 +378,7 @@ async fn backoff_sleep(attempt: u32) {
 
 pub fn build_default_chain(base_url: &str, nim_api_key: String, nim_model: String) -> FallbackChain {
     let nim = Arc::new(NimProvider::new(base_url, nim_api_key, nim_model, 40.0));
-    let local = Arc::new(LocalProvider::new("http://localhost:11434".into(), "nemotron-3-nano".into()));
-
-    FallbackChain::new(vec![nim, local])
+    FallbackChain::new(vec![nim])
 }
 
 #[cfg(test)]

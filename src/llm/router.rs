@@ -265,8 +265,7 @@ impl LlmRouter {
             .await
     }
 
-    /// Try the primary model with retries; on any error, fall back to
-    /// a same-tier model (if resolvable) and retry once.
+    /// Executes model generation with exponential backoff retry on transient HTTP errors (429/5xx).
     pub async fn generate_with_retry_with_fallback(
         &self,
         model: &str,
@@ -274,24 +273,7 @@ impl LlmRouter {
         tools: Option<&Vec<ToolDef>>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<String> {
-        match self
-            .generate_with_retry(model, prompt, tools, response_format)
-            .await
-        {
-            Ok(text) => Ok(text),
-            Err(primary_err) => {
-                let Some(fb_model) = self.resolve_fallback(model) else {
-                    return Err(primary_err);
-                };
-                self.generate_with_retry(&fb_model, prompt, tools, response_format)
-                    .await
-                    .map_err(|fb_err| {
-                        anyhow::anyhow!(
-                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
-                        )
-                    })
-            }
-        }
+        self.generate_with_retry(model, prompt, tools, response_format).await
     }
 
     pub async fn chat(
@@ -357,8 +339,7 @@ impl LlmRouter {
             .await
     }
 
-    /// Try the primary model; on any error, automatically fall back to
-    /// a same-tier model (if resolvable) and retry once.
+    /// Chat with explicit `tool_choice` with exponential backoff retry.
     pub async fn chat_meta_with_fallback(
         &self,
         model: &str,
@@ -367,26 +348,7 @@ impl LlmRouter {
         tool_choice: Option<&ToolChoice>,
         response_format: Option<&ResponseFormat>,
     ) -> Result<ChatCompletion> {
-        match self
-            .chat_meta_with_choice(model, messages.clone(), tools, tool_choice, response_format)
-            .await
-        {
-            Ok(completion) => Ok(completion),
-            Err(primary_err) => {
-                let Some(fb_model) = self.resolve_fallback(model) else {
-                    return Err(primary_err);
-                };
-                // The fallback model may not support tools; capability
-                // filtering is re-applied for its own id.
-                self.chat_meta_with_choice(&fb_model, messages, tools, tool_choice, response_format)
-                    .await
-                    .map_err(|fb_err| {
-                        anyhow::anyhow!(
-                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
-                        )
-                    })
-            }
-        }
+        self.chat_meta_with_choice(model, messages, tools, tool_choice, response_format).await
     }
 
     pub async fn stream(
@@ -404,11 +366,7 @@ impl LlmRouter {
             .await
     }
 
-    /// Stream a conversation response with the same same-tier fallback as
-    /// [`Self::chat_meta_with_fallback`]: `on_token` receives each content
-    /// delta while a normalized [`ChatCompletion`] is returned. The fallback
-    /// attempt re-streams from scratch, so a failed primary call never leaves
-    /// partial text behind in the final completion.
+    /// Stream a conversation response on the active model with exponential backoff retry.
     pub async fn chat_meta_stream_with_fallback(
         &self,
         model: &str,
@@ -421,10 +379,10 @@ impl LlmRouter {
     ) -> Result<ChatCompletion> {
         let client = self.client_for(model)?;
         let (_, api_id) = self.resolve(model);
-        match client
+        client
             .chat_meta_stream(
                 &api_id,
-                messages.clone(),
+                messages,
                 tools,
                 tool_choice,
                 response_format,
@@ -432,32 +390,6 @@ impl LlmRouter {
                 on_reasoning,
             )
             .await
-        {
-            Ok(completion) => Ok(completion),
-            Err(primary_err) => {
-                let Some(fb_model) = self.resolve_fallback(model) else {
-                    return Err(primary_err);
-                };
-                let fb_client = self.client_for(&fb_model)?;
-                let (_, fb_api_id) = self.resolve(&fb_model);
-                fb_client
-                    .chat_meta_stream(
-                        &fb_api_id,
-                        messages,
-                        tools,
-                        tool_choice,
-                        response_format,
-                        on_token,
-                        None,
-                    )
-                    .await
-                    .map_err(|fb_err| {
-                        anyhow::anyhow!(
-                            "{primary_err}\n  [fallback {fb_model} also failed: {fb_err}]"
-                        )
-                    })
-            }
-        }
     }
 }
 
