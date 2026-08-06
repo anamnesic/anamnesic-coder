@@ -854,15 +854,6 @@ fn execute_read_only(
             )),
             None => ToolExecutionResult::output("missing required argument: pattern"),
         },
-        "symbol_search" => match string_arg("query") {
-            Some(query) => {
-                let limit = usize_arg("limit").unwrap_or(50);
-                let results = crate::tools::symbol::search_symbols(&context.workspace, query, limit);
-                let formatted = crate::tools::symbol::format_symbols(&results);
-                ToolExecutionResult::output(truncate_tool_output(&formatted, cap))
-            }
-            None => ToolExecutionResult::output("missing required argument: query"),
-        },
         "git_status" => {
             ToolExecutionResult::output(truncate_tool_output(&context.git.status(), cap))
         }

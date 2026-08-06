@@ -142,6 +142,23 @@ mod tests {
         assert!(!std::path::Path::new("/etc/newfile").exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn rejects_symlink_escape_outside_workspace() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("link")).ok();
+        let target = workspace.join("link").join("evil");
+        // On Windows, symlinks require admin/Developer Mode; skip if not supported
+        if std::os::windows::fs::symlink_dir(r"C:\Windows", &target).is_err() {
+            eprintln!("Skipping symlink test: insufficient privileges");
+            return;
+        }
+        let tools = FileTools::new(workspace.clone());
+        assert!(tools.read_file("link/evil/system32/drivers/etc/hosts").is_none());
+        assert!(tools.write_file("link/evil/newfile", "x").is_err());
+        assert!(!std::path::Path::new(r"C:\Windows\newfile").exists());
+    }
+
     #[test]
     fn rejects_deep_path_traversal_and_injection_strings() {
         let tools = FileTools::new(temp_workspace());

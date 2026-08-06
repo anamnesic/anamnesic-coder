@@ -1,4 +1,4 @@
 pub mod scanner;
 pub mod context;
 
-pub use scanner::{RepoMapGenerator, SymbolEntry, SymbolIndex};
+pub use scanner::{RepoMapGenerator, SymbolIndex};
