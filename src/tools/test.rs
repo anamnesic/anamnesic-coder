@@ -107,6 +107,18 @@ pub fn run_verification_command(command: &str, config: &Config) -> VerificationR
     }
 }
 
+/// Run `cargo clippy` (short output) as a static-analysis gate for Rust
+/// workspaces. Returns `None` when no Cargo.toml is present.
+pub fn run_lint(config: &Config) -> Option<VerificationResult> {
+    if !config.workspace_dir.join("Cargo.toml").exists() {
+        return None;
+    }
+    Some(run_verification_command(
+        "cargo clippy --message-format short",
+        config,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -441,26 +441,6 @@ async fn execute_step_inner(
                 hooks.warn(&format!("  ✗ answer failed: {e}"));
             }
         }
-        "git_init" => {
-            if let Err(message) = hooks.require_approval(
-                state.config.write_tool_policy,
-                "git_init",
-                "initialize a git repository and stage all files",
-                "repository mutation",
-            ) {
-                hooks.warn(&format!("  ✗ {message}"));
-                state.record_blocked_action(format!("git_init: {message}"));
-                return;
-            }
-            if !state.git.is_git_repo() {
-                state.git.init();
-                state.git.branch("main");
-                state.git.add(".");
-                hooks.note("  Git repo initialized");
-            } else {
-                hooks.note("  Git repo already exists");
-            }
-        }
         "git_commit" => {
             if let Err(message) = hooks.require_approval(
                 state.config.write_tool_policy,

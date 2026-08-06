@@ -1,4 +1,5 @@
 use crossterm::{
+    cursor::Show,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
@@ -1206,9 +1207,35 @@ fn run_input(
     app.clear_input();
 }
 
+/// Owns a second handle to stdout and restores the terminal to its pre-app
+/// state on ANY exit path — normal return, early `?` error, or panic
+/// unwinding. Without this, a crash mid-turn leaves the user's terminal stuck
+/// in raw mode / the alternate screen until they close the tab.
+struct TerminalGuard {
+    stdout: io::Stdout,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = execute!(
+            self.stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        );
+    }
+}
+
 pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>> {
-    // Setup terminal
+    // Setup terminal. The guard is created right after raw mode is enabled so
+    // any failure between here and the main loop (EnterAlternateScreen,
+    // Terminal::new, early returns) still restores the terminal. It runs on
+    // drop: normal exit, propagated error, or panic unwinding.
     enable_raw_mode()?;
+    let _guard = TerminalGuard {
+        stdout: io::stdout(),
+    };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1264,6 +1291,9 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     let task_rx = Arc::new(Mutex::new(task_rx));
     let (auto_test_tx, auto_test_rx) = mpsc::channel::<AutoTestProbeEvent>();
     let mut start = Instant::now();
+    // Last terminal size seen by the resize handler, used to clear the screen
+    // once per actual resize (crossterm can deliver batches of resize events).
+    let mut last_size: (u16, u16) = (0, 0);
 
     // Spawn worker thread loop to execute background tasks continuously
     {
@@ -2082,6 +2112,15 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         }
                     }
                     _ => {}
+                }
+            }
+            // On a real resize, force a full repaint. ratatui's Terminal::draw
+            // already autoresizes every frame, but clearing once per resize
+            // avoids stale glyphs from backends that deliver resize batches.
+            Ok(Event::Resize(width, height)) if width > 0 && height > 0 => {
+                if (width, height) != last_size {
+                    last_size = (width, height);
+                    let _ = terminal.clear();
                 }
             }
             Ok(_) => {}
@@ -3048,8 +3087,22 @@ fn status_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
     out
 }
 
+/// Insert a block-level separator span unless one was just inserted (so
+/// stacked block boundaries like `End(List)` + `Start(Paragraph)` collapse to
+/// a single break instead of producing empty rows). Never inserts a leading
+/// break for the first block of the message.
+fn push_block_sep(spans: &mut Vec<Span<'static>>, sep: &str) {
+    if spans.is_empty() {
+        return;
+    }
+    if spans.last().is_some_and(|s| s.content.ends_with('\n')) {
+        return;
+    }
+    spans.push(Span::raw(sep.to_string()));
+}
+
 fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
-    use pulldown_cmark::{Event, Parser, Tag, TagEnd, Options};
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -3093,9 +3146,26 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
             }
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    if !spans.is_empty() && !in_code {
-                        spans.push(Span::raw("\n\n".to_string()));
+                    if !in_code {
+                        push_block_sep(&mut spans, "\n\n");
                     }
+                }
+                // Block-level containers that pulldown-cmark does NOT signal
+                // with SoftBreak/Paragraph events: list items and headings
+                // only emit `Text` between `Start`/`End`, so without explicit
+                // separators consecutive items render glued on one line.
+                Tag::Heading { .. }
+                | Tag::List(_)
+                | Tag::Item
+                | Tag::BlockQuote(_)
+                | Tag::FootnoteDefinition(_)
+                | Tag::DefinitionList
+                | Tag::DefinitionListTitle
+                | Tag::DefinitionListDefinition
+                | Tag::Table(_)
+                | Tag::TableHead
+                | Tag::TableRow => {
+                    push_block_sep(&mut spans, "\n");
                 }
                 Tag::CodeBlock(_) => {
                     in_code = true;
@@ -3118,6 +3188,18 @@ fn render_markdown_lines(text: &str) -> Option<Vec<Span<'static>>> {
                     ));
                     in_code = false;
                     code_text.clear();
+                }
+                TagEnd::Heading(_)
+                | TagEnd::List(_)
+                | TagEnd::BlockQuote(_)
+                | TagEnd::FootnoteDefinition
+                | TagEnd::DefinitionList
+                | TagEnd::DefinitionListTitle
+                | TagEnd::DefinitionListDefinition
+                | TagEnd::Table
+                | TagEnd::TableHead
+                | TagEnd::TableRow => {
+                    push_block_sep(&mut spans, "\n");
                 }
                 TagEnd::Strong => in_bold = false,
                 TagEnd::Emphasis => in_italic = false,
@@ -3791,6 +3873,89 @@ mod tests {
     }
 
     #[test]
+    fn markdown_list_items_split_into_separate_lines() {
+        let cases = [
+            (
+                "**Tecnologias principais:**\n- React Query\n- **Backend:** Node.js",
+                "React Query",
+                "Backend:",
+            ),
+            (
+                "**Funcionalidades visíveis:**\n- Persistência em localStorage\n- **UI:** tema claro/escuro\n- Feedback háptico \"Theme Lab\"",
+                "localStorage",
+                "UI:",
+            ),
+            (
+                "**Auth:**\n- validação\n- **UI:** tema",
+                "validação",
+                "Auth:",
+            ),
+        ];
+        for (md, a, b) in cases {
+            let mut app = App::new("model", "off");
+            app.add_message("Assistant", md);
+            let lines = flatten_messages(&app);
+            let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            let full = texts.join("|");
+            assert!(
+                !full.contains(&format!("{a}{b}")),
+                "list items glued: {full}"
+            );
+            assert!(
+                !full.contains(&format!("{b}{a}")),
+                "list items glued: {full}"
+            );
+            // Both fragments must be present on their own rendered lines.
+            for frag in [a, b] {
+                assert!(
+                    texts.iter().any(|t| t.contains(frag)),
+                    "missing {frag} in: {full}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_soft_breaks_keep_line_breaks() {
+        let mut app = App::new("model", "off");
+        app.add_message("Assistant", "linha um\nlinha dois\nlinha três");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let full = texts.join("|");
+        assert!(texts[0].contains("linha um"), "got: {full}");
+        assert!(texts[1].contains("linha dois"), "got: {full}");
+        assert!(texts[2].contains("linha três"), "got: {full}");
+    }
+
+    #[test]
+    fn markdown_paragraph_boundary_does_not_glue() {
+        let mut app = App::new("model", "off");
+        app.add_message(
+            "Assistant",
+            "**Tecnologias principais:**\nReact Query\n\n**Backend:**\nNode.js",
+        );
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let full = texts.join("|");
+        assert!(
+            !full.contains("React Query**Backend:**"),
+            "glued across paragraph boundary: {full}"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_splits_its_own_line() {
+        let mut app = App::new("model", "off");
+        app.add_message("Assistant", "## Seção\nconteúdo\n## Outra\nmais");
+        let lines = flatten_messages(&app);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let full = texts.join("|");
+        assert!(!full.contains("Seçãoconteúdo"), "glued heading: {full}");
+        assert!(texts.iter().any(|t| t.contains("Seção")), "got: {full}");
+        assert!(texts.iter().any(|t| t.contains("mais")), "got: {full}");
+    }
+
+    #[test]
     fn reflow_renders_long_line_within_width() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -3827,5 +3992,44 @@ mod tests {
             }
         }
         assert!(found_x_beyond_row0, "reflow did not wrap long line");
+    }
+
+    #[test]
+    fn resize_rerenders_without_panic_and_respects_new_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new("model", "off");
+        app.streaming_assistant = false;
+        app.messages.push(("Assistant".to_string(), "word ".repeat(60)));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw(&mut terminal, &app).unwrap();
+        // Simulate the resize handler: shrink, clear, then redraw (the real loop
+        // calls terminal.clear() once per Event::Resize).
+        terminal.backend_mut().resize(30, 24);
+        terminal.clear().unwrap();
+        draw(&mut terminal, &app).unwrap();
+        let buf = terminal.backend().buffer();
+        // Content must be present and reflowed at the new width. Wrapped cells
+        // hold single characters, so count 'w' (only present in the message).
+        let mut w_count = 0;
+        for y in 0..24 {
+            for x in 0..30 {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "w") {
+                    w_count += 1;
+                }
+            }
+        }
+        assert!(w_count > 5, "message not rendered after resize+clear+redraw");
+        // Nothing may render outside the resized buffer width (draw must not
+        // have written stale glyphs beyond column 30).
+        for y in 0..24 {
+            for x in 30..80 {
+                assert!(
+                    !buf.cell((x, y)).is_some_and(|c| !c.symbol().trim().is_empty()),
+                    "cell at {x},{y} rendered outside the resized width"
+                );
+            }
+        }
     }
 }

@@ -9,7 +9,7 @@ impl PlannerPrompt {
         r#"You are a coding task planner. Given a task and context, output a JSON plan.
 Each step has a type and description.
 
-Step types: read_file, edit_file, create_file, search_code, run_command, run_tests, answer, git_init, git_commit, git_status, done
+Step types: read_file, edit_file, create_file, search_code, run_command, run_tests, answer, git_commit, git_status, done
 
 Rules:
 - create_file, edit_file and read_file MUST include "filename" (relative path, e.g. "src/calc.rs").

@@ -37,7 +37,8 @@ Routing per model id:
 4. everything else → local.
 
 `/provider` now rebuilds the cloud backend live; the default provider is
-`ollama-cloud`, and `OLLAMA_API_KEY` lives in the git-ignored `.env`. The agent
+`ollama-cloud`, and `OLLAMA_API_KEY` lives in the global `~/.anamnesic/settings.json`
+(Claude Code-style `env` block). The agent
 loop, repl and TUI all use the router — planner, executor, summarizer and the
 tool-use loop all resolve through `LlmRouter`, so the selected model drives the
 whole lifecycle and retries reuse the same resolved client.

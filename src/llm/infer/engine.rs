@@ -219,6 +219,10 @@ impl InferenceEngine {
         { false }
     }
 
+    pub fn n_embd(&self) -> usize {
+        self.model.n_embd as usize
+    }
+
 
     fn forward(&mut self, token_id: u32, logits: &mut [f32]) -> Result<()> {
         let n_embd = self.model.n_embd as usize;
@@ -302,6 +306,31 @@ impl InferenceEngine {
     pub fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_k: usize) -> Result<String> {
         let (text, _) = self.generate_inner(prompt, max_tokens, temperature, top_k, true)?;
         Ok(text)
+    }
+
+    /// Embed `text` into a normalized vector using the final layer's hidden
+    /// state of the last token (last-token pooling, matching Qwen3-Embedding
+    /// and Jina v5 retrieval models). The KV cache is reset so the engine
+    /// remains reusable for later generation or embedding calls.
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let tokens = self.tokenizer.encode(text, self.max_seq_len.saturating_sub(1));
+        anyhow::ensure!(!tokens.is_empty(), "failed to tokenize text for embedding");
+        self.n_past = 0;
+        let n_vocab = self.model.n_vocab as usize;
+        let mut logits = vec![0.0f32; n_vocab];
+        for &token in &tokens {
+            self.forward(token, &mut logits)?;
+        }
+        let n_embd = self.model.n_embd as usize;
+        let mut embedding = self.act[..n_embd].to_vec();
+        self.n_past = 0;
+        let norm = embedding.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for value in embedding.iter_mut() {
+                *value /= norm;
+            }
+        }
+        Ok(embedding)
     }
 
     /// Silent generation for benchmarking. Returns (output_text, tokens_generated).

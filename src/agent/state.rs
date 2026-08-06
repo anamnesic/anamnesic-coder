@@ -8,6 +8,19 @@ use crate::tools::test::{VerificationResult, VerificationStatus};
 use crate::tools::transaction::{WorkspaceDiff, WorkspaceTransaction};
 use std::collections::BTreeSet;
 
+/// A single tracked item in the agent's session checklist (`todo` tool).
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub text: String,
+    pub done: bool,
+}
+
+impl TodoItem {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into(), done: false }
+    }
+}
+
 pub struct AgentState {
     pub retries: usize,
     pub repair_attempt: usize,
@@ -38,6 +51,12 @@ pub struct AgentState {
     pub last_persisted_seq: Option<u64>,
     /// Compaction summary already reflected in the persisted session.
     pub last_persisted_summary: Option<String>,
+    /// Accumulated USD cost of cloud LLM calls in this turn (local = 0).
+    pub turn_cost_usd: f64,
+    /// Session task checklist maintained via the `todo` tool.
+    pub todos: Vec<TodoItem>,
+    /// Local embedding engine for `memory_search` (lazily loads the GGUF model).
+    pub embedder: crate::llm::embedder::Embedder,
 }
 
 impl AgentState {
@@ -45,6 +64,10 @@ impl AgentState {
         config.workspace_dir =
             crate::tools::fs::normalize_workspace_path(&config.workspace_dir);
         let long_memory = LongTermMemory::new(config.memory_dir.join("memory.db"))?;
+        let embedder = crate::llm::embedder::Embedder::new(
+            &config.models_dir,
+            config.embedding_model.as_deref(),
+        );
         Ok(AgentState {
             retries: 0,
             repair_attempt: 0,
@@ -66,6 +89,9 @@ impl AgentState {
             session_persist: true,
             last_persisted_seq: None,
             last_persisted_summary: None,
+            turn_cost_usd: 0.0,
+            todos: Vec::new(),
+            embedder,
         })
     }
 
@@ -78,6 +104,7 @@ impl AgentState {
         self.blocked_actions.clear();
         self.last_diff = WorkspaceDiff::default();
         self.dirty = false;
+        self.turn_cost_usd = 0.0;
         self.transaction = Some(WorkspaceTransaction::begin(
             self.config.workspace_dir.clone(),
             self.config.transaction_max_bytes,
@@ -152,6 +179,8 @@ impl AgentState {
         self.session_id = None;
         self.last_persisted_seq = None;
         self.last_persisted_summary = None;
+        self.turn_cost_usd = 0.0;
+        self.todos.clear();
     }
 
     pub fn record_blocked_action(&mut self, action: impl Into<String>) {
@@ -215,7 +244,44 @@ impl AgentState {
         let context = summary.unwrap_or_default();
         self.long_memory
             .update_session(id, &title, &context, &self.config.coder_model)?;
+
+        if self.config.memory_indexing {
+            self.index_persisted_records(id, &records);
+        }
         Ok(())
+    }
+
+    /// Embed freshly persisted assistant messages into the vector store so
+    /// `memory_search` can recall them across sessions. Best-effort: indexing
+    /// failures are logged and skipped, never fatal.
+    fn index_persisted_records(&mut self, session_id: i64, records: &[(i64, String, String)]) {
+        if !self.embedder.is_available() {
+            return;
+        }
+        use crate::llm::embedder::EmbedKind;
+        let workspace = self.config.workspace_dir.display().to_string();
+        for (_, role, content) in records {
+            if role != "assistant" {
+                continue;
+            }
+            let content = content.trim();
+            if content.len() < 16 || content.len() > 2000 {
+                continue;
+            }
+            match self.embedder.embed(content, EmbedKind::Passage) {
+                Ok(embedding) => {
+                    if let Err(error) =
+                        self.long_memory
+                            .store_vector(session_id, &workspace, content, &embedding)
+                    {
+                        log::debug!("memory indexing store failed: {error}");
+                    }
+                }
+                Err(error) => {
+                    log::debug!("memory indexing embed failed: {error}");
+                }
+            }
+        }
     }
 
     /// Load a saved conversation into the working session, restoring the full

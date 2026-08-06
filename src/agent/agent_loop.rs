@@ -1,6 +1,6 @@
 use crate::agent::executor;
 use crate::agent::planner;
-use crate::agent::state::AgentState;
+use crate::agent::state::{AgentState, TodoItem};
 use crate::config::settings::ApprovalPolicy;
 use crate::llm::prompt::CoderPrompt;
 use crate::llm::router::LlmRouter;
@@ -431,10 +431,20 @@ async fn run_tool_use_iteration(
             }
         };
         if let Some(usage) = &completion.usage {
-            hooks.note(&format!(
-                "  [usage] {} prompt + {} completion = {} total tokens",
-                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-            ));
+            let cost = client.estimate_cost(model, usage.prompt_tokens, usage.completion_tokens);
+            state.turn_cost_usd += cost.total();
+            let line = if cost.total() > 0.0 {
+                format!(
+                    "  [usage] {} prompt + {} completion = {} total tokens (${:.4})",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, cost.total()
+                )
+            } else {
+                format!(
+                    "  [usage] {} prompt + {} completion = {} total tokens",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                )
+            };
+            hooks.note(&line);
             hooks.emit(AgentEvent::TokenUsage {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
@@ -621,6 +631,18 @@ fn audited_final_text(state: &AgentState, response: &str) -> String {
             }
         }
     }
+    if state.turn_cost_usd > 0.0 {
+        final_text.push_str(&format!("\nEstimated cost: ${:.4}", state.turn_cost_usd));
+    }
+    let pending: Vec<&str> = state
+        .todos
+        .iter()
+        .filter(|item| !item.done)
+        .map(|item| item.text.as_str())
+        .collect();
+    if !pending.is_empty() {
+        final_text.push_str(&format!("\nOpen todos:\n- {}", pending.join("\n- ")));
+    }
     final_text
 }
 
@@ -655,9 +677,22 @@ fn connect_mcp_clients(state: &mut AgentState, hooks: &AgentHooks) {
 fn try_mcp_tool(
     state: &mut AgentState,
     tc: &crate::llm::client::ToolCall,
+    hooks: &AgentHooks,
 ) -> Option<ToolExecutionResult> {
     let args = tool_arguments(tc).ok()?;
     let name = &tc.function.name;
+    if !state.mcp_clients.iter().any(|client| client.has_tool(name)) {
+        return None;
+    }
+    if let Err(message) = hooks.require_approval(
+        state.config.command_tool_policy,
+        name,
+        "external MCP tool call",
+        "may mutate files or run commands outside this workspace",
+    ) {
+        state.record_blocked_action(format!("{name}: {message}"));
+        return Some(ToolExecutionResult::output(message));
+    }
     for client in &mut state.mcp_clients {
         if let Ok(result) = client.call_tool(name, &args) {
             return Some(ToolExecutionResult {
@@ -990,6 +1025,146 @@ fn execute_tool(
                 verification: Some(verification),
             }
         }
+        "http_fetch" => match string_arg("url") {
+            Some(url) => {
+                if let Err(message) = hooks.require_approval(
+                    state.config.command_tool_policy,
+                    "http_fetch",
+                    url,
+                    "fetches a URL over the network",
+                ) {
+                    state.record_blocked_action(format!("http_fetch {url}: {message}"));
+                    return ToolExecutionResult::output(message);
+                }
+                let max_bytes = args
+                    .get("max_bytes")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize)
+                    .unwrap_or(state.config.max_tool_output_bytes);
+                let timeout = args
+                    .get("timeout_secs")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(30);
+                match crate::tools::web::http_fetch(url, max_bytes, timeout) {
+                    Ok(text) => ToolExecutionResult::output(truncate_tool_output(&text, cap)),
+                    Err(error) => ToolExecutionResult::output(format!("fetch failed: {error}")),
+                }
+            }
+            None => ToolExecutionResult::output("missing required argument: url"),
+        },
+        "web_search" => match string_arg("query") {
+            Some(query) => {
+                if let Err(message) = hooks.require_approval(
+                    state.config.command_tool_policy,
+                    "web_search",
+                    query,
+                    "searches the web (SearXNG or DuckDuckGo)",
+                ) {
+                    state.record_blocked_action(format!("web_search {query}: {message}"));
+                    return ToolExecutionResult::output(message);
+                }
+                let max_results = args
+                    .get("max_results")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize)
+                    .unwrap_or(8);
+                let timeout = args
+                    .get("timeout_secs")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(30);
+                match crate::tools::web::web_search(query, max_results, timeout) {
+                    Ok(text) => ToolExecutionResult::output(truncate_tool_output(&text, cap)),
+                    Err(error) => ToolExecutionResult::output(format!("search failed: {error}")),
+                }
+            }
+            None => ToolExecutionResult::output("missing required argument: query"),
+        },
+        "todo" => {
+            let op = string_arg("op").unwrap_or("list");
+            let text = string_arg("text").unwrap_or("");
+            let index = args
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            match op {
+                "add" => {
+                    if text.trim().is_empty() {
+                        ToolExecutionResult::output("missing required argument: text")
+                    } else {
+                        let position = state.todos.len();
+                        state.todos.push(TodoItem::new(text));
+                        ToolExecutionResult::output(format!("todo {position}: {text}"))
+                    }
+                }
+                "complete" | "remove" => {
+                    let position = match index {
+                        Some(i) => i.checked_sub(1),
+                        None => state.todos.iter().position(|item| item.text == text),
+                    };
+                    match position {
+                        Some(pos) if pos < state.todos.len() => {
+                            if op == "complete" {
+                                let done = state.todos[pos].text.clone();
+                                state.todos[pos].done = true;
+                                ToolExecutionResult::output(format!("completed todo: {done}"))
+                            } else {
+                                let removed = state.todos.remove(pos);
+                                ToolExecutionResult::output(format!("removed todo: {}", removed.text))
+                            }
+                        }
+                        _ => ToolExecutionResult::output(
+                            "todo not found (pass 1-based index or matching text)",
+                        ),
+                    }
+                }
+                "clear" => {
+                    let count = state.todos.len();
+                    state.todos.clear();
+                    ToolExecutionResult::output(format!("cleared {count} todo(s)"))
+                }
+                _ => ToolExecutionResult::output(todos_display(&state.todos)),
+            }
+        }
+        "memory_search" => {
+            let Some(query) = string_arg("query") else {
+                return ToolExecutionResult::output("missing required argument: query");
+            };
+            let k = args
+                .get("k")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(5);
+            use crate::llm::embedder::EmbedKind;
+            match state.embedder.embed(query, EmbedKind::Query) {
+                Err(error) => ToolExecutionResult::output(format!(
+                    "embedding unavailable: {error}"
+                )),
+                Ok(embedding) => match state.long_memory.search_vectors(&embedding, k) {
+                    Err(error) => {
+                        ToolExecutionResult::output(format!("memory search failed: {error}"))
+                    }
+                    Ok(hits) if hits.is_empty() => {
+                        ToolExecutionResult::output("No memory matches.")
+                    }
+                    Ok(hits) => {
+                        let lines: Vec<String> = hits
+                            .iter()
+                            .enumerate()
+                            .map(|(i, hit)| {
+                                format!(
+                                    "{}. [score {:.3}] {}\n   (source: {})",
+                                    i + 1,
+                                    hit.score,
+                                    hit.text,
+                                    hit.source
+                                )
+                            })
+                            .collect();
+                        ToolExecutionResult::output(lines.join("\n\n"))
+                    }
+                },
+            }
+        }
         "task" => {
             let Some(task) = string_arg("task") else {
                 return ToolExecutionResult::output("missing required argument: task");
@@ -1007,6 +1182,7 @@ fn execute_tool(
                 };
                 let task = task.to_string();
                 let model = model.to_string();
+                let sub_approval = hooks.on_approval.clone();
                 thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async move {
@@ -1029,7 +1205,7 @@ fn execute_tool(
                             })),
                             on_tool_call_delta: None,
                             on_text_delta: None,
-                            on_approval: None,
+                            on_approval: sub_approval,
                             interrupt: None,
                         };
                         let _ = run_agent_loop_with_hooks(
@@ -1055,7 +1231,7 @@ fn execute_tool(
                 }
             }
         _ => {
-            if let Some(result) = try_mcp_tool(state, tc) {
+            if let Some(result) = try_mcp_tool(state, tc, hooks) {
                 result
             } else {
                 ToolExecutionResult::output(format!("Unknown tool: {}", tc.function.name))
@@ -1081,6 +1257,21 @@ fn verification_action(state: &AgentState) -> VerificationAction {
     }
 }
 
+fn todos_display(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "No todos yet.".to_string();
+    }
+    todos
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mark = if item.done { "[x]" } else { "[ ]" };
+            format!("{}. {} {}", i + 1, mark, item.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn automatic_verification(state: &AgentState) -> VerificationResult {
     match state
         .config
@@ -1088,7 +1279,18 @@ fn automatic_verification(state: &AgentState) -> VerificationResult {
         .denial_message("automatic verification")
     {
         Some(message) => VerificationResult::unavailable(message),
-        None => test::run_tests("", &state.config),
+        None => {
+            let base = test::run_tests("", &state.config);
+            if !state.config.lint_on_mutation {
+                return base;
+            }
+            if let Some(lint) = test::run_lint(&state.config) {
+                if !lint.passed() {
+                    return lint;
+                }
+            }
+            base
+        }
     }
 }
 
@@ -1405,6 +1607,53 @@ fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
                 serde_json::json!(["task"]),
             ),
         ),
+        tool(
+            "http_fetch",
+            "Fetch a URL (http/https) and return its text content. HTML pages are stripped to readable text. Use for documentation and reference material.",
+            object(
+                serde_json::json!({
+                    "url": {"type": "string"},
+                    "max_bytes": {"type": "integer","minimum":1,"maximum":1000000},
+                    "timeout_secs": {"type": "integer","minimum":1,"maximum":120}
+                }),
+                serde_json::json!(["url"]),
+            ),
+        ),
+        tool(
+            "web_search",
+            "Search the web without an API key (SearXNG if WEB_SEARCH_URL is set, else DuckDuckGo). Returns title, URL and snippet per result.",
+            object(
+                serde_json::json!({
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer","minimum":1,"maximum":20},
+                    "timeout_secs": {"type": "integer","minimum":1,"maximum":120}
+                }),
+                serde_json::json!(["query"]),
+            ),
+        ),
+        tool(
+            "todo",
+            "Manage the session task checklist. op: add (with text), complete (index or text), remove (index or text), clear, or list.",
+            object(
+                serde_json::json!({
+                    "op": {"type":"string","enum":["add","complete","remove","clear","list"]},
+                    "text": {"type":"string"},
+                    "index": {"type":"integer","minimum":1}
+                }),
+                serde_json::json!([]),
+            ),
+        ),
+        tool(
+            "memory_search",
+            "Semantic recall across past sessions and assistant outputs. Returns the most similar stored texts with scores. Requires a local embedding model (EMBEDDING_MODEL or --download-embedding-model). The first call loads the model (may take a minute or two on CPU).",
+            object(
+                serde_json::json!({
+                    "query": {"type":"string"},
+                    "k": {"type":"integer","minimum":1,"maximum":50}
+                }),
+                serde_json::json!(["query"]),
+            ),
+        ),
     ];
     for client in &mut state.mcp_clients {
         if let Ok(mcp_tools) = client.list_tools() {
@@ -1455,7 +1704,7 @@ pub async fn run_agent_loop_with_hooks(
 
     match mode {
         AgentMode::Agent => run_agent_mode(client, state, task, hooks).await,
-        AgentMode::Plan => run_plan_mode(client, state, task, hooks).await,
+        AgentMode::Plan => run_planner_fallback(client, state, task, hooks).await,
     }
     // Persist the transcript at turn boundaries (append-only, crash-safe).
     if let Err(e) = state.persist_session() {
@@ -1511,11 +1760,6 @@ async fn run_agent_mode(
         return;
     }
 
-    run_planner_fallback(client, state, task, hooks).await;
-}
-
-/// Plan mode: planner first, then execute plan steps.
-async fn run_plan_mode(client: &LlmRouter, state: &mut AgentState, task: &str, hooks: &AgentHooks) {
     run_planner_fallback(client, state, task, hooks).await;
 }
 
@@ -1769,6 +2013,26 @@ mod tests {
     }
 
     #[test]
+    fn todo_tool_lists_and_completes_items() {
+        let (mut state, root) = test_state("todo-tool");
+        let add = tool_call("todo", serde_json::json!({"op": "add", "text": "write tests"}));
+        let result = execute_tool(&dummy_router(), &mut state, &add, &AgentHooks::default());
+        assert!(result.output.contains("write tests"), "got: {}", result.output);
+
+        let complete = tool_call(
+            "todo",
+            serde_json::json!({"op": "complete", "index": 1}),
+        );
+        let result = execute_tool(&dummy_router(), &mut state, &complete, &AgentHooks::default());
+        assert!(result.output.contains("completed"), "got: {}", result.output);
+
+        let list = tool_call("todo", serde_json::json!({"op": "list"}));
+        let result = execute_tool(&dummy_router(), &mut state, &list, &AgentHooks::default());
+        assert!(result.output.contains("[x]"), "got: {}", result.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn failed_mutation_repairs_then_fails_when_budget_is_exhausted() {
         let root =
             std::env::temp_dir().join(format!("anamnesic-gate-state-{}", std::process::id()));
@@ -1815,8 +2079,66 @@ mod tests {
     fn try_mcp_tool_returns_none_when_no_mcp_clients() {
         let (mut state, root) = test_state("mcp-none");
         let call = tool_call("some_mcp_tool", serde_json::json!({"arg": "value"}));
-        let result = try_mcp_tool(&mut state, &call);
+        let result = try_mcp_tool(&mut state, &call, &AgentHooks::default());
         assert!(result.is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_tool_call_respects_ask_policy_without_approval_callback() {
+        let (mut state, root) = test_state("mcp-ask");
+        state.mcp_clients.push(fake_mcp_client());
+        state.config.command_tool_policy = ApprovalPolicy::Ask;
+        let call = tool_call("fake_tool", serde_json::json!({"arg": "value"}));
+        let result = try_mcp_tool(&mut state, &call, &AgentHooks::default());
+        let result = result.expect("MCP tool must be handled even when denied");
+        assert!(result.output.contains("was not approved"));
+        assert!(state.blocked_actions.iter().any(|a| a.contains("fake_tool")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_tool_call_approved_when_callback_returns_allow() {
+        let (mut state, root) = test_state("mcp-allow");
+        state.mcp_clients.push(fake_mcp_client());
+        state.config.command_tool_policy = ApprovalPolicy::Ask;
+        let hooks = AgentHooks {
+            on_approval: Some(Arc::new(|_| ApprovalDecision::AllowOnce)),
+            ..AgentHooks::default()
+        };
+        let call = tool_call("fake_tool", serde_json::json!({"arg": "value"}));
+        let result = try_mcp_tool(&mut state, &call, &hooks)
+            .expect("fake_tool should resolve after approval");
+        assert!(result.output.contains("fake result"));
+        assert!(state.blocked_actions.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_tool_call_runs_when_policy_is_allow() {
+        let (mut state, root) = test_state("mcp-run");
+        state.mcp_clients.push(fake_mcp_client());
+        let call = tool_call("fake_tool", serde_json::json!({"arg": "value"}));
+        let result = try_mcp_tool(&mut state, &call, &AgentHooks::default())
+            .expect("fake_tool should resolve under Allow policy");
+        assert!(result.output.contains("fake result"));
+        assert!(state.blocked_actions.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Spawns a copy of this test binary as a minimal fake MCP server exposing
+    /// a single tool named `fake_tool`. Runs with `--exact` on the dedicated
+    /// fake-server test (see `src/mcp/mod.rs`) so no other tests execute.
+    fn fake_mcp_client() -> crate::mcp::McpClient {
+        let exe = std::env::current_exe().unwrap();
+        let config = crate::mcp::McpServerConfig {
+            command: exe.to_string_lossy().into_owned(),
+            args: vec![
+                "--exact".into(),
+                "mcp::tests::fake_mcp_server_process".into(),
+            ],
+            env: vec![("ANAMNESIC_FAKE_MCP_SERVER".into(), "1".into())],
+        };
+        crate::mcp::McpClient::connect(&config).expect("fake MCP server should start")
     }
 }

@@ -1,0 +1,238 @@
+use anyhow::Result;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use crate::llm::infer::engine::InferenceEngine;
+use crate::llm::infer::gguf::GgufReader;
+use crate::llm::infer::model::Model;
+use crate::llm::infer::tokenizer::Tokenizer;
+
+/// Default embedding model file name placed under `<models_dir>/embeddings/`.
+pub const EMBEDDING_DEFAULT: &str = "Qwen3-Embedding-0.6B-Q8_0.gguf";
+
+/// Candidate download sources, tried in order. Qwen3-Embedding 0.6B is the
+/// recommended default (official Qwen GGUF, Q8_0 ~0.6 GB); Jina v5 small
+/// retrieval (1024-dim, last-token pooling) is the fallback.
+const EMBEDDING_CANDIDATES: &[&str] = &[
+    "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-f16.gguf",
+    "https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF/resolve/main/v5-small-retrieval-Q8_0.gguf",
+];
+
+/// Whether the text being embedded is a query or a stored passage. The two use
+/// different instruction prefixes (required by Qwen3-Embedding / Jina v5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedKind {
+    Query,
+    Passage,
+}
+
+enum EmbedderSource {
+    Gguf { path: PathBuf, max_seq_len: usize },
+}
+
+/// Local embedding engine that lazily loads a GGUF embedding model and exposes
+/// normalized last-token embeddings. When no model file is present it stays
+/// inert and `embed` returns a guidance error.
+pub struct Embedder {
+    source: Option<EmbedderSource>,
+    engine: Mutex<Option<InferenceEngine>>,
+}
+
+impl Embedder {
+    pub fn new(models_dir: &Path, embedding_model: Option<&str>) -> Self {
+        let source =
+            resolve_source(models_dir, embedding_model).map(|path| EmbedderSource::Gguf {
+                path,
+                max_seq_len: 512,
+            });
+        Self {
+            source,
+            engine: Mutex::new(None),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// Embed `text` with the task-appropriate instruction prefix and L2
+    /// normalization, so cosine similarity is a plain dot product.
+    pub fn embed(&self, text: &str, kind: EmbedKind) -> Result<Vec<f32>> {
+        let Some(source) = &self.source else {
+            anyhow::bail!(
+                "no embedding model configured — run `anamnesic --download-embedding-model` or point EMBEDDING_MODEL at a GGUF file"
+            );
+        };
+        let mut guard = self.engine.lock().unwrap();
+        if guard.is_none() {
+            let EmbedderSource::Gguf { path, max_seq_len } = source;
+            let path_str = path.to_string_lossy().to_string();
+            let model = Model::load(&path_str)?;
+            let reader = GgufReader::load(&path_str)?;
+            let tokenizer = Tokenizer::load_from_gguf(&reader)?;
+            log::info!("embedding model loaded from {}", path.display());
+            *guard = Some(InferenceEngine::new(model, tokenizer, *max_seq_len));
+        }
+        let engine = guard.as_mut().expect("engine loaded above");
+        let prompt = match kind {
+            EmbedKind::Query => format!("Query: {text}"),
+            EmbedKind::Passage => format!("Passage: {text}"),
+        };
+        engine.embed(&prompt)
+    }
+
+    /// Embedding dimensionality once a model is loaded (0 before then).
+    pub fn dim(&self) -> usize {
+        let guard = self.engine.lock().unwrap();
+        if let Some(engine) = guard.as_ref() {
+            let n_embd = engine.n_embd();
+            drop(guard);
+            return n_embd;
+        }
+        0
+    }
+}
+
+/// Locate an embedding GGUF: explicit `EMBEDDING_MODEL` path first, then any
+/// `.gguf` in `<models_dir>/embeddings/`, then the default filename.
+fn resolve_source(models_dir: &Path, embedding_model: Option<&str>) -> Option<PathBuf> {
+    if let Some(model) = embedding_model {
+        if !model.is_empty() {
+            let path = PathBuf::from(model);
+            if path.is_absolute() {
+                return path.exists().then_some(path);
+            }
+            let candidate = models_dir.join("embeddings").join(&path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            let candidate = models_dir.join(&path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            log::warn!(
+                "embedding model '{model}' not found under {}",
+                models_dir.display()
+            );
+            return None;
+        }
+    }
+    let dir = models_dir.join("embeddings");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut gguf: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "gguf"))
+            .collect();
+        gguf.sort();
+        if let Some(first) = gguf.into_iter().next() {
+            return Some(first);
+        }
+    }
+    let default = models_dir.join(EMBEDDING_DEFAULT);
+    default.exists().then_some(default)
+}
+
+/// Download the first available candidate embedding model into
+/// `<models_dir>/embeddings/` and return its path.
+pub fn download_embedding_model(models_dir: &Path) -> Result<PathBuf> {
+    let dir = models_dir.join("embeddings");
+    std::fs::create_dir_all(&dir)?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(format!("anamnesic-coder/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    for url in EMBEDDING_CANDIDATES {
+        let filename = url.rsplit('/').next().unwrap_or("embedding.gguf");
+        let target = dir.join(filename);
+        if target.exists() {
+            println!("Already present: {}", target.display());
+            return Ok(target);
+        }
+        let label = url
+            .split('/')
+            .nth(4)
+            .unwrap_or("huggingface.co");
+        match download_to(&client, url, &target) {
+            Ok(()) => {
+                println!("Downloaded: {}", target.display());
+                return Ok(target);
+            }
+            Err(error) => println!("[{label}] download failed: {error}"),
+        }
+    }
+    anyhow::bail!(
+        "all embedding model sources failed — check network access to huggingface.co (~0.6 GB each)"
+    )
+}
+
+fn download_to(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    target: &Path,
+) -> Result<()> {
+    let mut response = client.get(url).send()?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {}", response.status());
+    }
+    println!("  {url} → {}", target.display());
+    let file = std::fs::File::create(target)?;
+    let mut writer = std::io::BufWriter::new(file);
+    response.copy_to(&mut writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_source_uses_explicit_path() {
+        let dir = std::env::temp_dir().join(format!("anamnesic-embedder-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("embeddings")).unwrap();
+        let file = dir.join("embeddings").join("my-embed.gguf");
+        std::fs::write(&file, b"not a real model").unwrap();
+        let found = resolve_source(&dir, Some("my-embed.gguf"));
+        assert_eq!(found, Some(file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_source_returns_none_when_missing() {
+        let dir = std::env::temp_dir().join(format!("anamnesic-embedder-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(resolve_source(&dir, None).is_none());
+        assert!(!Embedder::new(&dir, None).is_available());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end check of the real inference engine against a downloaded
+    /// embedding GGUF. Skipped by default; run with
+    /// `cargo test -- --ignored` after `--download-embedding-model`.
+    #[test]
+    #[ignore]
+    fn real_embedding_model_ranks_similar_texts() {
+        let dir = std::env::var("MODELS_DIR").unwrap_or_else(|_| "models".to_string());
+        let embedder = Embedder::new(Path::new(&dir), None);
+        assert!(
+            embedder.is_available(),
+            "no embedding model found under {dir} — run --download-embedding-model first"
+        );
+        let a = embedder.embed("how do I run the test suite?", EmbedKind::Query).unwrap();
+        let b = embedder.embed("run cargo test to verify the changes", EmbedKind::Passage).unwrap();
+        let c = embedder.embed("bake a cake with flour and sugar", EmbedKind::Passage).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), c.len());
+        assert!(embedder.dim() > 0);
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(x, y)| x * y).sum::<f32>();
+        let similar = dot(&a, &b);
+        let unrelated = dot(&a, &c);
+        assert!(
+            similar > unrelated,
+            "similar texts must score higher ({similar:.4}) than unrelated ones ({unrelated:.4})"
+        );
+    }
+}

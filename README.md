@@ -101,8 +101,10 @@ Applied automatically to `run_command`, `run_tests`, `read_file`, `search_code` 
 Run the agent against NVIDIA NIM (OpenAI-compatible) instead of Ollama:
 
 ```bash
-# Key from https://build.nvidia.com/ — put it in .env or export it
-echo "NVIDIA_API_KEY=nvapi-..." > .env
+# Key from https://build.nvidia.com/ — global settings (Claude-style) or env
+# `~/.anamnesic/settings.json`:
+#   { "env": { "NVIDIA_API_KEY": "nvapi-..." } }
+echo "NVIDIA_API_KEY=nvapi-..." >> ~/.anamnesic/settings.json  # or export it
 
 cargo run -- --cloud "add user authentication"
 cargo run -- --cloud --cloud-model z-ai/glm-5.2 "explain this code"
@@ -110,7 +112,8 @@ cargo run -- --cloud --cloud-model z-ai/glm-5.2 "explain this code"
 
 - `--provider <id>`: any OpenAI-compatible provider from the models.dev catalog (default `nvidia`).
 - `--cloud-model <id>`: override model (default `z-ai/glm-5.2`, selected for the best latency/quality result in the local agent benchmark).
-- Key priority: `providers set nvidia <key>` → `NVIDIA_API_KEY` from env or `.env`.
+- API keys live in `~/.anamnesic/settings.json` (global, Claude Code-style `env` block) or `~/.anamnesic/providers.toml`.
+- Key priority: `providers set nvidia <key>` → `~/.anamnesic/settings.json` `env` → process env → project `.env`.
 
 ### 💻 Hardware Recommendation
 

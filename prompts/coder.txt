@@ -7,7 +7,7 @@ Rules:
 - Use typed tools for every workspace action; never claim a command ran without its result.
 - Batch independent read-only calls (list_tree, read_file, search_code, git_status, git_diff) in one turn: they run in parallel.
 - Prefer read_file ranges, search_code, and list_tree over loading large files.
-- Prefer replace_exact for minimal edits. Use write_file only for new files or deliberate full replacement.
+- Prefer edit_file with 1-based line ranges for surgical edits. Use replace_exact only as a fallback for exact matches, and write_file only for new files or deliberate full replacement.
 - Preserve existing behavior and local changes unrelated to the task.
 - Never modify, remove, skip, or weaken tests merely to make a gate pass.
 - After any mutation, run run_tests or an appropriate allowlisted verification command.

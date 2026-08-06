@@ -63,6 +63,12 @@ pub struct Config {
     pub transaction_max_bytes: usize,
     pub rollback_on_failure: bool,
     pub require_diff_summary: bool,
+    /// Run `cargo clippy` in addition to the test gate after a mutation.
+    pub lint_on_mutation: bool,
+    /// Path or bare name of a GGUF embedding model for `memory_search`.
+    pub embedding_model: Option<String>,
+    /// Auto-index assistant messages into the vector store on persist.
+    pub memory_indexing: bool,
     pub write_tool_policy: ApprovalPolicy,
     pub command_tool_policy: ApprovalPolicy,
     pub mcp_servers: Vec<crate::mcp::McpServerConfig>,
@@ -167,6 +173,9 @@ impl Default for Config {
                 .unwrap_or(64 * 1024 * 1024),
             rollback_on_failure: env_bool("ROLLBACK_ON_FAILURE", true),
             require_diff_summary: env_bool("REQUIRE_DIFF_SUMMARY", true),
+            lint_on_mutation: env_bool("LINT_ON_MUTATION", true),
+            embedding_model: std::env::var("EMBEDDING_MODEL").ok(),
+            memory_indexing: env_bool("MEMORY_INDEXING", false),
             write_tool_policy: ApprovalPolicy::from_env("WRITE_TOOL_POLICY", ApprovalPolicy::Allow),
             command_tool_policy: ApprovalPolicy::from_env(
                 "COMMAND_TOOL_POLICY",

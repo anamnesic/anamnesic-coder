@@ -15,6 +15,7 @@ pub struct McpClient {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
+    tools: Vec<crate::llm::client::ToolDef>,
 }
 
 impl McpClient {
@@ -35,8 +36,10 @@ impl McpClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            tools: Vec::new(),
         };
         client.initialize()?;
+        client.tools = client.list_tools()?;
         Ok(client)
     }
 
@@ -128,6 +131,12 @@ impl McpClient {
         Ok(defs)
     }
 
+    /// Whether this client advertises a tool with the given name (cached from
+    /// the `tools/list` response captured at connect time).
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.function.name == name)
+    }
+
     pub fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String> {
         let params = serde_json::json!({
             "name": name,
@@ -173,5 +182,54 @@ mod tests {
             env: vec![],
         };
         assert_eq!(a, b);
+    }
+
+    /// Minimal JSON-RPC MCP server used as a subprocess by agent-loop tests.
+    /// It is a no-op unless spawned with `ANAMNESIC_FAKE_MCP_SERVER=1` and the
+    /// `--exact` filter, so normal test runs never block here.
+    #[test]
+    fn fake_mcp_server_process() {
+        if std::env::var("ANAMNESIC_FAKE_MCP_SERVER").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        let mut stdout = std::io::stdout();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let id = request.get("id").cloned();
+            let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let response = match (method, id) {
+                ("initialize", Some(id)) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": {"name": "fake", "version": "0"}
+                    }
+                }),
+                ("tools/list", Some(id)) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "tools": [{"name": "fake_tool", "description": "", "inputSchema": {"type": "object"}}]
+                    }
+                }),
+                ("tools/call", Some(id)) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": "fake result"}]}
+                }),
+                _ => continue,
+            };
+            if writeln!(stdout, "{response}").is_err() {
+                break;
+            }
+            let _ = stdout.flush();
+        }
     }
 }

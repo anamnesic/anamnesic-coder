@@ -41,6 +41,20 @@ pub struct LlmRouter {
     fallback_model: Arc<Mutex<Option<String>>>,
 }
 
+/// USD cost estimate for a completed LLM call, priced from the models.dev
+/// catalog. Defaults to zero for local/free models not present in the catalog.
+#[derive(Debug, Clone, Default)]
+pub struct CostEstimate {
+    pub input_usd: f64,
+    pub output_usd: f64,
+}
+
+impl CostEstimate {
+    pub fn total(&self) -> f64 {
+        self.input_usd + self.output_usd
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AutoTestProbeResult {
     pub model: String,
@@ -159,6 +173,34 @@ impl LlmRouter {
         // Fall back to the stored fallback model
         let stored = self.fallback_model.lock().unwrap().clone();
         stored.filter(|fb| fb != model)
+    }
+
+    /// Estimate the USD cost of a completed call for `model` using models.dev
+    /// catalog prices ($ per million tokens). Prefers the active provider's
+    /// listing; falls back to any provider matching the base id. Local/free
+    /// models not in the catalog price at zero.
+    pub fn estimate_cost(&self, model: &str, prompt_tokens: usize, completion_tokens: usize) -> CostEstimate {
+        let base = base_id(model);
+        let active = self.provider();
+        let mut found: Option<(f64, f64)> = None;
+        for (pid, provider) in self.catalog.catalog.iter() {
+            for (mid, info) in provider.models.iter() {
+                if mid == model || base_id(mid) == base {
+                    let candidate = (info.cost.input, info.cost.output);
+                    let prefer = !active.is_empty() && pid == &active;
+                    if found.is_none() || prefer {
+                        found = Some(candidate);
+                    }
+                }
+            }
+        }
+        let Some((input_mtok, output_mtok)) = found else {
+            return CostEstimate::default();
+        };
+        CostEstimate {
+            input_usd: input_mtok * prompt_tokens as f64 / 1e6,
+            output_usd: output_mtok * completion_tokens as f64 / 1e6,
+        }
     }
 
     /// Resolve a model id against the active provider: `(is_cloud, api_id)`.
@@ -585,6 +627,27 @@ mod tests {
         r.clear_cloud_marks();
         assert!(!r.is_cloud_model("custom-a"));
         assert!(!r.is_cloud_model("custom-b"));
+    }
+
+    #[test]
+    fn estimate_cost_prices_cloud_models_and_ignores_local() {
+        let mut model = model("z-ai/glm-5.2", true);
+        model.cost.input = 0.50;
+        model.cost.output = 1.00;
+        let mut catalog = Catalog::new();
+        catalog.insert("nvidia".into(), provider("nvidia", vec![model]));
+        let r = LlmRouter::with_catalog(
+            LlmClient::ollama("http://localhost:11434"),
+            ModelsDevClient { catalog },
+        );
+        // 2M prompt @ $0.50/MTok + 1M completion @ $1.00/MTok.
+        let cost = r.estimate_cost("glm-5.2", 2_000_000, 1_000_000);
+        assert!((cost.input_usd - 1.0).abs() < 1e-9);
+        assert!((cost.output_usd - 1.0).abs() < 1e-9);
+        assert!((cost.total() - 2.0).abs() < 1e-9);
+        // Local model not present in the catalog prices at zero.
+        let local = r.estimate_cost("qwen3:1.7b", 1000, 1000);
+        assert_eq!(local.total(), 0.0);
     }
 
     #[test]

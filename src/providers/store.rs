@@ -28,7 +28,7 @@ pub struct ProviderStore {
 }
 
 impl ProviderStore {
-    /// Load from `~/.config/rustcode/providers.toml`.
+    /// Load from `~/.anamnesic/providers.toml`.
     /// Returns empty store if file doesn't exist yet.
     pub fn load() -> Self {
         Self::load_inner().unwrap_or_default()
@@ -102,7 +102,7 @@ impl ProviderStore {
     pub fn config_path_display() -> String {
         config_path()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.config/rustcode/providers.toml".into())
+            .unwrap_or_else(|_| "~/.anamnesic/providers.toml".into())
     }
 
     /// Scan the current environment (plus an optional .env file) for known
@@ -148,7 +148,7 @@ impl ProviderStore {
     /// Resolve cloud endpoint + API key for a provider.
     ///
     /// Base URL priority: store override → models.dev catalog default → built-in default.
-    /// Key priority: store key → environment / `.env` file (e.g. `NVIDIA_API_KEY`).
+    /// Key priority: store key → global settings / environment / `.env` (e.g. `NVIDIA_API_KEY`).
     pub fn resolve_cloud_credentials(provider_id: &str, catalog: &Catalog) -> Result<(String, String)> {
         let env_name = catalog.get(provider_id)
             .and_then(|p| p.env.first().map(|s| s.as_str()))
@@ -172,16 +172,19 @@ impl ProviderStore {
 }
 
 fn config_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("XDG_CONFIG_HOME"))
-        .context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".config").join("rustcode").join("providers.toml"))
+    let home = crate::config::home_dir();
+    Ok(home.join(".anamnesic").join("providers.toml"))
 }
 
-/// Build a merged env-var map: real process environment + .env file in the
-/// current working directory (real env takes precedence over .env values).
+/// Build a merged env-var map: real process environment → global settings
+/// (`~/.anamnesic/settings.json`) → `.env` file (earlier sources win).
 fn load_env_with_dotenv() -> HashMap<String, String> {
     let mut map: HashMap<String, String> = std::env::vars().collect();
+
+    // Global settings (`~/.anamnesic/settings.json`): process env wins.
+    for (k, v) in crate::config::GlobalSettings::load().env {
+        map.entry(k).or_insert(v);
+    }
 
     // Try project .env in cwd, then parent dirs up to 3 levels
     let candidates = [
@@ -216,9 +219,10 @@ fn load_env_with_dotenv() -> HashMap<String, String> {
     map
 }
 
-/// Load `.env` (cwd + parent dirs) into the process environment so cloud keys
-/// and model overrides (e.g. `NVIDIA_API_KEY`, `CODER_MODEL`) are visible to
-/// `std::env::var` everywhere. Existing vars are not overridden (dotenv convention).
+/// Load global settings (`~/.anamnesic/settings.json`) and `.env` (cwd + parent
+/// dirs) into the process environment so cloud keys and model overrides (e.g.
+/// `NVIDIA_API_KEY`, `CODER_MODEL`) are visible to `std::env::var` everywhere.
+/// Existing vars are not overridden (dotenv convention).
 pub fn load_dotenv() {
     for (k, v) in load_env_with_dotenv() {
         if std::env::var_os(&k).is_none() {
@@ -379,12 +383,18 @@ mod tests {
     #[test]
     fn config_path_uses_home() {
         let prev = std::env::var_os("HOME");
+        let prev_up = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", "/tmp/anamnesic-store-test");
+        std::env::remove_var("USERPROFILE");
         let p = config_path().unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/anamnesic-store-test/.config/rustcode/providers.toml"));
+        assert_eq!(p, PathBuf::from("/tmp/anamnesic-store-test/.anamnesic/providers.toml"));
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match prev_up {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
         }
     }
 

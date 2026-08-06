@@ -3,3 +3,4 @@ pub mod git;
 pub mod shell;
 pub mod test;
 pub mod transaction;
+pub mod web;

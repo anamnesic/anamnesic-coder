@@ -115,6 +115,9 @@ struct Cli {
     /// Continue the most recent session for this workspace without prompting
     #[arg(long, alias = "continue")]
     cont: bool,
+    /// Download the default embedding model (Qwen3-Embedding 0.6B Q8) for memory_search
+    #[arg(long)]
+    download_embedding_model: bool,
     task: Option<String>,
 }
 
@@ -141,7 +144,7 @@ enum Commands {
         #[arg(default_value = "")]
         query: String,
     },
-    /// Configure and manage cloud provider API keys (stored securely at ~/.config/rustcode/providers.toml)
+    /// Configure and manage cloud provider API keys (stored securely at ~/.anamnesic/providers.toml)
     Providers {
         #[command(subcommand)]
         action: ProvidersAction,
@@ -276,6 +279,24 @@ async fn main() -> Result<()> {
         use_local: cli.local,
         ..Config::default()
     };
+    if cli.download_embedding_model {
+        // Run the blocking download on a plain thread so reqwest's internal
+        // runtime is dropped off the async main runtime (which would panic).
+        let models_dir = cfg.models_dir.clone();
+        let handle = std::thread::spawn(move || {
+            llm::embedder::download_embedding_model(&models_dir)
+        });
+        let path = match handle.join() {
+            Ok(Ok(path)) => path,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => anyhow::bail!("embedding model download thread panicked"),
+        };
+        println!(
+            "Embedding model ready: {} (already the default location).",
+            path.display()
+        );
+        return Ok(());
+    }
     let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
     state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
@@ -586,6 +607,16 @@ async fn handle_providers(action: ProvidersAction) -> Result<()> {
                 store.set_base(&provider, &b);
             }
             store.save()?;
+            // Also persist into the global `~/.anamnesic/settings.json` env block
+            // (Claude Code-style), so the key is available to every workspace.
+            let env_name = catalog
+                .get(&provider)
+                .and_then(|p| p.env.first().map(|s| s.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase().replace('-', "_")));
+            let mut globals = config::GlobalSettings::load();
+            globals.set_env(&env_name, &key);
+            globals.save().ok();
             println!(
                 "  ✓ API key saved for '{}' ({})",
                 provider,

@@ -13,6 +13,14 @@ pub struct SessionInfo {
     pub model: String,
 }
 
+/// A recalled memory vector with its cosine similarity score.
+#[derive(Debug, Clone)]
+pub struct VectorHit {
+    pub text: String,
+    pub source: String,
+    pub score: f64,
+}
+
 pub struct LongTermMemory {
     conn: Connection,
     path: PathBuf,
@@ -24,6 +32,7 @@ impl LongTermMemory {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +54,16 @@ impl LongTermMemory {
                 created_at TEXT,
                 PRIMARY KEY (session_id, seq)
             );
-            CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id);"
+            CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id);
+            CREATE TABLE IF NOT EXISTS memory_vectors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                source TEXT,
+                created_at TEXT,
+                embedding BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_vectors_session ON memory_vectors(session_id);"
         )?;
         Self::migrate_sessions_table(&conn)?;
         Ok(LongTermMemory { conn, path: db_path })
@@ -53,15 +71,20 @@ impl LongTermMemory {
 
     /// Add metadata columns that older session rows lack. Applies only to the
     /// local SQLite database, so the `ALTER TABLE` calls are idempotent.
+    /// The migration is race-safe: a concurrent open of the same file may add
+    /// a column between the `PRAGMA` read and the `ALTER`, so a failed `ALTER`
+    /// is retried through a fresh column read instead of aborting.
     fn migrate_sessions_table(conn: &Connection) -> anyhow::Result<()> {
-        let mut columns = Vec::new();
-        {
+        let read_columns = || -> anyhow::Result<Vec<String>> {
+            let mut columns = Vec::new();
             let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for row in rows {
                 columns.push(row?);
             }
-        }
+            Ok(columns)
+        };
+        let mut columns = read_columns()?;
         for (name, definition) in [
             ("workspace", "TEXT"),
             ("model", "TEXT"),
@@ -69,8 +92,20 @@ impl LongTermMemory {
             ("status", "TEXT DEFAULT 'active'"),
             ("message_count", "INTEGER DEFAULT 0"),
         ] {
-            if !columns.iter().any(|c| c == name) {
-                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {name} {definition};"))?;
+            if columns.iter().any(|c| c == name) {
+                continue;
+            }
+            let alter = || {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {name} {definition};"))
+            };
+            match alter() {
+                Ok(()) => columns.push(name.to_string()),
+                Err(_) => {
+                    columns = read_columns()?;
+                    if !columns.iter().any(|c| c == name) {
+                        return alter().map_err(anyhow::Error::from);
+                    }
+                }
             }
         }
         Ok(())
@@ -150,6 +185,73 @@ impl LongTermMemory {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist an embedding for a piece of assistant text so `memory_search`
+    /// can recall it later. `embedding` should be L2-normalized so a plain dot
+    /// product equals cosine similarity.
+    pub fn store_vector(
+        &self,
+        session_id: i64,
+        source: &str,
+        text: &str,
+        embedding: &[f32],
+    ) -> anyhow::Result<()> {
+        let mut blob = Vec::with_capacity(embedding.len() * 4);
+        for value in embedding {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        self.conn.execute(
+            "INSERT INTO memory_vectors (session_id, text, source, created_at, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                session_id,
+                text,
+                source,
+                Local::now().to_rfc3339(),
+                blob
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Top-`k` vectors most similar to the (normalized) query embedding.
+    pub fn search_vectors(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<VectorHit>> {
+        let mut stmt =
+            self.conn
+                .prepare("SELECT text, source, embedding FROM memory_vectors")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut hits: Vec<(f64, String, String)> = Vec::new();
+        for row in rows {
+            let (text, source, blob) = row?;
+            if blob.len() != query.len() * 4 {
+                continue;
+            }
+            let mut dot = 0.0f64;
+            for (index, value) in blob.chunks_exact(4).enumerate() {
+                let element = f32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                dot += element as f64 * query[index] as f64;
+            }
+            if dot.is_finite() {
+                hits.push((dot, text, source));
+            }
+        }
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(hits
+            .into_iter()
+            .take(k.clamp(1, 50))
+            .map(|(score, text, source)| VectorHit { text, source, score })
+            .collect())
     }
 
     /// Recently active saved sessions for a workspace, newest first.
@@ -366,5 +468,29 @@ mod tests {
         m.delete_session(id).unwrap();
         assert!(m.load_session(id).unwrap().is_empty());
         assert!(m.list_sessions("/tmp/ws", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn vector_store_roundtrips_and_ranks_by_similarity() {
+        let m = temp_memory("vectors");
+        let id = m.start_session("/tmp/ws", "m").unwrap();
+        let norm = |v: &[f32]| {
+            let len = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / len).collect::<Vec<_>>()
+        };
+        let target = norm(&[1.0, 0.0, 0.0]);
+        let close = norm(&[0.95, 0.31, 0.0]);
+        let far = norm(&[0.0, 0.0, 1.0]);
+        m.store_vector(id, "ws-a", "target text", &target).unwrap();
+        m.store_vector(id, "ws-b", "close text", &close).unwrap();
+        m.store_vector(id, "ws-c", "far text", &far).unwrap();
+
+        let hits = m.search_vectors(&target, 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "target text");
+        assert!((hits[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(hits[1].text, "close text");
+        assert!(hits[1].score > 0.9);
+        assert!(hits.iter().all(|h| h.score <= 1.0));
     }
 }
