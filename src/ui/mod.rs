@@ -1485,6 +1485,30 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     continue;
                 }
                 let mut guard = app.lock().unwrap();
+                // Top-level Universal Ctrl+C handler: works across all popups, overlays, modals, and screens.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    if guard.quit_pending {
+                        break;
+                    }
+                    guard.quit_pending = true;
+                    if guard.loading {
+                        interrupt.store(true, Ordering::Relaxed);
+                    }
+                    guard.auto_test_running = false;
+                    guard.auto_test_popup = false;
+                    guard.info_popup = false;
+                    guard.file_search = false;
+                    guard.command_menu = false;
+                    guard.model_selector = false;
+                    guard.provider_selector = false;
+                    guard.resume_selector = false;
+                    guard.pending_approval = None;
+                    guard.status = "Press Ctrl+C again to quit".into();
+                    continue;
+                } else {
+                    guard.quit_pending = false;
+                }
+
                 // The approval modal only captures explicit decisions.
                 if guard.pending_approval.is_some() {
                     let decision = match key.code {
@@ -1511,18 +1535,6 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
                     guard.messages.clear();
                     guard.status = "Chat cleared (session memory is preserved).".into();
-                    continue;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    if guard.loading {
-                        interrupt.store(true, Ordering::Relaxed);
-                        guard.status = "Interrupting…".into();
-                    } else if guard.quit_pending {
-                        break;
-                    } else {
-                        guard.quit_pending = true;
-                        guard.status = "Ctrl+C again to quit".into();
-                    }
                     continue;
                 }
                 // Ctrl+P: toggle the fuzzy file-search overlay.
