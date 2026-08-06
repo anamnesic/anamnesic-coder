@@ -201,8 +201,11 @@ pub struct App {
     pub file_search_paths: Vec<String>,
     /// /info overlay: full-screen view of the former left sidebar sections.
     pub info_popup: bool,
-    /// Auto model availability test overlay popup and last test record.
+    /// Auto model availability test overlay popup and real-time live test state.
     pub auto_test_popup: bool,
+    pub auto_test_running: bool,
+    pub auto_test_current_candidate: Option<(String, usize, usize)>,
+    pub auto_test_live_results: Vec<crate::llm::router::AutoTestProbeResult>,
     pub last_auto_test: Option<crate::llm::router::AutoTestRecord>,
     /// Accumulated reasoning content for thinking models (GLM-5.2, deepseek-r1).
     pub reasoning: String,
@@ -210,6 +213,30 @@ pub struct App {
     pub active_tab: usize,
     /// Number of background tasks enqueued and currently running.
     pub pending_tasks: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum AutoTestProbeEvent {
+    ProbeStarted {
+        model: String,
+        index: usize,
+        total: usize,
+    },
+    ProbeSuccess {
+        model: String,
+        latency_ms: u128,
+        index: usize,
+        total: usize,
+    },
+    ProbeFailed {
+        model: String,
+        error: String,
+        index: usize,
+        total: usize,
+    },
+    Complete {
+        record: crate::llm::router::AutoTestRecord,
+    },
 }
 
 /// Byte offset of the `char_index`-th character of `s`. Clamped to `s.len()`
@@ -306,6 +333,9 @@ model: model.to_string(),
             file_search_paths: Vec::new(),
             info_popup: false,
             auto_test_popup: false,
+            auto_test_running: false,
+            auto_test_current_candidate: None,
+            auto_test_live_results: Vec::new(),
             last_auto_test: load_auto_test_record(),
             reasoning: String::new(),
             active_tab: 0,
@@ -518,13 +548,14 @@ fn handle_slash_command(
     app: &mut App,
     state: &Arc<Mutex<AgentState>>,
     router: &LlmRouter,
+    auto_test_tx: Option<&mpsc::Sender<AutoTestProbeEvent>>,
 ) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("");
     match cmd {
         "/auto" => {
             let sub = input.trim_start_matches("/auto").trim();
             let arg = if sub.is_empty() { "auto".to_string() } else { format!("auto {sub}") };
-            set_active_model(app, state, router, &arg);
+            set_active_model(app, state, router, &arg, auto_test_tx);
             true
         }
         "/reset" => {
@@ -675,7 +706,7 @@ cloud_ranked.sort_by_key(|(rank, _)| *rank);
                     app.model_selector = true;
                 }
             } else {
-                set_active_model(app, state, router, arg);
+                set_active_model(app, state, router, arg, auto_test_tx);
             }
             true
         }
@@ -820,78 +851,199 @@ fn format_auto_test_scene(record: &crate::llm::router::AutoTestRecord) -> String
     out
 }
 
+fn pinned_candidate_models(provider: &str, state: &Arc<Mutex<AgentState>>) -> Vec<String> {
+    let catalog = crate::models_dev::ModelsDevClient::load();
+    let cloud_candidates: Vec<String> = catalog
+        .provider_models(provider)
+        .into_iter()
+        .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
+        .filter(|m| {
+            let base = crate::models_dev::base_id(&m.id);
+            matches!(
+                base.as_str(),
+                "glm-5.2"
+                    | "qwen3.5-397b-a17b"
+                    | "deepseek-v4-pro"
+                    | "kimi-k2.6"
+                    | "minimax-m3"
+                    | "nemotron-3-ultra-550b-a55b"
+            )
+        })
+        .map(|m| crate::models_dev::base_id(&m.id))
+        .collect();
+
+    let mut candidates = unique_model_ids(cloud_candidates);
+    if candidates.is_empty() {
+        let st = state.lock().unwrap();
+        let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
+        if !local.is_empty() {
+            candidates = local;
+        } else {
+            candidates = vec![
+                "glm-5.2".into(),
+                "qwen3.5-397b-a17b".into(),
+                "deepseek-v4-pro".into(),
+                "kimi-k2.6".into(),
+                "minimax-m3".into(),
+            ];
+        }
+    }
+    candidates
+}
+
+fn start_async_auto_test(
+    app: &mut App,
+    state: &Arc<Mutex<AgentState>>,
+    router: &LlmRouter,
+    auto_test_tx: mpsc::Sender<AutoTestProbeEvent>,
+) {
+    app.auto_model = true;
+    app.auto_test_popup = true;
+    app.auto_test_running = true;
+    app.auto_test_live_results.clear();
+    app.auto_test_current_candidate = None;
+
+    let provider = app.provider.clone();
+    let candidates = pinned_candidate_models(&provider, state);
+
+    app.add_message(
+        "System",
+        &format!("Iniciando teste de disponibilidade em tempo real em {} modelos candidatos…", candidates.len()),
+    );
+    app.status = format!("Testing availability across {} candidate models…", candidates.len());
+
+    let router_clone = router.clone();
+    let provider_clone = provider.clone();
+    thread::spawn(move || {
+        let total = candidates.len();
+        let mut results = Vec::new();
+        let mut best: Option<(String, u128)> = None;
+
+        for (idx, candidate) in candidates.into_iter().enumerate() {
+            let index = idx + 1;
+            let _ = auto_test_tx.send(AutoTestProbeEvent::ProbeStarted {
+                model: candidate.clone(),
+                index,
+                total,
+            });
+
+            let res = block_on_async(router_clone.test_model_availability(&candidate));
+            match res {
+                Ok(dur) => {
+                    let ms = dur.as_millis();
+                    let item = crate::llm::router::AutoTestProbeResult {
+                        model: candidate.clone(),
+                        latency_ms: ms,
+                        success: true,
+                        error: None,
+                    };
+                    results.push(item);
+                    let _ = auto_test_tx.send(AutoTestProbeEvent::ProbeSuccess {
+                        model: candidate.clone(),
+                        latency_ms: ms,
+                        index,
+                        total,
+                    });
+                    match &best {
+                        None => best = Some((candidate, ms)),
+                        Some((_, best_ms)) => {
+                            if ms < *best_ms {
+                                best = Some((candidate, ms));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    let item = crate::llm::router::AutoTestProbeResult {
+                        model: candidate.clone(),
+                        latency_ms: 0,
+                        success: false,
+                        error: Some(err_msg.clone()),
+                    };
+                    results.push(item);
+                    let _ = auto_test_tx.send(AutoTestProbeEvent::ProbeFailed {
+                        model: candidate,
+                        error: err_msg,
+                        index,
+                        total,
+                    });
+                }
+            }
+        }
+
+        let (selected_model, selected_latency_ms) = if let Some((m, lat)) = best {
+            (m, lat)
+        } else if !results.is_empty() {
+            (results[0].model.clone(), 0)
+        } else {
+            ("glm-5.2".to_string(), 0)
+        };
+
+        let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => format!("T-unix +{}s", d.as_secs()),
+            Err(_) => "Now".to_string(),
+        };
+
+        let record = crate::llm::router::AutoTestRecord {
+            timestamp,
+            provider: provider_clone,
+            selected_model,
+            selected_latency_ms,
+            results,
+        };
+
+        let _ = auto_test_tx.send(AutoTestProbeEvent::Complete { record });
+    });
+}
+
 /// Set the active coder model for subsequent agent turns. Strips the
 /// " [cloud]" picker suffix and tells the router whether the model is a cloud
 /// model so requests go to the right backend.
-fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmRouter, name: &str) {
+fn set_active_model(
+    app: &mut App,
+    state: &Arc<Mutex<AgentState>>,
+    router: &LlmRouter,
+    name: &str,
+    auto_test_tx: Option<&mpsc::Sender<AutoTestProbeEvent>>,
+) {
     let clean = name.trim_end_matches(" [cloud]").to_string();
     let is_force_test = clean.contains("test") || clean.contains("refresh") || clean.contains("probe");
     let is_auto_cmd = clean == "auto" || clean.starts_with("auto");
     if is_auto_cmd {
         app.auto_model = true;
-        let provider = app.provider.clone();
-        let catalog = crate::models_dev::ModelsDevClient::load();
-
+        app.auto_test_popup = true;
         let existing_record = if !is_force_test {
             app.last_auto_test.clone().or_else(load_auto_test_record)
         } else {
             None
         };
 
-        let record = if let Some(rec) = existing_record {
-            rec
+        if let Some(record) = existing_record {
+            let best = record.selected_model.clone();
+            {
+                let mut st = state.lock().unwrap();
+                st.config.coder_model = best.clone();
+                st.config.planner_model = best.clone();
+                st.config.summarizer_model = best.clone();
+            }
+            app.model = best.clone();
+            app.last_auto_test = Some(record.clone());
+            router.set_model(&best);
+            let catalog = crate::models_dev::ModelsDevClient::load();
+            if catalog.provider_model_api_id(&app.provider, &best).is_some() {
+                router.mark_cloud(&best);
+            }
+            let scene = format_auto_test_scene(&record);
+            app.add_message("System", &scene);
+            app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
+        } else if let Some(tx) = auto_test_tx {
+            start_async_auto_test(app, state, router, tx.clone());
         } else {
-            let cloud_candidates: Vec<String> = catalog
-                .provider_models(&provider)
-                .into_iter()
-                .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-                .map(|m| crate::models_dev::base_id(&m.id))
-                .collect();
-
-            let candidates = if !cloud_candidates.is_empty() {
-                cloud_candidates
-            } else {
-                let st = state.lock().unwrap();
-                let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
-                if !local.is_empty() {
-                    local
-                } else {
-                    vec!["glm-5.2".to_string()]
-                }
-            };
-
-            app.add_message(
-                "System",
-                &format!("Executando novo teste de disponibilidade em tempo real em {} candidatos…", candidates.len()),
-            );
-
-            let router_clone = router.clone();
-            let candidates_clone = candidates.clone();
-            let rec = block_on_async(async move {
-                router_clone.test_and_rank_models(&candidates_clone).await
-            });
-            save_auto_test_record(&rec);
-            rec
-        };
-
-        let best = record.selected_model.clone();
-        {
-            let mut st = state.lock().unwrap();
-            st.config.coder_model = best.clone();
-            st.config.planner_model = best.clone();
-            st.config.summarizer_model = best.clone();
+            let record = block_on_async(router.test_and_rank_models(&["glm-5.2".to_string()]));
+            app.last_auto_test = Some(record.clone());
+            app.model = record.selected_model.clone();
         }
-        app.model = best.clone();
-        app.last_auto_test = Some(record.clone());
-        app.auto_test_popup = true;
-        router.set_model(&best);
-        if catalog.provider_model_api_id(&provider, &best).is_some() {
-            router.mark_cloud(&best);
-        }
-
-        let scene = format_auto_test_scene(&record);
-        app.add_message("System", &scene);
-        app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
         return;
     }
     app.auto_model = false;
@@ -997,10 +1149,11 @@ fn run_input(
     state: &Arc<Mutex<AgentState>>,
     client: &LlmRouter,
     task_tx: &mpsc::Sender<(String, AgentMode)>,
+    auto_test_tx: &mpsc::Sender<AutoTestProbeEvent>,
     start: &mut Instant,
     input: &str,
 ) {
-    if input.starts_with('/') && handle_slash_command(input, app, state, client) {
+    if input.starts_with('/') && handle_slash_command(input, app, state, client, Some(auto_test_tx)) {
         app.clear_input();
         return;
     }
@@ -1077,6 +1230,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
     let interrupt = Arc::new(AtomicBool::new(false));
     let (task_tx, task_rx) = mpsc::channel::<(String, AgentMode)>();
     let task_rx = Arc::new(Mutex::new(task_rx));
+    let (auto_test_tx, auto_test_rx) = mpsc::channel::<AutoTestProbeEvent>();
     let mut start = Instant::now();
 
     // Spawn worker thread loop to execute background tasks continuously
@@ -1235,6 +1389,59 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                         a.context_cost = a.token_breakdown.input as f64 * 0.000003
                             + a.token_breakdown.output as f64 * 0.000012
                             + a.token_breakdown.reasoning as f64 * 0.000001;
+                    }
+                }
+            }
+        }
+        // Drain real-time auto mode probe events.
+        let probe_events: Vec<AutoTestProbeEvent> = auto_test_rx.try_iter().collect();
+        if !probe_events.is_empty() {
+            let mut a = app.lock().unwrap();
+            for ev in probe_events {
+                match ev {
+                    AutoTestProbeEvent::ProbeStarted { model, index, total } => {
+                        a.auto_test_running = true;
+                        a.auto_test_current_candidate = Some((model.clone(), index, total));
+                        a.status = format!("Testing availability [{index}/{total}] {model}…");
+                    }
+                    AutoTestProbeEvent::ProbeSuccess { model, latency_ms, .. } => {
+                        a.auto_test_live_results.push(crate::llm::router::AutoTestProbeResult {
+                            model,
+                            latency_ms,
+                            success: true,
+                            error: None,
+                        });
+                    }
+                    AutoTestProbeEvent::ProbeFailed { model, error, .. } => {
+                        a.auto_test_live_results.push(crate::llm::router::AutoTestProbeResult {
+                            model,
+                            latency_ms: 0,
+                            success: false,
+                            error: Some(error),
+                        });
+                    }
+                    AutoTestProbeEvent::Complete { record } => {
+                        a.auto_test_running = false;
+                        a.auto_test_current_candidate = None;
+                        a.last_auto_test = Some(record.clone());
+                        save_auto_test_record(&record);
+
+                        let best = record.selected_model.clone();
+                        {
+                            let mut st = state.lock().unwrap();
+                            st.config.coder_model = best.clone();
+                            st.config.planner_model = best.clone();
+                            st.config.summarizer_model = best.clone();
+                        }
+                        a.model = best.clone();
+                        client.set_model(&best);
+                        let catalog = crate::models_dev::ModelsDevClient::load();
+                        if catalog.provider_model_api_id(&a.provider, &best).is_some() {
+                            client.mark_cloud(&best);
+                        }
+                        let scene = format_auto_test_scene(&record);
+                        a.add_message("System", &scene);
+                        a.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
                     }
                 }
             }
@@ -1434,6 +1641,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     &state,
                                     &client,
                                     &task_tx,
+                                    &auto_test_tx,
                                     &mut start,
                                     &text,
                                 );
@@ -1445,7 +1653,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                     .unwrap_or_default();
                                 guard.model_selector = false;
                                 if !name.is_empty() {
-                                    set_active_model(&mut guard, &state, &client, &name);
+                                    set_active_model(&mut guard, &state, &client, &name, Some(&auto_test_tx));
                                 }
                             } else if guard.provider_selector {
                                 let name = guard
@@ -1616,6 +1824,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                                         &state,
                                         &client,
                                         &task_tx,
+                                        &auto_test_tx,
                                         &mut start,
                                         &input,
                                     );
@@ -3248,7 +3457,7 @@ mod tests {
     #[test]
     fn info_command_opens_popup() {
         let (mut app, state, router) = test_app_state_router();
-        let handled = handle_slash_command("/info", &mut app, &state, &router);
+        let handled = handle_slash_command("/info", &mut app, &state, &router, None);
         assert!(handled);
         assert!(app.info_popup);
         assert!(!app.info_sections.is_empty());
@@ -3257,7 +3466,7 @@ mod tests {
     #[test]
     fn selecting_cloud_model_drives_entire_lifecycle_to_cloud() {
         let (mut app, state, router) = test_app_state_router();
-        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]");
+        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]", None);
         let st = state.lock().unwrap();
         assert_eq!(st.config.coder_model, "z-ai/glm-5.2");
         assert_eq!(st.config.planner_model, "z-ai/glm-5.2");
@@ -3273,7 +3482,7 @@ mod tests {
     #[test]
     fn selecting_local_model_keeps_lifecycle_on_ollama() {
         let (mut app, state, router) = test_app_state_router();
-        set_active_model(&mut app, &state, &router, "qwen3:1.7b");
+        set_active_model(&mut app, &state, &router, "qwen3:1.7b", None);
         let st = state.lock().unwrap();
         assert_eq!(st.config.coder_model, "qwen3:1.7b");
         assert_eq!(st.config.planner_model, "qwen3:1.7b");
@@ -3288,9 +3497,9 @@ mod tests {
     #[test]
     fn planner_summarizer_default_to_local_models() {
         let (mut app, state, router) = test_app_state_router();
-        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]");
+        set_active_model(&mut app, &state, &router, "z-ai/glm-5.2 [cloud]", None);
         // Switching back to a local model must also move planner/summarizer.
-        set_active_model(&mut app, &state, &router, "granite3.3:2b");
+        set_active_model(&mut app, &state, &router, "granite3.3:2b", None);
         let st = state.lock().unwrap();
         assert_eq!(st.config.planner_model, "granite3.3:2b");
         assert_eq!(st.config.coder_model, "granite3.3:2b");
