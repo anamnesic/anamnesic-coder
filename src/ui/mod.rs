@@ -898,7 +898,7 @@ fn start_async_auto_test(
     auto_test_tx: mpsc::Sender<AutoTestProbeEvent>,
 ) {
     app.auto_model = true;
-    app.auto_test_popup = true;
+    app.auto_test_popup = false;
     app.auto_test_running = true;
     app.auto_test_live_results.clear();
     app.auto_test_current_candidate = None;
@@ -908,9 +908,9 @@ fn start_async_auto_test(
 
     app.add_message(
         "System",
-        &format!("Iniciando teste de disponibilidade em tempo real em {} modelos candidatos…", candidates.len()),
+        &format!("🧪 [Auto Mode Test] Executando novo teste de disponibilidade em tempo real nos modelos fixados ({})…", candidates.join(", ")),
     );
-    app.status = format!("Testing availability across {} candidate models…", candidates.len());
+    app.status = format!("Testing availability across {} pinned models…", candidates.len());
 
     let router_clone = router.clone();
     let provider_clone = provider.clone();
@@ -1012,15 +1012,40 @@ fn set_active_model(
     let is_auto_cmd = clean == "auto" || clean.starts_with("auto");
     if is_auto_cmd {
         app.auto_model = true;
-        app.auto_test_popup = true;
-        let existing_record = if !is_force_test {
-            app.last_auto_test.clone().or_else(load_auto_test_record)
-        } else {
-            None
-        };
+        app.auto_test_popup = false;
 
-        if let Some(record) = existing_record {
-            let best = record.selected_model.clone();
+        if is_force_test {
+            if let Some(tx) = auto_test_tx {
+                start_async_auto_test(app, state, router, tx.clone());
+            } else {
+                let candidates = pinned_candidate_models(&app.provider, state);
+                let record = block_on_async(router.test_and_rank_models(&candidates));
+                save_auto_test_record(&record);
+                let best = record.selected_model.clone();
+                {
+                    let mut st = state.lock().unwrap();
+                    st.config.coder_model = best.clone();
+                    st.config.planner_model = best.clone();
+                    st.config.summarizer_model = best.clone();
+                }
+                app.model = best.clone();
+                app.last_auto_test = Some(record.clone());
+                router.set_model(&best);
+                let catalog = crate::models_dev::ModelsDevClient::load();
+                if catalog.provider_model_api_id(&app.provider, &best).is_some() {
+                    router.mark_cloud(&best);
+                }
+                let scene = format_auto_test_scene(&record);
+                app.add_message("System", &scene);
+                app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
+            }
+            return;
+        }
+
+        // Standard `/model auto` or `/auto` without `test`: default to the winning model from the last test!
+        let record = app.last_auto_test.clone().or_else(load_auto_test_record);
+        if let Some(rec) = record {
+            let best = rec.selected_model.clone();
             {
                 let mut st = state.lock().unwrap();
                 st.config.coder_model = best.clone();
@@ -1028,19 +1053,26 @@ fn set_active_model(
                 st.config.summarizer_model = best.clone();
             }
             app.model = best.clone();
-            app.last_auto_test = Some(record.clone());
+            app.last_auto_test = Some(rec.clone());
             router.set_model(&best);
             let catalog = crate::models_dev::ModelsDevClient::load();
             if catalog.provider_model_api_id(&app.provider, &best).is_some() {
                 router.mark_cloud(&best);
             }
-            let scene = format_auto_test_scene(&record);
-            app.add_message("System", &scene);
-            app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
+            app.add_message(
+                "System",
+                &format!(
+                    "✓ Modo auto ativo — Modelo padrão selecionado: {} (latência {}ms baseada no último teste). Use /auto test para executar um novo teste.",
+                    rec.selected_model, rec.selected_latency_ms
+                ),
+            );
+            app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", rec.selected_latency_ms);
         } else if let Some(tx) = auto_test_tx {
             start_async_auto_test(app, state, router, tx.clone());
         } else {
-            let record = block_on_async(router.test_and_rank_models(&["glm-5.2".to_string()]));
+            let candidates = pinned_candidate_models(&app.provider, state);
+            let record = block_on_async(router.test_and_rank_models(&candidates));
+            save_auto_test_record(&record);
             app.last_auto_test = Some(record.clone());
             app.model = record.selected_model.clone();
         }
