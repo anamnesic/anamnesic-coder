@@ -145,7 +145,6 @@ pub struct App {
     pub follow: bool,
     pub model: String,
     pub auto_model: bool,
-    pub caveman: String,
     pub dir: String,
     pub git_branch: String,
     pub tokens: usize,
@@ -250,7 +249,7 @@ fn char_index_to_byte_index(s: &str, char_index: usize) -> usize {
 }
 
 impl App {
-    pub fn new(model: &str, caveman: &str) -> Self {
+    pub fn new(model: &str) -> Self {
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -272,9 +271,8 @@ impl App {
                 .into(),
             scroll_offset: 0,
             follow: true,
-model: model.to_string(),
+            model: model.to_string(),
             auto_model: false,
-            caveman: caveman.to_string(),
             dir: String::new(),
             git_branch: String::new(),
             tokens: 0,
@@ -569,9 +567,8 @@ fn handle_slash_command(
         "/status" => {
             let st = state.lock().unwrap();
             let out = format!(
-                "model: {}\ncaveman: {}\nprovider: {}\ndir: {}\ncontext tokens: {}",
+                "model: {}\nprovider: {}\ndir: {}\ncontext tokens: {}",
                 app.model,
-                app.caveman,
                 app.provider,
                 st.config.workspace_dir.display(),
                 st.session.estimated_tokens()
@@ -1243,15 +1240,7 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
 
     // Create app and event channels
     let model_name = state.config.coder_model.clone();
-    let caveman_tag = state.caveman.tag();
-    let mut initial_app = App::new(
-        &model_name,
-        if caveman_tag.is_empty() {
-            "off"
-        } else {
-            caveman_tag
-        },
-    );
+    let mut initial_app = App::new(&model_name);
     initial_app.dir = state.config.workspace_dir.display().to_string();
     initial_app.git_branch = git_branch(&state.config.workspace_dir);
     // Bring the default cloud provider online (e.g. nvidia with
@@ -2256,9 +2245,8 @@ fn draw<B: ratatui::backend::Backend>(
         // token counter right-aligned. No box — full-bleed like Claude Code/Codex.
         let header_w = size.width.saturating_sub(2) as usize;
         let left_txt = format!(
-            "  {}  ·  {}  ·  {}  ·  {}  ·  {}",
+            "  {}  ·  {}  ·  {}  ·  {}",
             truncate_str(&app.model, 22),
-            app.caveman,
             truncate_str(&app.provider, 12),
             app.git_branch,
             match app.agent_mode {
@@ -3383,7 +3371,7 @@ mod tests {
 
     #[test]
     fn feed_tool_delta_accumulates_on_one_line() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.feed_tool_delta(0, "edit_file", "{\"path\":");
         app.feed_tool_delta(0, "?", "\"a.rs\",");
         app.feed_tool_delta(0, "?", "\"new\":1}");
@@ -3394,7 +3382,7 @@ mod tests {
 
     #[test]
     fn feed_tool_delta_starts_new_line_for_new_index() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.feed_tool_delta(0, "read_file", "a");
         app.feed_tool_delta(1, "edit_file", "b");
         assert_eq!(app.messages.len(), 2);
@@ -3404,7 +3392,7 @@ mod tests {
 
     #[test]
     fn feed_text_delta_accumulates_one_live_message() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.feed_text_delta("Hello ");
         app.feed_text_delta("world");
         assert_eq!(app.messages.len(), 1);
@@ -3415,7 +3403,7 @@ mod tests {
 
     #[test]
     fn feed_text_delta_recovers_from_stale_stream_flag() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.feed_text_delta("fresh");
         assert_eq!(app.messages.len(), 1);
@@ -3424,7 +3412,7 @@ mod tests {
 
     #[test]
     fn end_streaming_replaces_live_message_once() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.feed_text_delta("partial ");
         app.feed_text_delta("text");
         let replaced = app.end_streaming(Some("final answer"));
@@ -3437,14 +3425,14 @@ mod tests {
 
     #[test]
     fn end_streaming_without_stream_noops() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         assert!(!app.end_streaming(Some("x")));
         assert!(app.messages.is_empty());
     }
 
     #[test]
     fn file_search_ranks_and_selects() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.open_file_search(vec![
             "src/main.rs".to_string(),
             "tests/main_test.rs".to_string(),
@@ -3467,7 +3455,7 @@ mod tests {
 
     #[test]
     fn open_editor_loads_lines_and_focus() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.open_editor("src/main.rs", Some("fn main() {}\n// end"));
         assert!(app.focus == Focus::Editor);
         assert_eq!(app.editor_file.as_deref(), Some("src/main.rs"));
@@ -3479,7 +3467,7 @@ mod tests {
 
     #[test]
     fn open_editor_handles_missing_content() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.open_editor("empty.txt", None);
         assert!(app.focus == Focus::Editor);
         assert!(app.editor_lines.is_empty());
@@ -3499,7 +3487,7 @@ mod tests {
         let state = Arc::new(Mutex::new(
             crate::agent::state::AgentState::new(cfg).unwrap(),
         ));
-        let app = App::new(&state.lock().unwrap().config.coder_model, "off");
+        let app = App::new(&state.lock().unwrap().config.coder_model);
         let router = LlmRouter::new(crate::llm::client::LlmClient::ollama(
             "http://localhost:11434",
         ));
@@ -3508,7 +3496,7 @@ mod tests {
 
     #[test]
     fn flatten_messages_user_prefix_and_assistant_bullet() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message("User", "fix the bug");
         app.add_message("Assistant", "Done.");
         let lines = flatten_messages(&app);
@@ -3520,7 +3508,7 @@ mod tests {
 
     #[test]
     fn flatten_messages_status_cells_are_subdued() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message("System", "ready");
         app.add_message("Error", "boom");
         app.add_message("Tool", "edit_file — changed src/main.rs");
@@ -3534,7 +3522,7 @@ mod tests {
 
     #[test]
     fn flatten_messages_collapses_tool_calls_when_expanded_is_false() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.tool_calls_expanded = false;
         app.add_message("Tool", "edit_file — changed src/main.rs");
         app.add_message("Tool", "run_tests — all passed");
@@ -3558,7 +3546,7 @@ mod tests {
 
     #[test]
     fn flatten_messages_rollup_with_streaming_delta_does_not_panic() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.tool_calls_expanded = false;
         app.add_message("Tool", "read_file — read src/main.rs");
         app.feed_tool_delta(0, "edit_file", "{\"path\":\"a.rs\"}");
@@ -3571,7 +3559,7 @@ mod tests {
 
     #[test]
     fn markdown_paragraphs_split_into_separate_lines() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message("Assistant", "first para\n\nsecond para");
         let lines = flatten_messages(&app);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
@@ -3655,7 +3643,7 @@ mod tests {
 
     #[test]
     fn feed_reasoning_delta_flushes_at_threshold() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         let chunk = "x".repeat(120);
         app.feed_reasoning_delta(&chunk);
         assert_eq!(app.reasoning.len(), 0);
@@ -3666,7 +3654,7 @@ mod tests {
 
     #[test]
     fn feed_reasoning_delta_accumulates_below_threshold() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.feed_reasoning_delta("hello ");
         app.feed_reasoning_delta("world");
         assert_eq!(app.reasoning, "hello world");
@@ -3675,7 +3663,7 @@ mod tests {
 
     #[test]
     fn end_streaming_inserts_reasoning_tail_before_assistant() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
         app.reasoning.push_str("tail reasoning");
@@ -3690,7 +3678,7 @@ mod tests {
 
     #[test]
     fn end_streaming_appends_to_existing_thinking() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
         app.messages.push(("Thinking".to_string(), "existing thinking".to_string()));
@@ -3706,7 +3694,7 @@ mod tests {
 
     #[test]
     fn end_streaming_no_content_only_flushes_reasoning() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
         app.reasoning.push_str("tail reasoning");
@@ -3721,7 +3709,7 @@ mod tests {
 
     #[test]
     fn reset_reasoning_flushes_tail() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.reasoning.push_str("small tail");
         app.reset_reasoning();
         assert!(app.reasoning.is_empty());
@@ -3732,7 +3720,7 @@ mod tests {
 
     #[test]
     fn reset_reasoning_no_op_when_empty() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.reset_reasoning();
         assert!(app.reasoning.is_empty());
         assert_eq!(app.messages.len(), 0);
@@ -3740,7 +3728,7 @@ mod tests {
 
     #[test]
     fn end_streaming_early_return_does_not_lose_reasoning() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = false;
         app.reasoning.push_str("orphaned tail");
         let finalized = app.end_streaming(Some("final content"));
@@ -3752,7 +3740,7 @@ mod tests {
 
     #[test]
     fn end_streaming_handles_multiple_thinking_flushes_after_partial() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.messages.push(("Assistant".to_string(), "streamed partial".to_string()));
         app.messages.push(("Thinking".to_string(), "flush A".to_string()));
@@ -3770,7 +3758,7 @@ mod tests {
 
     #[test]
     fn end_streaming_without_assistant_pushes_final_content() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = true;
         app.messages.push(("Thinking".to_string(), "reasoning only".to_string()));
         let finalized = app.end_streaming(Some("final content"));
@@ -3821,7 +3809,7 @@ mod tests {
 
     #[test]
     fn previous_input_cursor_at_char_count_for_multibyte() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.input_history.push("o que é".to_string());
         app.previous_input();
         assert_eq!(app.input, "o que é");
@@ -3892,7 +3880,7 @@ mod tests {
             ),
         ];
         for (md, a, b) in cases {
-            let mut app = App::new("model", "off");
+            let mut app = App::new("model");
             app.add_message("Assistant", md);
             let lines = flatten_messages(&app);
             let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
@@ -3917,7 +3905,7 @@ mod tests {
 
     #[test]
     fn markdown_soft_breaks_keep_line_breaks() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message("Assistant", "linha um\nlinha dois\nlinha três");
         let lines = flatten_messages(&app);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
@@ -3929,7 +3917,7 @@ mod tests {
 
     #[test]
     fn markdown_paragraph_boundary_does_not_glue() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message(
             "Assistant",
             "**Tecnologias principais:**\nReact Query\n\n**Backend:**\nNode.js",
@@ -3945,7 +3933,7 @@ mod tests {
 
     #[test]
     fn markdown_heading_splits_its_own_line() {
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.add_message("Assistant", "## Seção\nconteúdo\n## Outra\nmais");
         let lines = flatten_messages(&app);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
@@ -3959,7 +3947,7 @@ mod tests {
     fn reflow_renders_long_line_within_width() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = false;
         app.messages.push(("Assistant".to_string(), "x".repeat(200)));
         let backend = TestBackend::new(40, 10);
@@ -3998,7 +3986,7 @@ mod tests {
     fn resize_rerenders_without_panic_and_respects_new_width() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        let mut app = App::new("model", "off");
+        let mut app = App::new("model");
         app.streaming_assistant = false;
         app.messages.push(("Assistant".to_string(), "word ".repeat(60)));
         let backend = TestBackend::new(80, 24);

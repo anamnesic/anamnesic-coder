@@ -1,11 +1,55 @@
 use std::path::Path;
 use regex::Regex;
 
+#[derive(Debug, Clone)]
 pub struct SymbolEntry {
     pub file_path: String,
     pub symbol_type: &'static str,
     pub name: String,
     pub line_number: usize,
+}
+
+/// Queryable symbol index built from the workspace.
+pub struct SymbolIndex {
+    entries: Vec<SymbolEntry>,
+}
+
+impl SymbolIndex {
+    pub fn build(workspace: &Path) -> Self {
+        let mut symbols = Vec::new();
+        RepoMapGenerator::scan_directory(workspace, workspace, &mut symbols, 0, 4);
+        Self { entries: symbols }
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Vec<&SymbolEntry> {
+        let q = query.to_lowercase();
+        let mut results: Vec<&SymbolEntry> = self
+            .entries
+            .iter()
+            .filter(|s| s.name.to_lowercase().contains(&q))
+            .collect();
+        results.sort_by(|a, b| {
+            let a_exact = a.name.to_lowercase() == q;
+            let b_exact = b.name.to_lowercase() == q;
+            b_exact.cmp(&a_exact)
+        });
+        results.truncate(limit);
+        results
+    }
+
+    pub fn search_type(&self, symbol_type: &str, limit: usize) -> Vec<&SymbolEntry> {
+        let mut results: Vec<&SymbolEntry> = self
+            .entries
+            .iter()
+            .filter(|s| s.symbol_type == symbol_type)
+            .collect();
+        results.truncate(limit);
+        results
+    }
+
+    pub fn all(&self) -> &[SymbolEntry] {
+        &self.entries
+    }
 }
 
 pub struct RepoMapGenerator;
@@ -164,6 +208,33 @@ mod tests {
         assert!(map.contains("File `src/lib.rs`:"));
         assert!(map.contains("fn parse_input"));
         assert!(map.contains("type struct Data"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn symbol_index_searches_by_name_and_type() {
+        let temp = std::env::temp_dir().join(format!("test_symbolidx_{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("src")).unwrap();
+        std::fs::write(
+            temp.join("src/lib.rs"),
+            "pub fn parse_input() {}\npub struct Data {}\npub fn process_data() {}\n",
+        )
+        .unwrap();
+
+        let index = SymbolIndex::build(&temp);
+        let hits = index.search("parse", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "parse_input");
+        assert_eq!(hits[0].symbol_type, "fn");
+
+        let hits = index.search("data", 10);
+        assert_eq!(hits.len(), 2); // parse_input, process_data, Data
+        let fn_hits = index.search_type("fn", 10);
+        assert_eq!(fn_hits.len(), 2);
+        let type_hits = index.search_type("type", 10);
+        assert_eq!(type_hits.len(), 1);
+        assert_eq!(type_hits[0].name, "struct Data");
 
         std::fs::remove_dir_all(&temp).ok();
     }

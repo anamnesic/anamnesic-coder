@@ -66,6 +66,91 @@ fn executable_name(cmd: &str) -> Option<String> {
     cmd.split_whitespace().next().map(|s| s.to_string())
 }
 
+/// Executables that can mutate the filesystem; their path arguments are subject
+/// to the workspace-containment gate (`block_workspace_escape`).
+fn mutation_executables() -> &'static [&'static str] {
+    &[
+        "rm", "rmdir", "mv", "cp", "ln", "mkdir", "md", "install", "truncate", "dd", "shred",
+        "chmod", "chown", "touch", "tee", "vi", "vim", "nano", "ed",
+        "del", "erase", "deltree", "rd", "ren", "rename", "move", "copy", "xcopy",
+        "attrib", "takeown", "icacls", "sc", "reg", "wmic",
+        "powershell", "pwsh", "cmd",
+    ]
+}
+
+/// True when the resolved absolute target of `token` (an absolute path) falls
+/// outside the workspace and outside every allowlisted prefix.
+fn token_escapes_workspace(token: &str, config: &Config) -> bool {
+    let trimmed = token.trim_matches(['"', '\'']);
+    let path = std::path::PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return false;
+    }
+    let normalized = crate::tools::fs::normalize_workspace_path(&path);
+    if normalized.starts_with(&config.workspace_dir) {
+        return false;
+    }
+    !config.path_allowlist.iter().any(|allowed| {
+        let allowed = std::path::PathBuf::from(allowed);
+        normalized.starts_with(&allowed)
+    })
+}
+
+/// Workspace-containment gate: when enabled, a *mutation* command whose path
+/// arguments reference absolute paths outside the workspace (and outside the
+/// allowlist) is refused before it can run. Read-only commands (`git`, `cargo`,
+/// `ls`, ...) are not scanned, keeping false positives low.
+pub fn escapes_workspace(cmd: &str, config: &Config) -> bool {
+    if !config.block_workspace_escape {
+        return false;
+    }
+    let tokens: Vec<String> = tokenize(cmd);
+    let Some(executable) = tokens.first() else {
+        return false;
+    };
+    let exe = executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    if !mutation_executables().contains(&exe.as_str()) {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(1)
+        .any(|arg| token_escapes_workspace(arg, config))
+}
+
+/// Split a command string into whitespace-delimited tokens, honoring single and
+/// double quotes. Unlike `parse_command`, this keeps Windows backslash paths
+/// intact (backslash is a path separator, not a shell metacharacter here).
+fn tokenize(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in cmd.chars() {
+        match ch {
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(ch);
+            }
+            c if Some(c) == quote => {
+                quote = None;
+            }
+            c if quote.is_none() && c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Check whether a command is allowed by the allow/block lists.
 pub fn is_allowed(cmd: &str, config: &Config) -> bool {
     let trimmed = cmd.trim();
@@ -91,20 +176,27 @@ pub fn is_allowed(cmd: &str, config: &Config) -> bool {
 
     // If allowed_commands is empty or contains wildcard "*", allow all non-blocked commands
     if config.allowed_commands.is_empty() || config.allowed_commands.iter().any(|a| a == "*") {
-        return true;
+        return !escapes_workspace(cmd, config);
     }
 
     // Check allowed_commands list
-    config.allowed_commands.iter().any(|a| {
+    let listed = config.allowed_commands.iter().any(|a| {
         let a_lower = a.to_lowercase();
         exe_lower == a_lower
             || exe_lower.ends_with(&format!("/{a_lower}"))
             || exe_lower.ends_with(&format!("\\{a_lower}"))
-    })
+    });
+    listed && !escapes_workspace(cmd, config)
 }
 
 /// Run an allowlisted command with a timeout and return combined output.
 pub fn run_command(cmd: &str, config: &Config) -> String {
+    if escapes_workspace(cmd, config) {
+        return format!(
+            "Command rejected: it mutates a path outside the workspace (and outside PATH_ALLOWLIST): {}",
+            cmd
+        );
+    }
     if !is_allowed(cmd, config) {
         return format!(
             "Command not in allowed list or contains blocked operation: {}",
@@ -127,6 +219,16 @@ pub fn run_command_raw_with_interrupt(
     config: &Config,
     interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> CommandOutput {
+    if escapes_workspace(cmd, config) {
+        return CommandOutput {
+            code: None,
+            stdout: String::new(),
+            stderr: format!(
+                "Command rejected: it mutates a path outside the workspace (and outside PATH_ALLOWLIST): {cmd}"
+            ),
+            timed_out: false,
+        };
+    }
     if !is_allowed(cmd, config) {
         return CommandOutput {
             code: None,
@@ -338,5 +440,49 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(out.contains("command timed out"), "got: {out}");
+    }
+
+    #[test]
+    fn mutation_command_with_absolute_escape_is_rejected() {
+        let cfg = test_config();
+        // Read-only commands pass even with absolute paths.
+        assert!(is_allowed("git status C:/Windows/System32", &cfg));
+        // Mutation commands with args outside the workspace are blocked.
+        let outside = cfg
+            .workspace_dir
+            .parent()
+            .unwrap_or(std::path::Path::new("/"))
+            .to_path_buf();
+        assert!(!is_allowed(&format!("rm {}", outside.display()), &cfg));
+        assert!(!is_allowed(&format!("mkdir {}", outside.display()), &cfg));
+    }
+
+    #[test]
+    fn mutation_command_inside_workspace_is_allowed() {
+        let cfg = test_config();
+        let inside = cfg.workspace_dir.join("subdir");
+        assert!(is_allowed(&format!("mkdir {}", inside.display()), &cfg));
+    }
+
+    #[test]
+    fn disable_block_workspace_escape_lets_mutation_run() {
+        let mut cfg = test_config();
+        cfg.block_workspace_escape = false;
+        let outside = std::env::temp_dir();
+        assert!(is_allowed(&format!("rm {}file", outside.display()), &cfg));
+    }
+
+    #[test]
+    fn path_allowlist_permits_external_mutation_target() {
+        let mut cfg = test_config();
+        let outside = cfg
+            .workspace_dir
+            .parent()
+            .unwrap_or(std::path::Path::new("/"))
+            .to_path_buf();
+        cfg.path_allowlist
+            .push(outside.display().to_string());
+        let target = outside.join("anamnesic_bash_subdir");
+        assert!(is_allowed(&format!("mkdir {}", target.display()), &cfg));
     }
 }

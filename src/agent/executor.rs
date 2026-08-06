@@ -282,15 +282,13 @@ pub async fn execute_step(
     step: &PlanStep,
     hooks: &AgentHooks,
 ) {
-    let caveman = state.caveman;
-    execute_step_inner(client, state, step, caveman, hooks).await
+    execute_step_inner(client, state, step, hooks).await
 }
 
 async fn execute_step_inner(
     client: &LlmRouter,
     state: &mut AgentState,
     step: &PlanStep,
-    caveman: crate::compressor::caveman::CavemanLevel,
     hooks: &AgentHooks,
 ) {
     match step.step_type.as_str() {
@@ -307,7 +305,7 @@ async fn execute_step_inner(
                 write_with_verification(client, state, &fname, |extra| {
                     format!(
                         "{}\n\nContext:\n{}\n\nTask:\nCreate file '{}': {}\nReturn only the COMPLETE file content inside a single code block.\n{}",
-                        CoderPrompt::with_caveman(&caveman),
+                        CoderPrompt::system(),
                         context,
                         fname,
                         description,
@@ -336,7 +334,7 @@ async fn execute_step_inner(
                 write_with_verification(client, state, &fname, |extra| {
                     format!(
                         "{}\n\nFile: {}\n\nContent:\n```\n{}\n```\n\nInstruction: {}\n{}\nReturn only the COMPLETE modified file content inside a single code block.",
-                        CoderPrompt::with_caveman(&caveman),
+                        CoderPrompt::system(),
                         fname,
                         file_content,
                         description,
@@ -426,7 +424,7 @@ async fn execute_step_inner(
         }
         "answer" => {
             let context = grep_context(state);
-            let system = CoderPrompt::with_caveman(&caveman);
+            let system = CoderPrompt::system();
             let prompt = format!(
                 "{}\n\nContext:\n{}\n\nTask:\n{}",
                 system, context, step.description

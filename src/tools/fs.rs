@@ -67,6 +67,10 @@ pub fn normalize_workspace_path(path: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct FileTools {
     workspace: PathBuf,
+    /// Absolute path prefixes outside the workspace that are explicitly permitted.
+    allowlist: Vec<PathBuf>,
+    /// Workspace-relative prefixes (e.g. `.git`) that are forbidden.
+    denylist: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,13 +219,82 @@ mod tests {
         assert_eq!(tools.read_file(&absolute).unwrap(), "data");
         let _ = std::fs::remove_dir_all(cwd.join("verbatim-sub"));
     }
+
+    #[test]
+    fn denylist_blocks_workspace_relative_prefix() {
+        let workspace = temp_workspace();
+        let tools = FileTools::new_with_policy(
+            workspace.clone(),
+            Vec::new(),
+            vec![".git".into(), "secrets/keys".into()],
+        );
+        assert!(tools.read_file(".git/config").is_none());
+        assert!(tools.read_file("secrets/keys/private.key").is_none());
+        // sibling of a denylisted prefix is still reachable
+        tools.write_file("secrets/other.txt", "ok").unwrap();
+        assert_eq!(tools.read_file("secrets/other.txt").unwrap(), "ok");
+    }
+
+    #[test]
+    fn allowlist_permits_external_path() {
+        let workspace = temp_workspace();
+        let outside = std::env::temp_dir().join(format!(
+            "anamnesic-allow-out-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.txt"), "external").unwrap();
+        let tools = FileTools::new_with_policy(
+            workspace.clone(),
+            vec![outside.display().to_string()],
+            Vec::new(),
+        );
+        assert_eq!(
+            tools
+                .read_file(outside.join("target.txt").to_str().unwrap())
+                .unwrap(),
+            "external"
+        );
+        // a different outside area is still blocked
+        let other = std::env::temp_dir().join(format!(
+            "anamnesic-allow-other-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("x.txt"), "nope").unwrap();
+        assert!(tools
+            .read_file(other.join("x.txt").to_str().unwrap())
+            .is_none());
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&other);
+    }
 }
 
 impl FileTools {
     pub fn new(workspace: PathBuf) -> Self {
+        Self::new_with_policy(workspace, Vec::new(), Vec::new())
+    }
+
+    pub fn new_with_policy(
+        workspace: PathBuf,
+        allowlist: Vec<String>,
+        denylist: Vec<String>,
+    ) -> Self {
         let ws = normalize_workspace_path(&workspace);
         fs::create_dir_all(&ws).ok();
-        FileTools { workspace: ws }
+        let allowlist = allowlist
+            .into_iter()
+            .map(|entry| normalize_workspace_path(&PathBuf::from(entry)))
+            .collect();
+        let denylist = denylist
+            .into_iter()
+            .map(|entry| entry.replace('\\', "/").trim_matches('/').to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        FileTools { workspace: ws, allowlist, denylist }
     }
 
     /// Canonicalized workspace root the tools operate inside.
@@ -253,11 +326,58 @@ impl FileTools {
         for part in suffix.iter().rev() {
             real.push(part);
         }
-        if self.contains_path(&real) {
+        if self.denylisted(&normalized) {
+            return None;
+        }
+        if self.contains_path(&real) || self.allowed_outside(&real) {
             Some(real)
         } else {
             None
         }
+    }
+
+    /// True when the lexical (pre-canonicalization) path falls under one of the
+    /// workspace-relative deny prefixes (e.g. `.git`).
+    fn denylisted(&self, path: &Path) -> bool {
+        if self.denylist.is_empty() {
+            return false;
+        }
+        let Some(relative) = path.strip_prefix(&self.workspace).ok() else {
+            return false;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let relative = relative.trim_matches('/');
+        self.denylist.iter().any(|entry| {
+            relative == entry || relative.starts_with(&format!("{entry}/"))
+        })
+    }
+
+    /// True when `candidate` (already known to be outside the workspace) lives
+    /// under one of the explicitly allowed external path prefixes.
+    fn allowed_outside(&self, candidate: &Path) -> bool {
+        let cand = {
+            #[cfg(windows)]
+            {
+                strip_verbatim_prefix(candidate)
+            }
+            #[cfg(not(windows))]
+            {
+                candidate.to_path_buf()
+            }
+        };
+        self.allowlist.iter().any(|allowed| {
+            let allowed = {
+                #[cfg(windows)]
+                {
+                    strip_verbatim_prefix(allowed)
+                }
+                #[cfg(not(windows))]
+                {
+                    allowed.clone()
+                }
+            };
+            cand.starts_with(&allowed)
+        })
     }
 
     /// True when `candidate` lives inside the workspace, tolerating Windows

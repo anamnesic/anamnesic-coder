@@ -1,5 +1,3 @@
-use crate::compressor::caveman::CavemanLevel;
-
 const PROMPT_VERSION: &str = "0.1.0";
 
 pub struct PlannerPrompt;
@@ -33,16 +31,6 @@ Output JSON format:
 }
 
 Keep plans minimal: 1-6 steps. Only include necessary steps. Output ONLY the JSON, nothing else."#
-    }
-
-    pub fn with_caveman(level: &CavemanLevel) -> String {
-        let base = Self::system();
-        let suffix = level.system_prompt_suffix();
-        if suffix.is_empty() {
-            base.to_string()
-        } else {
-            format!("{}{}", base, suffix)
-        }
     }
 
     pub fn version() -> &'static str {
@@ -79,23 +67,14 @@ impl CoderPrompt {
         loaded.join("\n\n")
     }
 
-    pub fn with_context(level: &CavemanLevel, project_context: &str) -> String {
+    pub fn with_context(project_context: &str) -> String {
         let base = Self::system();
-        let suffix = level.system_prompt_suffix();
-        let mut prompt = if suffix.is_empty() {
-            base.to_string()
-        } else {
-            format!("{}{}", base, suffix)
-        };
+        let mut prompt = base.to_string();
         if !project_context.trim().is_empty() {
             prompt.push_str("\n\nProject Instructions:\n");
             prompt.push_str(project_context.trim());
         }
         prompt
-    }
-
-    pub fn with_caveman(level: &CavemanLevel) -> String {
-        Self::with_context(level, "")
     }
 
     pub fn version() -> &'static str {
@@ -117,7 +96,7 @@ mod tests {
         assert!(ctx.contains("AGENTS.md"));
         assert!(ctx.contains("Rule 1"));
 
-        let full_prompt = CoderPrompt::with_context(&CavemanLevel::Off, &ctx);
+        let full_prompt = CoderPrompt::with_context(&ctx);
         assert!(full_prompt.contains("Project Instructions:"));
         assert!(full_prompt.contains("Rule 1"));
 

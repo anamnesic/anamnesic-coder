@@ -6,6 +6,7 @@ use crate::llm::prompt::CoderPrompt;
 use crate::llm::router::LlmRouter;
 use crate::tools::shell;
 use crate::tools::test::{self, VerificationResult, VerificationStatus};
+use crate::tools::background::TaskStatus;
 use crate::ui::AgentMode;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -358,7 +359,7 @@ async fn run_tool_use_iteration(
     prior: &[(String, String)],
 ) -> Result<ToolLoopOutcome> {
     let project_ctx = CoderPrompt::load_project_context(&state.config.workspace_dir);
-    let system_prompt = CoderPrompt::with_context(&state.caveman, &project_ctx);
+    let system_prompt = CoderPrompt::with_context(&project_ctx);
     let mut conversation: Vec<serde_json::Value> =
         vec![serde_json::json!({"role": "system", "content": system_prompt})];
     for (role, content) in prior {
@@ -565,7 +566,13 @@ async fn run_tool_use_iteration(
         }
 
         let mut final_text = audited_final_text(state, &response);
-        final_text.push_str(&finalize_transaction(state, hooks, true));
+        let diff_note = finalize_transaction(state, hooks, true);
+        if let Some(concerns) = run_adversarial_review(client, state, &diff_note).await {
+            hooks.note(&format!("[adversarial review] {concerns}"));
+            final_text.push_str("\n\nAdversarial review notes:\n");
+            final_text.push_str(&concerns);
+        }
+        final_text.push_str(&diff_note);
         return Ok(ToolLoopOutcome::Completed(final_text));
     }
 
@@ -656,7 +663,8 @@ enum ToolEffect {
 
 fn tool_effect(name: &str) -> ToolEffect {
     match name {
-        "read_file" | "list_tree" | "search_code" | "git_status" | "git_diff" => {
+        "read_file" | "list_tree" | "search_code" | "git_status" | "git_diff"
+        | "list_skills" | "load_skill" => {
             ToolEffect::ReadOnly
         }
             "write_file" | "replace_exact" | "edit_file" | "multi_edit_file" => ToolEffect::Mutation,
@@ -845,6 +853,15 @@ fn execute_read_only(
                 cap,
             )),
             None => ToolExecutionResult::output("missing required argument: pattern"),
+        },
+        "symbol_search" => match string_arg("query") {
+            Some(query) => {
+                let limit = usize_arg("limit").unwrap_or(50);
+                let results = crate::tools::symbol::search_symbols(&context.workspace, query, limit);
+                let formatted = crate::tools::symbol::format_symbols(&results);
+                ToolExecutionResult::output(truncate_tool_output(&formatted, cap))
+            }
+            None => ToolExecutionResult::output("missing required argument: query"),
         },
         "git_status" => {
             ToolExecutionResult::output(truncate_tool_output(&context.git.status(), cap))
@@ -1165,42 +1182,189 @@ fn execute_tool(
                 },
             }
         }
-        "task" => {
-            let Some(task) = string_arg("task") else {
-                return ToolExecutionResult::output("missing required argument: task");
+        "list_skills" => {
+            let skills = state.skills.list();
+            if skills.is_empty() {
+                ToolExecutionResult::output(
+                    "No skills found. Add Markdown files to ./skills or ~/.anamnesic/skills.",
+                )
+            } else {
+                let body: Vec<String> = skills
+                    .iter()
+                    .enumerate()
+                    .map(|(i, skill)| format!("{}. {}", i + 1, skill.summary()))
+                    .collect();
+                ToolExecutionResult::output(body.join("\n"))
+            }
+        }
+        "load_skill" => {
+            let Some(name) = string_arg("name") else {
+                return ToolExecutionResult::output("missing required argument: name");
             };
-                let model = string_arg("model").unwrap_or(&state.config.coder_model);
-                let (tx, rx) = mpsc::channel::<(String, bool)>();
-                let tx = Arc::new(Mutex::new(Some(tx)));
+            match state.skills.get(&name) {
+                Some(skill) => ToolExecutionResult::output(format!(
+                    "# Skill: {}\n\n{}",
+                    skill.name, skill.body
+                )),
+                None => ToolExecutionResult::output(format!(
+                    "skill '{name}' not found. Call list_skills to see available skills."
+                )),
+            }
+        }
+        "spawn_background" => {
+            let Some(command) = string_arg("command") else {
+                return ToolExecutionResult::output("missing required argument: command");
+            };
+            match state.background.spawn(command, &state.config) {
+                Ok(id) => ToolExecutionResult::output(format!(
+                    "Background task {id} started: `{command}`. Poll with background_status."
+                )),
+                Err(error) => ToolExecutionResult::output(format!("spawn failed: {error}")),
+            }
+        }
+        "background_status" => {
+            let Some(id) = string_arg("id") else {
+                return ToolExecutionResult::output("missing required argument: id");
+            };
+            match state.background.status(&id) {
+                Some((status, output, elapsed)) => {
+                    let label = match status {
+                        TaskStatus::Running => "running".to_string(),
+                        TaskStatus::Done { exit_code, timed_out } => match (exit_code, timed_out) {
+                            (Some(code), false) => format!("done (exit {code})"),
+                            (None, true) => "done (timed out)".to_string(),
+                            _ => "done".to_string(),
+                        },
+                    };
+                    ToolExecutionResult::output(format!(
+                        "[{id}] {label} (elapsed {:.1}s)\n{output}",
+                        elapsed.as_secs_f64()
+                    ))
+                }
+                None => ToolExecutionResult::output(format!("no background task with id {id}")),
+            }
+        }
+        "list_background" => {
+            let list = state.background.list();
+            if list.is_empty() {
+                ToolExecutionResult::output("No background tasks.")
+            } else {
+                let lines: Vec<String> = list
+                    .iter()
+                    .map(|(id, cmd, status)| format!("{id}  `{cmd}`  {status}"))
+                    .collect();
+                ToolExecutionResult::output(lines.join("\n"))
+            }
+        }
+        "kill_background" => {
+            let Some(id) = string_arg("id") else {
+                return ToolExecutionResult::output("missing required argument: id");
+            };
+            if state.background.kill(&id) {
+                ToolExecutionResult::output(format!("Background task {id} killed."))
+            } else {
+                ToolExecutionResult::output(format!("no background task with id {id}"))
+            }
+        }
+        "symbol_search" => {
+            let Some(query) = string_arg("query") else {
+                return ToolExecutionResult::output("missing required argument: query");
+            };
+            let symbol_type = string_arg("symbol_type");
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(50);
+            let index = crate::repo::SymbolIndex::build(&state.config.workspace_dir);
+            let results = if let Some(st) = symbol_type {
+                index
+                    .all()
+                    .iter()
+                    .filter(|s| s.symbol_type == st && s.name.to_lowercase().contains(&query.to_lowercase()))
+                    .take(limit)
+                    .collect()
+            } else {
+                index.search(&query, limit)
+            };
+            if results.is_empty() {
+                ToolExecutionResult::output("No matching symbols.")
+            } else {
+                let lines: Vec<String> = results
+                    .iter()
+                    .map(|s| format!("{} {} {}:{}", s.symbol_type, s.name, s.file_path, s.line_number))
+                    .collect();
+                ToolExecutionResult::output(lines.join("\n"))
+            }
+        }
+        "task" => {
+            let model = string_arg("model").unwrap_or(&state.config.coder_model).to_string();
+            // Accept either a single `task` string or a `tasks` array; the
+            // array form fans out to N sub-agents that run concurrently and
+            // report back together (C3 parallel sub-agents).
+            let tasks: Vec<String> = if let Some(arr) = args.get("tasks").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.trim().is_empty())
+                    .collect()
+            } else if let Some(single) = string_arg("task") {
+                vec![single.to_string()]
+            } else {
+                return ToolExecutionResult::output(
+                    "missing required argument: task (string) or tasks (array of strings)",
+                );
+            };
+            if tasks.is_empty() {
+                return ToolExecutionResult::output("no tasks provided");
+            }
+            let total = tasks.len();
+            let (tx, rx) = mpsc::channel::<(usize, String, bool)>();
+            for (idx, task) in tasks.into_iter().enumerate() {
+                let tx = Arc::new(Mutex::new(Some(tx.clone())));
                 let client = client.clone();
-                let mut sub_state = match AgentState::new(state.config.clone()) {
-                    Ok(mut s) => {
-                        s.session_persist = false;
-                        s
-                    }
-                    Err(e) => return ToolExecutionResult::output(format!("Failed to initialize sub-agent state: {e}")),
-                };
-                let task = task.to_string();
-                let model = model.to_string();
+                let config = state.config.clone();
                 let sub_approval = hooks.on_approval.clone();
                 thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(error) => {
+                            if let Some(tx) = tx.lock().unwrap().take() {
+                                let _ = tx.send((idx, format!("runtime error: {error}"), false));
+                            }
+                            return;
+                        }
+                    };
                     rt.block_on(async move {
+                        let mut sub_state = match AgentState::new(config) {
+                            Ok(mut s) => {
+                                s.session_persist = false;
+                                s
+                            }
+                            Err(error) => {
+                                if let Some(tx) = tx.lock().unwrap().take() {
+                                    let _ =
+                                        tx.send((idx, format!("state init failed: {error}"), false));
+                                }
+                                return;
+                            }
+                        };
                         let _ = sub_state.start_turn();
                         sub_state.session.add_message("user", &task);
+                        let entry_tx = tx.clone();
                         let sub_hooks = AgentHooks {
-                            on_event: Some(Arc::new({
-                                let tx = tx.clone();
-                                move |event| {
-                                    if let AgentEvent::Done { message } = event {
-                                        if let Some(tx) = tx.lock().unwrap().take() {
-                                            let _ = tx.send((message.clone(), true));
-                                        }
-                                    } else if let AgentEvent::Failed { message } = event {
-                                        if let Some(tx) = tx.lock().unwrap().take() {
-                                            let _ = tx.send((message.clone(), false));
+                            on_event: Some(Arc::new(move |event| {
+                                match event {
+                                    AgentEvent::Done { message } => {
+                                        if let Some(tx) = entry_tx.lock().unwrap().take() {
+                                            let _ = tx.send((idx, message.clone(), true));
                                         }
                                     }
+                                    AgentEvent::Failed { message } => {
+                                        if let Some(tx) = entry_tx.lock().unwrap().take() {
+                                            let _ = tx.send((idx, message.clone(), false));
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             })),
                             on_tool_call_delta: None,
@@ -1216,20 +1380,42 @@ fn execute_tool(
                             AgentMode::Agent,
                         )
                         .await;
+                        // Safety net: if the sub-agent never emitted Done/Failed,
+                        // report completion from its last session state so the
+                        // parent is never stuck waiting on `barrier`.
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send((idx, "(no result)".into(), true));
+                        }
                     });
                 });
-                match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-                    Ok((msg, ok)) => ToolExecutionResult {
-                        output: format!("[task:{model}] {msg}"),
-                        mutated: false,
-                        changed_file: None,
-                        verification: None,
-                        exit_code: None,
-                        timed_out: !ok,
-                    },
-                    Err(_) => ToolExecutionResult::output(format!("[task:{model}] timed out")),
+            }
+            // Gather one message per task, bounded by a 5-minute wall clock so
+            // a stuck sub-agent cannot hang the parent turn.
+            let model = model; // reused for the timed-out message
+            let mut results: Vec<(usize, String, bool)> = Vec::with_capacity(total);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            while results.len() < total {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(remaining) {
+                    Ok(item) => results.push(item),
+                    Err(_) => break,
                 }
             }
+            results.sort_by_key(|(idx, _, _)| *idx);
+            let body: Vec<String> = results
+                .iter()
+                .enumerate()
+                .map(|(pos, (_idx, msg, ok))| {
+                    let status = if *ok { "ok" } else { "failed" };
+                    format!("[task {}/{}]: ({status}) {msg}", pos + 1, total)
+                })
+                .collect();
+            ToolExecutionResult::output(if body.is_empty() {
+                format!("[task:{model}] timed out")
+            } else {
+                body.join("\n\n")
+            })
+        }
         _ => {
             if let Some(result) = try_mcp_tool(state, tc, hooks) {
                 result
@@ -1294,6 +1480,49 @@ fn automatic_verification(state: &AgentState) -> VerificationResult {
     }
 }
 
+/// Pure helper: build the prompt for the adversarial critique pass. Kept free
+/// of I/O so it can be unit-tested.
+fn build_adversarial_prompt(diff_summary: &str, changed_files: &str) -> String {
+    format!(
+        "You are an adversarial code reviewer. The following changes just passed the project's tests and lint gate.\n\
+Critique them for regressions, security issues, weakened/removed tests, data loss or behavior changes not implied by the task.\n\
+Be concise and concrete. If everything is fine, reply with exactly: OK\n\
+\nChanged files:\n{changed_files}\n\nDiff summary:\n{diff_summary}\n\n\
+Reply with a short bullet list of concerns, or OK if none."
+    )
+}
+
+/// Run the adversarial critique pass. Returns the model's reply (which may be
+/// `OK`) on success, or an explanatory message on failure. Only the concerns
+/// when the reply is not a clean `OK` are surfaced into the audit.
+async fn run_adversarial_review(
+    client: &LlmRouter,
+    state: &AgentState,
+    diff_summary: &str,
+) -> Option<String> {
+    if !state.config.adversarial_verification {
+        return None;
+    }
+    if state.changed_files.is_empty() {
+        return None;
+    }
+    let changed_files = state
+        .changed_files
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prompt = build_adversarial_prompt(diff_summary, &changed_files);
+    match client
+        .generate_with_retry_with_fallback(&state.config.summarizer_model, &prompt, None, None)
+        .await
+    {
+        Ok(reply) if reply.trim().eq_ignore_ascii_case("OK") => None,
+        Ok(reply) => Some(reply.trim().to_string()),
+        Err(error) => Some(format!("(adversarial review failed: {error})")),
+    }
+}
+
 /// Close the turn's workspace transaction. On success the changes are kept and
 /// summarized; on failure they are rolled back to the turn baseline (which
 /// preserves any pre-existing local modifications) unless disabled.
@@ -1313,10 +1542,20 @@ fn finalize_transaction(state: &mut AgentState, hooks: &AgentHooks, succeeded: b
             return String::new();
         }
         hooks.transaction("keep", &diff.summary());
+        let fingerprint = state
+            .transaction
+            .as_ref()
+            .map(|t| t.fingerprint())
+            .unwrap_or_default();
         if state.config.require_diff_summary {
-            return format!("\nWorkspace diff: {}", diff.summary());
+            return format!(
+                "\nWorkspace diff: {} (checksum: {}, baseline: {})",
+                diff.summary(),
+                diff.checksum(),
+                fingerprint
+            );
         }
-        return String::new();
+        return format!("\nWorkspace diff: {} (checksum: {})", diff.summary(), diff.checksum());
     }
 
     if !state.config.rollback_on_failure {
@@ -1568,6 +1807,17 @@ fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
             ),
         ),
         tool(
+            "symbol_search",
+            "Search workspace symbols (functions, structs, classes, etc.) by name. Returns symbol type, file, and line number. Use for finding definitions.",
+            object(
+                serde_json::json!({
+                    "query": {"type":"string"},
+                    "limit": {"type":"integer","minimum":1,"maximum":100}
+                }),
+                serde_json::json!(["query"]),
+            ),
+        ),
+        tool(
             "git_status",
             "Show repository status without modifying it.",
             object(serde_json::json!({}), serde_json::json!([])),
@@ -1598,13 +1848,14 @@ fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
         ),
         tool(
             "task",
-            "Spawn a sub-agent to execute a self-contained task in isolation. Use for complex multi-step work that should not pollute the current session.",
+            "Spawn one or more sub-agents to execute self-contained tasks in isolation. Pass `task` for a single task, or `tasks` (array of strings) to run several concurrently. Use for parallel research or independent edits that should not pollute the current session.",
             object(
                 serde_json::json!({
                     "task": {"type": "string"},
+                    "tasks": {"type": "array", "items": {"type": "string"}},
                     "model": {"type": "string"}
                 }),
-                serde_json::json!(["task"]),
+                serde_json::json!([]),
             ),
         ),
         tool(
@@ -1645,11 +1896,73 @@ fn coding_tools(state: &mut AgentState) -> Vec<crate::llm::client::ToolDef> {
         ),
         tool(
             "memory_search",
-            "Semantic recall across past sessions and assistant outputs. Returns the most similar stored texts with scores. Requires a local embedding model (EMBEDDING_MODEL or --download-embedding-model). The first call loads the model (may take a minute or two on CPU).",
+            "Semantic recall across past sessions and assistant outputs. Returns the most similar stored texts with scores. Requires the global embedding model (run --download-embedding-model once; stored in ~/.anamnesic/models). The first call loads the model (may take a minute or two on CPU).",
             object(
                 serde_json::json!({
                     "query": {"type":"string"},
                     "k": {"type":"integer","minimum":1,"maximum":50}
+                }),
+                serde_json::json!(["query"]),
+            ),
+        ),
+        tool(
+            "list_skills",
+            "List available skill packs discovered in ./skills and ~/.anamnesic/skills. Each skill is a Markdown document of specialized instructions.",
+            object(serde_json::json!({}), serde_json::json!([])),
+        ),
+        tool(
+            "load_skill",
+            "Load a skill pack by name and return its body so it can be applied to the current task. Use list_skills first to discover names.",
+            object(
+                serde_json::json!({
+                    "name": {"type":"string"}
+                }),
+                serde_json::json!(["name"]),
+            ),
+        ),
+        tool(
+            "spawn_background",
+            "Start a long-running command detached (build, watch, large test). Reuses the same allow/block policy as run_command. Returns a task id to poll later.",
+            object(
+                serde_json::json!({
+                    "command": {"type":"string"}
+                }),
+                serde_json::json!(["command"]),
+            ),
+        ),
+        tool(
+            "background_status",
+            "Poll a background task by id. Returns status (running/done), elapsed seconds and captured output so far.",
+            object(
+                serde_json::json!({
+                    "id": {"type":"string"}
+                }),
+                serde_json::json!(["id"]),
+            ),
+        ),
+        tool(
+            "list_background",
+            "List running and recently finished background tasks (id, command, status).",
+            object(serde_json::json!({}), serde_json::json!([])),
+        ),
+        tool(
+            "kill_background",
+            "Stop a running background task by id.",
+            object(
+                serde_json::json!({
+                    "id": {"type":"string"}
+                }),
+                serde_json::json!(["id"]),
+            ),
+        ),
+        tool(
+            "symbol_search",
+            "Search workspace symbols (functions, types, classes) extracted from source files. Supports Rust, Python, JavaScript/TypeScript. Query matches symbol names; use symbol_type filter (e.g. 'fn', 'struct', 'def', 'class', 'function') to narrow.",
+            object(
+                serde_json::json!({
+                    "query": {"type":"string"},
+                    "symbol_type": {"type":"string"},
+                    "limit": {"type":"integer","minimum":1,"maximum":100}
                 }),
                 serde_json::json!(["query"]),
             ),
@@ -1685,10 +1998,6 @@ pub async fn run_agent_loop_with_hooks(
     if let Err(error) = state.start_turn() {
         hooks.failed(&format!("Could not snapshot the workspace: {error}"));
         return;
-    }
-    let caveman_tag = state.caveman.tag();
-    if !caveman_tag.is_empty() {
-        hooks.note(&format!("[{}]", caveman_tag));
     }
     hooks.note(&format!("[Planning] {task}"));
     state.session.add_message("user", task);
@@ -1785,7 +2094,6 @@ async fn run_planner_fallback(
         &state.config.planner_model,
         task,
         &context,
-        &state.caveman,
     )
     .await
     .unwrap_or_else(|e| {
@@ -1915,6 +2223,15 @@ async fn run_planner_fallback(
 mod tests {
     use super::*;
 
+    #[test]
+    fn adversarial_prompt_mentions_files_and_diff() {
+        let prompt = build_adversarial_prompt("+1 −1 src/lib.rs", "src/lib.rs, src/main.rs");
+        assert!(prompt.contains("adversarial code reviewer"));
+        assert!(prompt.contains("src/lib.rs, src/main.rs"));
+        assert!(prompt.contains("+1 −1 src/lib.rs"));
+        assert!(prompt.contains("OK"));
+    }
+
     fn tool_call(name: &str, arguments: serde_json::Value) -> crate::llm::client::ToolCall {
         crate::llm::client::ToolCall {
             id: format!("call_{name}"),
@@ -1993,7 +2310,11 @@ mod tests {
 
         let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
 
-        assert!(result.output.contains("[task:"), "got: {}", result.output);
+        assert!(
+            result.output.contains("[task ") || result.output.contains("[task:"),
+            "got: {}",
+            result.output
+        );
         assert!(
             result.output.contains("hello")
                 || result.output.contains("timed out")
@@ -2001,6 +2322,21 @@ mod tests {
             "got: {}",
             result.output
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_tool_runs_parallel_subagents() {
+        let (mut state, root) = test_state("task-parallel");
+        let call = tool_call(
+            "task",
+            serde_json::json!({"tasks": ["hello from A", "hello from B"]}),
+        );
+        let result = execute_tool(&dummy_router(), &mut state, &call, &AgentHooks::default());
+        // Both sub-agents report back; on the dummy router both return an
+        // API-request-failed message, which still proves fan-out + aggregation.
+        assert!(result.output.contains("[task 1/2]"), "got: {}", result.output);
+        assert!(result.output.contains("[task 2/2]"), "got: {}", result.output);
         let _ = std::fs::remove_dir_all(root);
     }
 

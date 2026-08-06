@@ -8,7 +8,8 @@ use crate::llm::infer::gguf::GgufReader;
 use crate::llm::infer::model::Model;
 use crate::llm::infer::tokenizer::Tokenizer;
 
-/// Default embedding model file name placed under `<models_dir>/embeddings/`.
+/// Default embedding model file name placed under
+/// `~/.anamnesic/models/embeddings/`.
 pub const EMBEDDING_DEFAULT: &str = "Qwen3-Embedding-0.6B-Q8_0.gguf";
 
 /// Candidate download sources, tried in order. Qwen3-Embedding 0.6B is the
@@ -41,12 +42,11 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    pub fn new(models_dir: &Path, embedding_model: Option<&str>) -> Self {
-        let source =
-            resolve_source(models_dir, embedding_model).map(|path| EmbedderSource::Gguf {
-                path,
-                max_seq_len: 512,
-            });
+    pub fn new() -> Self {
+        let source = resolve_source().map(|path| EmbedderSource::Gguf {
+            path,
+            max_seq_len: 512,
+        });
         Self {
             source,
             engine: Mutex::new(None),
@@ -62,7 +62,7 @@ impl Embedder {
     pub fn embed(&self, text: &str, kind: EmbedKind) -> Result<Vec<f32>> {
         let Some(source) = &self.source else {
             anyhow::bail!(
-                "no embedding model configured — run `anamnesic --download-embedding-model` or point EMBEDDING_MODEL at a GGUF file"
+                "no embedding model configured — run `anamnesic --download-embedding-model` once (stores the model in ~/.anamnesic/models)"
             );
         };
         let mut guard = self.engine.lock().unwrap();
@@ -95,31 +95,18 @@ impl Embedder {
     }
 }
 
-/// Locate an embedding GGUF: explicit `EMBEDDING_MODEL` path first, then any
-/// `.gguf` in `<models_dir>/embeddings/`, then the default filename.
-fn resolve_source(models_dir: &Path, embedding_model: Option<&str>) -> Option<PathBuf> {
-    if let Some(model) = embedding_model {
-        if !model.is_empty() {
-            let path = PathBuf::from(model);
-            if path.is_absolute() {
-                return path.exists().then_some(path);
-            }
-            let candidate = models_dir.join("embeddings").join(&path);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            let candidate = models_dir.join(&path);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            log::warn!(
-                "embedding model '{model}' not found under {}",
-                models_dir.display()
-            );
-            return None;
-        }
-    }
-    let dir = models_dir.join("embeddings");
+/// Global config models dir: `~/.anamnesic/models`. The embedding model lives
+/// here (shared across every project) so workspaces stay free of multi-hundred
+/// MB blobs and the transaction snapshot never has to read them.
+pub fn global_models_dir() -> PathBuf {
+    crate::config::home_dir().join(".anamnesic").join("models")
+}
+
+/// Locate the embedding GGUF in the global config dir
+/// (`~/.anamnesic/models/embeddings/`): the first `.gguf` present, then the
+/// default filename. No per-project search.
+fn resolve_source() -> Option<PathBuf> {
+    let dir = global_models_dir().join("embeddings");
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut gguf: Vec<PathBuf> = entries
             .filter_map(|entry| entry.ok())
@@ -131,14 +118,14 @@ fn resolve_source(models_dir: &Path, embedding_model: Option<&str>) -> Option<Pa
             return Some(first);
         }
     }
-    let default = models_dir.join(EMBEDDING_DEFAULT);
+    let default = dir.join(EMBEDDING_DEFAULT);
     default.exists().then_some(default)
 }
 
-/// Download the first available candidate embedding model into
-/// `<models_dir>/embeddings/` and return its path.
-pub fn download_embedding_model(models_dir: &Path) -> Result<PathBuf> {
-    let dir = models_dir.join("embeddings");
+/// Download the first available candidate embedding model into the global
+/// config dir (`~/.anamnesic/models/embeddings/`) and return its path.
+pub fn download_embedding_model() -> Result<PathBuf> {
+    let dir = global_models_dir().join("embeddings");
     std::fs::create_dir_all(&dir)?;
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("anamnesic-coder/{}", env!("CARGO_PKG_VERSION")))
@@ -190,36 +177,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_source_uses_explicit_path() {
-        let dir = std::env::temp_dir().join(format!("anamnesic-embedder-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("embeddings")).unwrap();
-        let file = dir.join("embeddings").join("my-embed.gguf");
+    fn resolve_source_uses_global_models_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "anamnesic-embedder-global-{}",
+            std::process::id()
+        ));
+        let dir = tmp.join(".anamnesic").join("models").join("embeddings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("my-embed.gguf");
         std::fs::write(&file, b"not a real model").unwrap();
-        let found = resolve_source(&dir, Some("my-embed.gguf"));
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+        let found = resolve_source();
         assert_eq!(found, Some(file));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(Embedder::new().is_available());
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_source_returns_none_when_missing() {
-        let dir = std::env::temp_dir().join(format!("anamnesic-embedder-none-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(resolve_source(&dir, None).is_none());
-        assert!(!Embedder::new(&dir, None).is_available());
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = std::env::temp_dir().join(format!(
+            "anamnesic-embedder-none-{}",
+            std::process::id()
+        ));
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(resolve_source().is_none());
+        assert!(!Embedder::new().is_available());
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// End-to-end check of the real inference engine against a downloaded
-    /// embedding GGUF. Skipped by default; run with
+    /// End-to-end check of the real inference engine against the embedding
+    /// GGUF in `~/.anamnesic/models`. Skipped by default; run with
     /// `cargo test -- --ignored` after `--download-embedding-model`.
     #[test]
     #[ignore]
     fn real_embedding_model_ranks_similar_texts() {
-        let dir = std::env::var("MODELS_DIR").unwrap_or_else(|_| "models".to_string());
-        let embedder = Embedder::new(Path::new(&dir), None);
+        let embedder = Embedder::new();
         assert!(
             embedder.is_available(),
-            "no embedding model found under {dir} — run --download-embedding-model first"
+            "no embedding model in {} — run --download-embedding-model first",
+            global_models_dir().display()
         );
         let a = embedder.embed("how do I run the test suite?", EmbedKind::Query).unwrap();
         let b = embedder.embed("run cargo test to verify the changes", EmbedKind::Passage).unwrap();

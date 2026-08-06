@@ -105,11 +105,11 @@
 - **Fix:** Implementado tool `task` que spawna um sub-agente em thread separada com `tokio::runtime::Runtime::new()`. O sub-agente usa `AgentState::clone()` (com `Clone` manual resetando retries/transaction/dirty), roda `run_agent_loop_with_hooks` em modo `Agent`, e retorna o resultado via `mpsc::channel` com timeout de 300s. `execute_tool` e `execute_tool_calls` atualizados para receber `&LlmRouter`. Registrado em `coding_tools()` com parâmetros `task` (required) e `model` (optional).
 - **Ref:** ADR 0011
 
-### G6. Cost Tracking Per Turn
+### ~~G6. Cost Tracking Per Turn~~ ✅ DONE
 - **Gap:** Não sabe quanto gastou em tokens/dinheiro por turno ou sessão. Claude Code e Aider mostram isso.
 - **Impact:** Ops — sem visibilidade de custos; impossível otimizar.
-- **Files:** `src/llm/client.rs`, `src/agent/loop.rs`, `src/ui.rs`
-- **Fix:** Em `ChatCompletion`, adicionar `usage: Option<Usage>` (prompt_tokens, completion_tokens). Acumular por turno. Mostrar no status bar do TUI.
+- **Files:** `src/llm/router.rs`, `src/agent/state.rs`, `src/agent/agent_loop.rs`
+- **Fix:** `LlmRouter::estimate_cost` precifica tokens em US$ pelo catálogo models.dev (base id do provider ativo). Acumulado em `AgentState.turn_cost_usd`, resetado por turno; mostrado na nota `[usage]` (com `($X.XXXX)`) e no resumo final (`Estimated cost: $X.XXXX`). Modelo local/fora do catálogo → US$ 0.
 
 ### ~~G7. MCP Client (Model Context Protocol)~~ ✅ DONE
 - **Gap:** Não conecta a tool servers MCP externos. Todos os líderes (Claude Code, Antigravity, Cursor, Codex) suportam MCP.
@@ -118,11 +118,12 @@
 - **Fix:** Implementado MCP client com stdio transport em `src/mcp/mod.rs`. `McpClient::connect()` spawns processo filho, envia `initialize` JSON-RPC, e mantém stdin/stdout pipes. `list_tools()` converte tools MCP para `ToolDef`. `call_tool()` envia `tools/call` e extrai conteúdo textual. Registrado em `coding_tools(state)` que agora aceita `&mut AgentState` e mescla tools MCP com tools built-in. `execute_tool()` tem fallback `try_mcp_tool()` para tool names não reconhecidos. `connect_mcp_clients()` é chamado no início de `run_agent_loop_with_hooks`. Config: `Config.mcp_servers: Vec<McpServerConfig>`. State: `AgentState.mcp_clients: Vec<McpClient>`.
 - **Ref:** ADR 0012
 
-### G8. Auto-Read Project Context (AGENTS.md)
+### ~~G8. Auto-Read Project Context (AGENTS.md)~~ ✅ DONE
 - **Gap:** O agente não lê nenhum arquivo de contexto de projeto automaticamente. O próprio projeto tem um `AGENTS.md` mas o agente ignora.
 - **Impact:** O modelo não tem contexto sobre arquitetura, convenções, e regras do projeto.
 - **Files:** `src/agent/loop.rs`, `src/llm/prompt.rs`
-- **Fix:** Na construção do system prompt, procurar e ler `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, ou `CONTEXT.md` na raiz do workspace. Injetar o conteúdo no system prompt.
+- **Fix:** Implementado `CoderPrompt::load_project_context` (`src/llm/prompt.rs`) — lê `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `CONTEXT.md` na raiz do workspace e injeta no system prompt junto do repo map.
+- **Ref:** ADR 0004
 
 ### ~~G9. Streaming Tool Call Deltas~~ ✅ DONE
 - **Gap:** Tool calls são parseados apenas de respostas completas. Não há streaming incremental de tool call deltas durante SSE.
@@ -138,11 +139,11 @@
 - **Fix:** Implementado `CircuitBreaker` com estados Closed/Open/HalfOpen. `CircuitBreakerProvider` wrapper around any `CompletionProvider`. `FallbackChain::new` agora wraps todos os providers com `CircuitBreakerProvider` (threshold=3, cooldown=30s). Após 3 falhas consecutivas, circuito abre por 30s. Após cooldown, tenta novamente (half-open). Sucesso reseta o contador. 2 testes: `circuit_breaker_opens_after_threshold_failures` e `circuit_breaker_records_success`.
 - **Ref:** ADR 0014
 
-### G10. `list_files` Should Include Directories
+### ~~G10. `list_files` Should Include Directories~~ ✅ DONE
 - **Gap:** `list_files` só retorna arquivos (`is_file()`), não diretórios. Antigravity e Claude Code retornam ambos.
 - **Impact:** O modelo não vê a estrutura de diretórios do projeto.
 - **Files:** `src/tools/fs.rs`
-- **Fix:** Incluir diretórios no output com um sufixo `/` para distinguir. Ou implementar tool separado `list_dir`.
+- **Fix:** Implementado tool `list_tree` com `depth`/`max_entries` (inclui diretórios com sufixo `/`).
 
 ## P2 — Code Quality & Design
 
@@ -202,35 +203,35 @@
 
 ## P2 — Harness Gaps (nice-to-have)
 
-### G11. Repo Map (Aider-style)
+### ~~G11. Repo Map (Aider-style)~~ ✅ DONE
 - **Gap:** O agente não tem uma visão estrutural do repositório. Aider e Cursor geram um mapa de definições (classes, funções) para guiar file selection.
 - **Impact:** Context efficiency — o agente gasta iterações buscando arquivos relevantes.
-- **Fix:** Gerar um repo map na inicialização usando regex ou tree-sitter para extrair definições. Injetar no system prompt como contexto compacto.
+- **Fix:** Implementado `RepoMapGenerator` (regex, max 2KB) injetado no system prompt. Melhora futura: símbolos via LSP/tree-sitter (ver C2 no backlog competitivo).
 
-### G12. Lint Integration
+### ~~G12. Lint Integration~~ ✅ DONE
 - **Gap:** Não integra com linters. Claude Code, Cursor e Aider usam lint feedback para self-correction.
 - **Impact:** O agente não detecta erros de estilo/tipo sem rodar o test command completo.
-- **Fix:** Após edições, rodar `cargo clippy` / `eslint` e alimentar o output como feedback ao modelo.
+- **Fix:** Implementado lint gate — `Config.lint_on_mutation` (env `LINT_ON_MUTATION`, default true) roda `cargo clippy --message-format short` junto do gate de testes após mutação (`tools::test::run_lint`). Só para workspaces com `Cargo.toml`.
 
-### G13. Web Search Tool
+### ~~G13. Web Search Tool~~ ✅ DONE
 - **Gap:** Não tem capacidade de buscar na web. Antigravity tem `search_web`, Aider tem web integration.
 - **Impact:** O agente não pode pesquisar documentação, APIs, ou soluções para erros desconhecidos.
-- **Fix:** Implementar tool `web_search(query)` usando uma search API (SearXNG, Brave, etc.).
+- **Fix:** Implementado em `src/tools/web.rs` — `http_fetch(url, max_bytes, timeout_secs)` (HTML→texto) + `web_search(query, max_results, timeout_secs)` sem API key: SearXNG via `WEB_SEARCH_URL` (JSON) com fallback DuckDuckGo HTML. Ambos com gate de approval via `command_tool_policy`.
 
-### G14. Session Persistence
+### ~~G14. Session Persistence~~ ✅ DONE
 - **Gap:** Sessões não persistem entre execuções. Claude Code, Cursor e Codex salvam sessões.
 - **Impact:** UX — o usuário perde todo o contexto ao reiniciar.
-- **Fix:** Serializar `AgentState` + conversation history para disco. Restaurar com `/session load`.
+- **Fix:** Implementado `persist_session`/`resume_session` (SQLite, crash-safe) + flags `--resume`/`--cont`. Auto-index vetorial opcional via `MEMORY_INDEXING`.
 
 ### G15. Background Task Execution
 - **Gap:** Não suporta execução em background. Antigravity e Cursor permitem rodar tarefas enquanto o usuário faz outra coisa.
 - **Impact:** UX — builds longos bloqueiam o agent loop.
 - **Fix:** Executar commands longos em thread separada com polling de status. Emitir eventos via `AgentHooks`.
 
-### G16. Git Branch/Stash Operations
+### ~~G16. Git Branch/Stash Operations~~ ✅ DONE
 - **Gap:** Git tools são básicos (status, diff, log, stage, commit). Sem branch, stash, blame.
 - **Impact:** Workflow — não pode criar feature branches ou stash work-in-progress.
-- **Fix:** Adicionar `git_branch`, `git_stash`, `git_blame` em `src/tools/git.rs`.
+- **Fix:** Implementado em `src/tools/git.rs` — `git_branch`, `git_stash`, `git_log`, `git_restore` (status/diff/log/stash/restore).
 
 ## P3 — Logic Bugs & Edge Cases
 
@@ -324,6 +325,71 @@ Recomendações da comparação com `codex-rs` (openai/codex). NÃO copiar o wor
 
 ---
 
+## Roadmap — Competitive Backlog (2026-08-06)
+
+> Fonte: comparação com Claude Code / Codex / Antigravity / Cursor / Aider (ver `docs/gap-analysis-2026-08.md`).
+> Entregues nesta rodada: cost em US$ (G6), web tools (G13), lint gate (G12), todo tool, memória vetorial, global settings (`~/.anamnesic/settings.json`), snapshot respeitando `.gitignore`.
+
+### Implementar (novos gaps)
+
+#### C1. Path-scoped permissions — 🔴 Alta — Segurança
+- **Gap:** `require_approval` existe, mas não há rede automática: nada impede write/shell fora do `workspace_dir` (`..`, symlink escape, diretórios do sistema). Codex (sandbox) e Claude (path-scope) fazem.
+- **Files:** `src/tools/fs.rs`, `src/tools/shell.rs`, `src/agent/agent_loop.rs`
+- **Fix:** gate automático de escrita: rejeitar caminhos fora do workspace, `..`, symlink escape; policy por prefixo de path.
+
+#### C2. Symbol / LSP search — 🔴 Alta — Navegação
+- **Gap:** o repo map regex (2KB) é fraco para navegação. Claude (LSP) e Cursor (LSP) têm go-to-def/referências.
+- **Fix:** índice de símbolos (tree-sitter, ctags ou LSP) com tool `search_symbols`.
+
+#### C3. Sub-agentes paralelos — 🟡 Média — Throughput
+- **Gap:** tool `task` roda 1 sub-agente/turno sequencial. Claude/Cursor disparam N em paralelo.
+- **Fix:** escalar `task` para N concorrentes com junção de resultados e timeout total.
+
+#### C4. Skills system — 🟡 Média — Extensibilidade
+- **Gap:** sem sistema de skills (Claude `SKILL.md`, Antigravity skills). MCP já cobre tools externas; falta conhecimento/prompting empacotado por skill.
+- **Fix:** `skills/` no projeto + `SKILL.md` injetável + tool `load_skill`; gates por policy.
+
+#### C5. File checksums / change-tracking — 🟡 Média — Contexto e diff
+- **Gap:** o snapshot lê bytes todo turno; sem hash por arquivo (Claude/Cursor/Aider têm). Releitura redundante gasta I/O e tokens.
+- **Fix:** hash+size por arquivo no snapshot; reler só o que mudou; diff por checksum.
+
+#### C6. Extended thinking — 🟡 Média — Modelos reasoning
+- **Gap:** sem pass-through de `reasoning_content` (Claude/Codex). `ToolCallDelta` já existe; é o próximo degrau.
+- **Fix:** campo `thinking` no streaming, persistência opcional, exibição colapsável na UI.
+
+#### C7. Adversarial verification — 🟢 Baixa — Qualidade
+- **Fix:** após passar nos testes, o agente questiona a própria solução (padrão Claude Code).
+
+#### C8. Notebook editing / timers / image gen — 🟢 Baixa — Paridade
+- Notebook editing (Claude/Cursor), timers/cron (Antigravity), image gen (Antigravity). Avaliar público-alvo.
+
+#### C9. Background tasks — 🟡 Média — UX (reabre G15)
+- **Fix:** commands longos (build/verify) em thread separada com polling de status via `AgentHooks`, sem travar o loop.
+
+### Remover / congelar
+
+#### R1. Remover `--caveman` — `src/compressor/caveman.rs`
+- Modo de compressão "cavernês"; é gimmick. Remover ou esconder atrás de feature flag.
+
+#### R2. Avaliar `serve`/`src/terminal/` (501 linhas: pty + websocket)
+- Menor uso no fluxo core. Se o TUI no browser não é usado, remover; se é diferencial de acesso remoto, manter e documentar.
+
+#### R3. Congelar `bench`/`hw_recommend` (735 + 521 linhas)
+- São dev-tools (subcomandos `bench`/`check`), não features do harness. Parar de evoluir; manter apenas manutenção.
+
+### Sprint sugerido
+
+| Sprint | Foco | Itens | Timeline |
+|--------|------|-------|----------|
+| 1 | Segurança | C1 (path-scope) | 1-2 dias |
+| 2 | Extensibilidade | C4 (skills) | 1 dia |
+| 3 | Contexto/Perf | C5 (checksums), C7 | 2-3 dias |
+| 4 | Throughput | C3 (sub-agentes paralelos) | 2-3 dias |
+| 5 | Qualidade | C6 (thinking), C2 (symbols) | 1 semana |
+| — | Limpeza | R1, R2, R3 | 1 dia |
+
+---
+
 ## Status Summary (as of 2026-08-02)
 
 ### Fixed (from previous TODOs)
@@ -391,6 +457,13 @@ Recomendações da comparação com `codex-rs` (openai/codex). NÃO copiar o wor
 | MCP client with stdio transport (G7) | ✅ Done | 0012 |
 | Streaming tool call deltas (G9) | ✅ Done | 0013 |
 | Provider health checks & circuit breaking | ✅ Done | 0014 |
+| Cost tracking em US$ (catálogo models.dev) (G6) | ✅ Done | — |
+| Web search keyless + `http_fetch` (G13) | ✅ Done | — |
+| Lint gate (`cargo clippy` pós-mutação) (G12) | ✅ Done | — |
+| TODO tracking tool (`todo`) | ✅ Done | — |
+| Memória vetorial/semântica local (`memory_search`, embeddings) | ✅ Done | — |
+| Global settings (`~/.anamnesic/settings.json`, Claude-style) | ✅ Done | — |
+| Snapshot respeita `.gitignore` + guard de tempo | ✅ Done | — |
 | Prompts versioned/tested | ✅ Done | — |
 | Status/WARN messages to fixed status bar (no chat leak) | ✅ Done | UI |
 | ESC handling: interrupt + approval deny + Ctrl+C twice quit | ✅ Done | UI |
@@ -402,10 +475,18 @@ Recomendações da comparação com `codex-rs` (openai/codex). NÃO copiar o wor
 
 | # | Priority | Item | Category | Effort |
 |---|----------|------|----------|--------|
-| G12 | P2 | Lint integration | Harness | Médio |
-| G13 | P2 | Web search tool | Harness | Médio |
-| G14 | P2 | Session persistence | Harness | Médio |
-| G15 | P2 | Background task execution | Harness | Alto |
+| C1 | 🔴 Alta | Path-scoped permissions (workspace containment) | Safety | Médio |
+| C2 | 🔴 Alta | Symbol / LSP search | Harness | Alto |
+| C3 | P1 | Parallel sub-agents (N por turno) | Harness | Médio |
+| C4 | P1 | Skills system (`SKILL.md` + `load_skill`) | Extensibilidade | Baixo |
+| C5 | P1 | File checksums / change-tracking | Performance | Médio |
+| C6 | P1 | Extended thinking (`reasoning_content`) | Harness | Médio |
+| C7 | P2 | Adversarial verification | Quality | Baixo |
+| C8 | P2 | Notebook editing / timers / image gen | Harness | Alto |
+| C9 | P2 | Background task execution (reabre G15) | Harness | Alto |
+| R1 | P2 | Remove `--caveman` | Limpeza | Baixo |
+| R2 | P2 | Avaliar `serve`/`src/terminal/` | Limpeza | Baixo |
+| R3 | P3 | Congelar `bench`/`hw_recommend` | Limpeza | Baixo |
 | 17 | P2 | Remove `#![allow(dead_code)]` | Code Quality | Baixo |
 | 18 | P2 | Fix `truncate_str` (head vs tail) | Code Quality | Baixo |
 | 19 | P2 | Fix conversation clone per iteration | Performance | Médio |
@@ -424,25 +505,28 @@ Recomendações da comparação com `codex-rs` (openai/codex). NÃO copiar o wor
 
 | Sprint | Focus | Items | Timeline |
 |--------|-------|-------|----------|
-| **1** | Quick Wins | G2, G8, G10, G6, items 4-7 | 1-2 dias |
-| **2** | Context Intelligence | G4, G3, G11 (repo map) | 1 semana |
-| **3** | Architecture | G5, G7, G9, circuit breaker | 1-2 semanas |
+| **1** | Safety | C1, R1 | 1-2 dias |
+| **2** | Extensibility | C4, R2 | 1 dia |
+| **3** | Context Intelligence | C5, C7 | 2-3 dias |
+| **4** | Architecture | C3, C6, C9 | 2-3 dias |
+| **5** | Competitive | C2, C8, R3 | 1 semana |
 
 ### Test Coverage
 
-~174 unit tests across all modules. Key areas:
+~284 unit tests across all modules (3 ignored: 2 live web + 1 embedding real). Key areas:
 
 | Module | Tests |
 |--------|-------|
 | `llm/tier.rs` | 10 (tier classification, fallback resolution, ordering) |
-| `llm/router.rs` | 12 (routing, resolution, provider switching, capability, fallback) |
+| `llm/router.rs` | 12+ (routing, resolution, provider switching, capability, fallback, cost) |
 | `tools/shell.rs` | 8 (allowlist, metacharacters, timeout, combined output) |
 | `tools/fs.rs` | 6+ (path traversal, workspace containment, transactions) |
-| `tools/transaction.rs` | 3 (snapshot, diff, rollback) |
+| `tools/transaction.rs` | 4 (snapshot, diff, rollback, gitignore) |
+| `tools/web.rs` | 5 (strip_html, truncation, DDG parser + 2 live `[ignore]`) |
 | `config/settings.rs` | 6 (defaults, env overrides, policies) |
-| `agent/loop.rs` | 11 (tool dispatch, parallel execution, output formatting) |
-| `compressor/` | 20+ (caveman, layer1, layer2) |
-| `memory/` | 6+ (short-term, search) |
+| `agent/agent_loop.rs` | 12+ (tool dispatch, todo, parallel execution, output formatting) |
+| `llm/embedder.rs` | 2 (global resolve) + 1 real `[ignore]` |
+| `memory/log.rs` | 6+ (short-term, search, vector store) |
 | `providers/store.rs` | 6+ (env loading, catalog resolution, masking) |
 | `models_dev/` | 10+ (catalog queries, provider models) |
-| `ui.rs` | 6+ (truncation, formatting, elapsed time) |
+| `ui/` | 6+ (truncation, formatting, elapsed time) |

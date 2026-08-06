@@ -39,6 +39,41 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn expand_home(path: &str) -> String {
+    let path = path.trim();
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        if let Some(home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|h| h.to_string_lossy().into_owned())
+        {
+            let rest = path[1..].trim_start_matches(['/', '\\']);
+            return if rest.is_empty() {
+                home
+            } else {
+                std::path::Path::new(&home)
+                    .join(rest)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+        }
+    }
+    path.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub workspace_dir: PathBuf,
@@ -53,6 +88,18 @@ pub struct Config {
     pub chunk_overlap: usize,
     pub allowed_commands: Vec<String>,
     pub blocked_commands: Vec<String>,
+    /// Absolute path prefixes (outside the workspace) that the file tools are
+    /// allowed to touch. Everything else outside the workspace is rejected.
+    /// Home-relative (`~/...`) entries are expanded against the user's home.
+    pub path_allowlist: Vec<String>,
+    /// Path prefixes that are forbidden even when inside the workspace (e.g.
+    /// `.git`, `node_modules/.cache`). Matched against the workspace-relative
+    /// path of the target file or directory.
+    pub path_denylist: Vec<String>,
+    /// Master switch for the automatic workspace-containment gate. When on,
+    /// mutation shell commands that reference absolute paths outside the
+    /// workspace (and outside `path_allowlist`) are refused without running.
+    pub block_workspace_escape: bool,
     pub use_local: bool,
     pub models_dir: PathBuf,
     pub max_seq_len: usize,
@@ -65,8 +112,10 @@ pub struct Config {
     pub require_diff_summary: bool,
     /// Run `cargo clippy` in addition to the test gate after a mutation.
     pub lint_on_mutation: bool,
-    /// Path or bare name of a GGUF embedding model for `memory_search`.
-    pub embedding_model: Option<String>,
+    /// After passing tests/lint, ask the coder model to critique the diff for
+    /// regressions, security issues or weakened tests. Advisory only: concerns
+    /// are surfaced as a note, not as a hard failure.
+    pub adversarial_verification: bool,
     /// Auto-index assistant messages into the vector store on persist.
     pub memory_indexing: bool,
     pub write_tool_policy: ApprovalPolicy,
@@ -146,6 +195,9 @@ impl Default for Config {
                 "del /f".into(),
                 "rd /s".into(),
             ],
+            path_allowlist: env_list("PATH_ALLOWLIST"),
+            path_denylist: env_list("PATH_DENYLIST"),
+            block_workspace_escape: env_bool("BLOCK_WORKSPACE_ESCAPE", true),
             use_local: false,
             models_dir: std::env::var("MODELS_DIR")
                 .map(PathBuf::from)
@@ -174,7 +226,7 @@ impl Default for Config {
             rollback_on_failure: env_bool("ROLLBACK_ON_FAILURE", true),
             require_diff_summary: env_bool("REQUIRE_DIFF_SUMMARY", true),
             lint_on_mutation: env_bool("LINT_ON_MUTATION", true),
-            embedding_model: std::env::var("EMBEDDING_MODEL").ok(),
+            adversarial_verification: env_bool("ADVERSARIAL_VERIFICATION", false),
             memory_indexing: env_bool("MEMORY_INDEXING", false),
             write_tool_policy: ApprovalPolicy::from_env("WRITE_TOOL_POLICY", ApprovalPolicy::Allow),
             command_tool_policy: ApprovalPolicy::from_env(
@@ -208,6 +260,9 @@ mod tests {
         assert_eq!(cfg.write_tool_policy, ApprovalPolicy::Allow);
         assert_eq!(cfg.command_tool_policy, ApprovalPolicy::Allow);
         assert!(cfg.blocked_commands.iter().any(|c| c == "sudo"));
+        assert!(cfg.block_workspace_escape);
+        assert!(cfg.path_allowlist.is_empty());
+        assert!(cfg.path_denylist.is_empty());
     }
 
     #[test]

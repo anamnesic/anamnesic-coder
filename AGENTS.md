@@ -13,10 +13,11 @@ This file lists all the index.md files created in the src directory and its subd
 - [`src/llm/infer/index.md`](src/llm/infer/index.md) - Documentation for the LLM inference submodule
  - [`src/bench/index.md`](src/bench/index.md) - Documentation for benchmarking utilities
  - [`src/memory/index.md`](src/memory/index.md) - Documentation for memory subsystems
- - [`src/repo/index.md`](src/repo/index.md) - Documentation for repository helpers
- - [`src/tools/index.md`](src/tools/index.md) - Documentation for tooling helpers
- - [`src/types/index.md`](src/types/index.md) - Documentation for shared types
- - [`src/terminal/index.md`](src/terminal/index.md) - Documentation for the interactive PTY terminal module
+- [`src/repo/index.md`](src/repo/index.md) - Documentation for repository helpers
+- [`src/skills/index.md`](src/skills/index.md) - Documentation for the skills system
+- [`src/tools/index.md`](src/tools/index.md) - Documentation for tooling helpers
+- [`src/types/index.md`](src/types/index.md) - Documentation for shared types
+- [`src/terminal/index.md`](src/terminal/index.md) - Documentation for the interactive PTY terminal module
 
 Each index.md file contains a list of files in that directory with brief descriptions of their purpose.
 
@@ -36,4 +37,5 @@ Each index.md file contains a list of files in that directory with brief descrip
 - [`docs/adr/0012-mcp-client.md`](docs/adr/0012-mcp-client.md) — MCP Client (Model Context Protocol, stdio)
 - [`docs/adr/0013-streaming-tool-call-deltas.md`](docs/adr/0013-streaming-tool-call-deltas.md) — Streaming Tool Call Deltas
 - [`docs/adr/0014-circuit-breaker.md`](docs/adr/0014-circuit-breaker.md) — Provider Health Checks & Circuit Breaking
+- [`docs/adr/0015-competitive-backlog.md`](docs/adr/0015-competitive-backlog.md) — Competitive Backlog (C1–C9, R1–R3)
 - [`docs/gap-analysis-2026-08.md`](docs/gap-analysis-2026-08.md) — 2026 Competitor Gap Analysis Report

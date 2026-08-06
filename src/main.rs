@@ -13,6 +13,7 @@ mod memory;
 mod models_dev;
 mod providers;
 mod repo;
+mod skills;
 mod terminal;
 mod tools;
 mod types;
@@ -98,8 +99,6 @@ struct Cli {
     model: Option<String>,
     #[arg(short, long, default_value = ".")]
     dir: String,
-    #[arg(long, default_value = "off")]
-    caveman: String,
     /// Use a cloud provider (OpenAI-compatible, e.g. NVIDIA NIM) for inference
     #[arg(long)]
     cloud: bool,
@@ -115,7 +114,7 @@ struct Cli {
     /// Continue the most recent session for this workspace without prompting
     #[arg(long, alias = "continue")]
     cont: bool,
-    /// Download the default embedding model (Qwen3-Embedding 0.6B Q8) for memory_search
+    /// Download the default embedding model (Qwen3-Embedding 0.6B Q8) into ~/.anamnesic/models for memory_search
     #[arg(long)]
     download_embedding_model: bool,
     task: Option<String>,
@@ -282,24 +281,20 @@ async fn main() -> Result<()> {
     if cli.download_embedding_model {
         // Run the blocking download on a plain thread so reqwest's internal
         // runtime is dropped off the async main runtime (which would panic).
-        let models_dir = cfg.models_dir.clone();
-        let handle = std::thread::spawn(move || {
-            llm::embedder::download_embedding_model(&models_dir)
-        });
+        let handle = std::thread::spawn(llm::embedder::download_embedding_model);
         let path = match handle.join() {
             Ok(Ok(path)) => path,
             Ok(Err(error)) => return Err(error),
             Err(_) => anyhow::bail!("embedding model download thread panicked"),
         };
         println!(
-            "Embedding model ready: {} (already the default location).",
+            "Embedding model ready at {} (global config dir — found automatically by memory_search from any project).",
             path.display()
         );
         return Ok(());
     }
     let client = build_router(&cli, &mut cfg).await?;
     let mut state = AgentState::new(cfg)?;
-    state.caveman = compressor::caveman::CavemanLevel::from_str(&cli.caveman);
     if cli.cont || cli.resume {
         continue_latest_session(&mut state)?;
     }
@@ -391,10 +386,7 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     loop {
         if interactive {
-            let prompt = match state.caveman {
-                compressor::caveman::CavemanLevel::Off => "\n[you] ",
-                _ => "\n🪨 ",
-            };
+            let prompt = "\n[you] ";
             print!("{}", prompt);
             std::io::stdout().flush()?;
         }
@@ -411,31 +403,7 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
         }
 
         if input.starts_with("/caveman") {
-            let rest = input.trim_start_matches("/caveman").trim();
-            if rest.is_empty() || rest == "full" {
-                state.caveman = compressor::caveman::CavemanLevel::Full;
-                println!("🪨 CAVEMAN MODE: full — why use many word when few do trick");
-            } else if rest == "lite" {
-                state.caveman = compressor::caveman::CavemanLevel::Lite;
-                println!("🪨 CAVEMAN MODE: lite");
-            } else if rest == "ultra" {
-                state.caveman = compressor::caveman::CavemanLevel::Ultra;
-                println!("🪨 CAVEMAN MODE: ultra — brain big, mouth small");
-            } else if rest == "off" || rest == "stop" || rest == "disable" {
-                state.caveman = compressor::caveman::CavemanLevel::Off;
-                println!("🗣️ Normal mode restored");
-            } else if rest == "stats" {
-                let tag = state.caveman.tag();
-                println!("═══ Caveman Stats ═══");
-                println!("  Mode:      {}", if tag.is_empty() { "off" } else { tag });
-                println!("  Sessions:  this session only");
-                println!("  Tip:       run /caveman [lite|full|ultra|off]");
-            } else {
-                println!(
-                    "Unknown caveman level: '{}'. Use: lite, full, ultra, off, stats",
-                    rest
-                );
-            }
+            println!("/caveman was removed — no longer supported (see TODO.md R1)");
             continue;
         }
 
@@ -451,8 +419,6 @@ async fn repl(client: &LlmRouter, state: &mut AgentState) -> Result<()> {
                 println!("  /exit        Exit");
                 println!("  /check       Hardware check");
                 println!("  /models      List available models");
-                println!("  /caveman     Toggle caveman mode (off/lite/full/ultra)");
-                println!("  /caveman stats  Show caveman stats");
             }
             "/check" => hw_check().await?,
             "/models" => {

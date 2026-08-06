@@ -1,4 +1,3 @@
-use crate::compressor::caveman::CavemanLevel;
 use crate::config::settings::Config;
 use crate::memory::log::LongTermMemory;
 use crate::memory::short_term::ShortTermMemory;
@@ -38,7 +37,6 @@ pub struct AgentState {
     pub long_memory: LongTermMemory,
     pub files: FileTools,
     pub git: GitTools,
-    pub caveman: CavemanLevel,
     pub mcp_clients: Vec<crate::mcp::McpClient>,
     /// Persistent session record backing this conversation, created lazily on
     /// the first persist. `None` means the next turn starts a fresh session.
@@ -57,6 +55,10 @@ pub struct AgentState {
     pub todos: Vec<TodoItem>,
     /// Local embedding engine for `memory_search` (lazily loads the GGUF model).
     pub embedder: crate::llm::embedder::Embedder,
+    /// Discovered skill packs (project `./skills` + user `~/.anamnesic/skills`).
+    pub skills: crate::skills::SkillRegistry,
+    /// Long-running detached commands (C9 background tasks) spawned this session.
+    pub background: crate::tools::background::BackgroundTaskManager,
 }
 
 impl AgentState {
@@ -64,10 +66,9 @@ impl AgentState {
         config.workspace_dir =
             crate::tools::fs::normalize_workspace_path(&config.workspace_dir);
         let long_memory = LongTermMemory::new(config.memory_dir.join("memory.db"))?;
-        let embedder = crate::llm::embedder::Embedder::new(
-            &config.models_dir,
-            config.embedding_model.as_deref(),
-        );
+        let embedder = crate::llm::embedder::Embedder::new();
+        let mut skills = crate::skills::SkillRegistry::new();
+        skills.load_from(crate::skills::default_skill_dirs(&config.workspace_dir));
         Ok(AgentState {
             retries: 0,
             repair_attempt: 0,
@@ -80,10 +81,13 @@ impl AgentState {
             dirty: false,
             session: ShortTermMemory::new(config.max_context_tokens),
             long_memory,
-            files: FileTools::new(config.workspace_dir.clone()),
+            files: FileTools::new_with_policy(
+                config.workspace_dir.clone(),
+                config.path_allowlist.clone(),
+                config.path_denylist.clone(),
+            ),
             git: GitTools::new(config.workspace_dir.to_string_lossy().to_string()),
             config,
-            caveman: CavemanLevel::Off,
             mcp_clients: Vec::new(),
             session_id: None,
             session_persist: true,
@@ -92,6 +96,8 @@ impl AgentState {
             turn_cost_usd: 0.0,
             todos: Vec::new(),
             embedder,
+            skills,
+            background: crate::tools::background::BackgroundTaskManager::new(),
         })
     }
 
@@ -353,7 +359,6 @@ mod tests {
         let state = AgentState::new(cfg).unwrap();
         assert!(state.session.history().is_empty());
         assert_eq!(state.retries, 0);
-        assert!(!state.caveman.is_active());
         let _ = fs::remove_dir_all(state.config.workspace_dir.parent().unwrap());
     }
 

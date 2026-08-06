@@ -1,4 +1,3 @@
-use crate::compressor::caveman::CavemanLevel;
 use crate::llm::prompt::PlannerPrompt;
 use crate::llm::router::LlmRouter;
 use crate::types::plan::{Plan, PlanStep};
@@ -9,9 +8,8 @@ pub async fn plan_task(
     model: &str,
     task: &str,
     context: &str,
-    caveman: &CavemanLevel,
 ) -> Result<Plan> {
-    let system = PlannerPrompt::with_caveman(caveman);
+    let system = PlannerPrompt::system();
     let prompt = format!("{}\n\nContext:\n{}\n\nTask:\n{}", system, context, task);
     let response = client
         .generate_with_retry_with_fallback(model, &prompt, None, None)
