@@ -41,6 +41,23 @@ pub struct LlmRouter {
     fallback_model: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoTestProbeResult {
+    pub model: String,
+    pub latency_ms: u128,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoTestRecord {
+    pub timestamp: String,
+    pub provider: String,
+    pub selected_model: String,
+    pub selected_latency_ms: u128,
+    pub results: Vec<AutoTestProbeResult>,
+}
+
 impl LlmRouter {
     pub fn new(local: LlmClient) -> Self {
         Self::with_catalog(local, ModelsDevClient::load())
@@ -189,39 +206,72 @@ impl LlmRouter {
         Ok(start.elapsed())
     }
 
+    /// Test all candidate models and return a complete AutoTestRecord report.
+    pub async fn test_and_rank_models(&self, candidates: &[String]) -> AutoTestRecord {
+        let provider = self.provider();
+        let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => format!("T-unix +{}s", d.as_secs()),
+            Err(_) => "Now".to_string(),
+        };
+
+        let mut results = Vec::new();
+        let mut best: Option<(String, u128)> = None;
+
+        for candidate in candidates {
+            match self.test_model_availability(candidate).await {
+                Ok(dur) => {
+                    let ms = dur.as_millis();
+                    results.push(AutoTestProbeResult {
+                        model: candidate.clone(),
+                        latency_ms: ms,
+                        success: true,
+                        error: None,
+                    });
+                    match &best {
+                        None => best = Some((candidate.clone(), ms)),
+                        Some((_, best_ms)) => {
+                            if ms < *best_ms {
+                                best = Some((candidate.clone(), ms));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(AutoTestProbeResult {
+                        model: candidate.clone(),
+                        latency_ms: 0,
+                        success: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        let (selected_model, selected_latency_ms) = if let Some((m, lat)) = best {
+            (m, lat)
+        } else if !candidates.is_empty() {
+            (candidates[0].clone(), 0)
+        } else {
+            ("glm-5.2".to_string(), 0)
+        };
+
+        AutoTestRecord {
+            timestamp,
+            provider,
+            selected_model,
+            selected_latency_ms,
+            results,
+        }
+    }
+
     /// Test a list of candidate model names and return the candidate model
     /// with the best availability (lowest latency + 200 OK status).
     pub async fn select_best_available_model(
         &self,
         candidates: &[String],
     ) -> Result<(String, std::time::Duration)> {
-        if candidates.is_empty() {
-            anyhow::bail!("No candidate models provided for auto selection");
-        }
-
-        let mut best: Option<(String, std::time::Duration)> = None;
-
-        for candidate in candidates {
-            if let Ok(latency) = self.test_model_availability(candidate).await {
-                match &best {
-                    None => {
-                        best = Some((candidate.clone(), latency));
-                    }
-                    Some((_, best_latency)) => {
-                        if latency < *best_latency {
-                            best = Some((candidate.clone(), latency));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(best_res) = best {
-            Ok(best_res)
-        } else {
-            // Fallback to first candidate if probes failed/offline
-            Ok((candidates[0].clone(), std::time::Duration::from_millis(0)))
-        }
+        let record = self.test_and_rank_models(candidates).await;
+        Ok((record.selected_model, std::time::Duration::from_millis(record.selected_latency_ms as u64)))
     }
 
     /// Pick the concrete client for a model id (cloned; cheap for reqwest).

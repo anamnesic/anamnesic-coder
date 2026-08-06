@@ -201,6 +201,9 @@ pub struct App {
     pub file_search_paths: Vec<String>,
     /// /info overlay: full-screen view of the former left sidebar sections.
     pub info_popup: bool,
+    /// Auto model availability test overlay popup and last test record.
+    pub auto_test_popup: bool,
+    pub last_auto_test: Option<crate::llm::router::AutoTestRecord>,
     /// Accumulated reasoning content for thinking models (GLM-5.2, deepseek-r1).
     pub reasoning: String,
     /// Active top tab: 0 = Session, 1 = Issues, 2 = Pull Requests, 3 = Gists
@@ -302,6 +305,8 @@ model: model.to_string(),
             file_search_results: Vec::new(),
             file_search_paths: Vec::new(),
             info_popup: false,
+            auto_test_popup: false,
+            last_auto_test: load_auto_test_record(),
             reasoning: String::new(),
             active_tab: 0,
             pending_tasks: 0,
@@ -516,6 +521,12 @@ fn handle_slash_command(
 ) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("");
     match cmd {
+        "/auto" => {
+            let sub = input.trim_start_matches("/auto").trim();
+            let arg = if sub.is_empty() { "auto".to_string() } else { format!("auto {sub}") };
+            set_active_model(app, state, router, &arg);
+            true
+        }
         "/reset" => {
             state.lock().unwrap().reset();
             app.messages.clear();
@@ -754,48 +765,116 @@ fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// Set the active coder model for subsequent agent turns.  Strips the
+fn auto_test_cache_path() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        std::path::PathBuf::from(home).join(".gemini").join("antigravity-cli").join("last_auto_test.json")
+    } else {
+        std::env::temp_dir().join("last_auto_test.json")
+    }
+}
+
+pub fn load_auto_test_record() -> Option<crate::llm::router::AutoTestRecord> {
+    let p = auto_test_cache_path();
+    let data = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+pub fn save_auto_test_record(record: &crate::llm::router::AutoTestRecord) {
+    let p = auto_test_cache_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(record) {
+        let _ = std::fs::write(p, json);
+    }
+}
+
+fn format_auto_test_scene(record: &crate::llm::router::AutoTestRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "🎬 [Auto Mode — Cena do Último Teste de Disponibilidade]\n✦ Provedor: {}\n✦ Registro/Timestamp: {}\n✦ Candidatos Probed ({} modelos):\n",
+        record.provider,
+        record.timestamp,
+        record.results.len()
+    ));
+
+    for res in &record.results {
+        let is_winner = res.model == record.selected_model && res.success;
+        let winner_tag = if is_winner { " [👑 Vencedor]" } else { "" };
+        if res.success {
+            out.push_str(&format!(
+                "  ✓ {} — {}ms (200 OK){}\n",
+                res.model, res.latency_ms, winner_tag
+            ));
+        } else {
+            let err = res.error.as_deref().unwrap_or("Failed");
+            out.push_str(&format!("  ✗ {} — {}\n", res.model, err));
+        }
+    }
+
+    out.push_str(&format!(
+        "└── Modelo Ativo Selecionado por Padrão: {} (latência {}ms)",
+        record.selected_model, record.selected_latency_ms
+    ));
+
+    out
+}
+
+/// Set the active coder model for subsequent agent turns. Strips the
 /// " [cloud]" picker suffix and tells the router whether the model is a cloud
 /// model so requests go to the right backend.
 fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmRouter, name: &str) {
     let clean = name.trim_end_matches(" [cloud]").to_string();
-    if clean == "auto" {
+    let is_force_test = clean.contains("test") || clean.contains("refresh") || clean.contains("probe");
+    let is_auto_cmd = clean == "auto" || clean.starts_with("auto");
+    if is_auto_cmd {
         app.auto_model = true;
         let provider = app.provider.clone();
         let catalog = crate::models_dev::ModelsDevClient::load();
-        let cloud_candidates: Vec<String> = catalog
-            .provider_models(&provider)
-            .into_iter()
-            .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
-            .map(|m| crate::models_dev::base_id(&m.id))
-            .collect();
 
-        let candidates = if !cloud_candidates.is_empty() {
-            cloud_candidates
+        let existing_record = if !is_force_test {
+            app.last_auto_test.clone().or_else(load_auto_test_record)
         } else {
-            let st = state.lock().unwrap();
-            let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
-            if !local.is_empty() {
-                local
-            } else {
-                vec!["glm-5.2".to_string()]
-            }
+            None
         };
 
-        app.add_message(
-            "System",
-            &format!("Testing availability across {} candidate models…", candidates.len()),
-        );
+        let record = if let Some(rec) = existing_record {
+            rec
+        } else {
+            let cloud_candidates: Vec<String> = catalog
+                .provider_models(&provider)
+                .into_iter()
+                .filter(|m| m.tool_call && m.modalities.output.iter().any(|o| o == "text"))
+                .map(|m| crate::models_dev::base_id(&m.id))
+                .collect();
 
-        let router_clone = router.clone();
-        let candidates_clone = candidates.clone();
-        let (best, latency) = block_on_async(async move {
-            router_clone
-                .select_best_available_model(&candidates_clone)
-                .await
-        })
-        .unwrap_or_else(|_| (candidates[0].clone(), std::time::Duration::from_millis(0)));
+            let candidates = if !cloud_candidates.is_empty() {
+                cloud_candidates
+            } else {
+                let st = state.lock().unwrap();
+                let local = crate::llm::model_resolver::list_models(&st.config.models_dir);
+                if !local.is_empty() {
+                    local
+                } else {
+                    vec!["glm-5.2".to_string()]
+                }
+            };
 
+            app.add_message(
+                "System",
+                &format!("Executando novo teste de disponibilidade em tempo real em {} candidatos…", candidates.len()),
+            );
+
+            let router_clone = router.clone();
+            let candidates_clone = candidates.clone();
+            let rec = block_on_async(async move {
+                router_clone.test_and_rank_models(&candidates_clone).await
+            });
+            save_auto_test_record(&rec);
+            rec
+        };
+
+        let best = record.selected_model.clone();
         {
             let mut st = state.lock().unwrap();
             st.config.coder_model = best.clone();
@@ -803,25 +882,16 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
             st.config.summarizer_model = best.clone();
         }
         app.model = best.clone();
+        app.last_auto_test = Some(record.clone());
+        app.auto_test_popup = true;
         router.set_model(&best);
         if catalog.provider_model_api_id(&provider, &best).is_some() {
             router.mark_cloud(&best);
         }
 
-        let lat_ms = latency.as_millis();
-        if lat_ms > 0 {
-            app.add_message(
-                "System",
-                &format!("✓ Auto mode tested availability: selected {best} ({lat_ms}ms latency, 200 OK)"),
-            );
-            app.status = format!("Ready · model: {best} (auto {lat_ms}ms) · Esc interrupt");
-        } else {
-            app.add_message(
-                "System",
-                &format!("✓ Auto mode enabled — selected {best} (fallback active)"),
-            );
-            app.status = format!("Ready · model: {best} (auto) · Esc interrupt");
-        }
+        let scene = format_auto_test_scene(&record);
+        app.add_message("System", &scene);
+        app.status = format!("Ready · model: {best} (auto {}ms) · Esc interrupt", record.selected_latency_ms);
         return;
     }
     app.auto_model = false;
@@ -1418,6 +1488,13 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     if handled || guard.model_selector || guard.provider_selector || guard.resume_selector {
                         continue;
                     }
+                }
+                // Auto test scene overlay captures Esc key while open.
+                if guard.auto_test_popup {
+                    if matches!(key.code, KeyCode::Esc) {
+                        guard.auto_test_popup = false;
+                    }
+                    continue;
                 }
                 // /info overlay captures navigation keys while open.
                 if guard.info_popup {
@@ -2159,6 +2236,58 @@ fn draw<B: ratatui::backend::Backend>(
                 .borders(Borders::ALL);
             let panel = Paragraph::new(panel_lines).block(panel_block).wrap(Wrap { trim: false });
             f.render_widget(panel, area);
+        }
+
+        // /auto & /model auto Test Scene Overlay: renders last availability test results.
+        if app.auto_test_popup {
+            let popup_w = (size.width.saturating_sub(6)).max(40);
+            let popup_h = (size.height.saturating_sub(4)).max(12);
+            let x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+            let y = size.y + (size.height.saturating_sub(popup_h)) / 3;
+            let area = Rect { x, y, width: popup_w, height: popup_h };
+
+            let mut lines: Vec<Line> = Vec::new();
+            if let Some(ref record) = app.last_auto_test {
+                lines.push(Line::from(vec![
+                    Span::styled("✦ Provedor: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&record.provider, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  │  Timestamp: {}", record.timestamp), Style::default().fg(Color::Gray)),
+                ]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Resultados dos Probes por Candidato:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+
+                for res in &record.results {
+                    let is_winner = res.model == record.selected_model && res.success;
+                    let mut spans = Vec::new();
+                    if is_winner {
+                        spans.push(Span::styled("▶ 👑 ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(format!("{} — {}ms (200 OK) [VENCEDOR]", res.model, res.latency_ms), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                    } else if res.success {
+                        spans.push(Span::styled("  ✓ ", Style::default().fg(Color::Green)));
+                        spans.push(Span::styled(format!("{} — {}ms (200 OK)", res.model, res.latency_ms), Style::default().fg(Color::White)));
+                    } else {
+                        let err = res.error.as_deref().unwrap_or("Failed");
+                        spans.push(Span::styled("  ✗ ", Style::default().fg(Color::Red)));
+                        spans.push(Span::styled(format!("{} — {}", res.model, err), Style::default().fg(Color::Red)));
+                    }
+                    lines.push(Line::from(spans));
+                }
+
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Modelo Ativo Selecionado por Padrão: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&record.selected_model, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" (latência {}ms)", record.selected_latency_ms), Style::default().fg(Color::Green)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled("Nenhum teste prévio encontrado. Execute /auto test para iniciar um novo teste.", Style::default().fg(Color::Gray))));
+            }
+
+            let title = " 🧪 TELA DE TESTE DE DISPONIBILIDADE — Esc fechar · /auto test recarregar ";
+            let para = Paragraph::new(lines)
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, area);
         }
 
         // Ctrl+P fuzzy file-search overlay.
