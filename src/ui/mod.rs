@@ -743,6 +743,17 @@ fn ranked_model_order(base_id: &str) -> usize {
     }
 }
 
+/// Safely execute an async future synchronously without panicking if already inside a Tokio runtime.
+fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("Failed to create Tokio runtime")
+            .block_on(fut)
+    }
+}
+
 /// Set the active coder model for subsequent agent turns.  Strips the
 /// " [cloud]" picker suffix and tells the router whether the model is a cloud
 /// model so requests go to the right backend.
@@ -778,14 +789,12 @@ fn set_active_model(app: &mut App, state: &Arc<Mutex<AgentState>>, router: &LlmR
 
         let router_clone = router.clone();
         let candidates_clone = candidates.clone();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let (best, latency) = rt
-            .block_on(async move {
-                router_clone
-                    .select_best_available_model(&candidates_clone)
-                    .await
-            })
-            .unwrap_or_else(|_| (candidates[0].clone(), std::time::Duration::from_millis(0)));
+        let (best, latency) = block_on_async(async move {
+            router_clone
+                .select_best_available_model(&candidates_clone)
+                .await
+        })
+        .unwrap_or_else(|_| (candidates[0].clone(), std::time::Duration::from_millis(0)));
 
         {
             let mut st = state.lock().unwrap();
@@ -1041,9 +1050,8 @@ pub fn run_ui(client: LlmRouter, state: AgentState) -> Result<(), Box<dyn Error>
                     interrupt: Some(interrupt_clone),
                 };
 
-                let rt = tokio::runtime::Runtime::new().unwrap();
                 let mut st = state_worker.lock().unwrap();
-                rt.block_on(crate::agent::agent_loop::run_agent_loop_with_hooks(
+                block_on_async(crate::agent::agent_loop::run_agent_loop_with_hooks(
                     &client_worker,
                     &mut st,
                     &input_text,
